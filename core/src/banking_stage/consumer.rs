@@ -302,6 +302,11 @@ impl Consumer {
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
 
+        datapoint_info!(
+            "fast_geyser_research",
+            ("load_execute_us", load_execute_us as i64, i64),
+        );
+
         let LoadAndExecuteTransactionsOutput {
             processing_results,
             processed_counts,
