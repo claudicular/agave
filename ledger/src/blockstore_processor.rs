@@ -402,6 +402,11 @@ fn execute_batches_internal(
                     None::<fn(&_) -> _>,
                 ));
 
+                datapoint_info!(
+                    "fast_geyser_research",
+                    ("execute_batch_us", execute_batches_us as i64, i64),
+                );
+
                 let thread_index = replay_tx_thread_pool.current_thread_index().unwrap();
                 execution_timings_per_thread
                     .lock()
