@@ -1182,7 +1182,7 @@ impl ReplayStage {
                 start_leader_time.stop();
 
                 let mut wait_receive_time = Measure::start("wait_receive_time");
-                let mut signal_received = false;
+                let mut _signal_received = false;
                 if !did_complete_bank {
                     // only wait for the signal if we did not just process a bank; maybe there are more slots available
 
@@ -1193,7 +1193,7 @@ impl ReplayStage {
                         Err(_) => break,
                         Ok(_) => {
                             trace!("blockstore signal");
-                            signal_received = true;
+                            _signal_received = true;
                         }
                     };
                 }

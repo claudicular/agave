@@ -227,8 +227,9 @@ The following timing variables are currently unused but kept for potential futur
 | `_load_and_execute_us` | `runtime/src/bank.rs` | ~3817 | Time for load_and_execute_transactions |
 | `_before_lock_us` | `ledger/src/blockstore_processor.rs` | ~738 | Timestamp before account lock acquisition |
 | `_before_verify_us` | `ledger/src/blockstore_processor.rs` | ~1610 | Timestamp before transaction verification |
+| `_signal_received` | `core/src/replay_stage.rs` | ~1185 | Whether blockstore signal was received |
 
-These were previously used for `fast_geyser_research` datapoints that computed duration metrics (e.g., `lock_duration_us`, `verify_duration_us`). The per-tx `fast_geyser_latency` metrics now only emit timestamps, not durations.
+These were previously used for `fast_geyser_research` datapoints that computed duration metrics (e.g., `lock_duration_us`, `verify_duration_us`) or tracked signal reception. The per-tx `fast_geyser_latency` metrics now only emit timestamps, not durations.
 
 ## PR Guidelines
 
