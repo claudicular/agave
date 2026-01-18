@@ -218,6 +218,18 @@ RUST_LOG=solana_core=debug ./cargo test -p solana-core test_name
 ./cargo test -p solana-local-cluster
 ```
 
+## Unused Timing Variables (TODO: cleanup)
+
+The following timing variables are currently unused but kept for potential future latency analysis. They can be deleted if no longer needed:
+
+| Variable | File | Line | Purpose |
+|----------|------|------|---------|
+| `_load_and_execute_us` | `runtime/src/bank.rs` | ~3817 | Time for load_and_execute_transactions |
+| `_before_lock_us` | `ledger/src/blockstore_processor.rs` | ~738 | Timestamp before account lock acquisition |
+| `_before_verify_us` | `ledger/src/blockstore_processor.rs` | ~1610 | Timestamp before transaction verification |
+
+These were previously used for `fast_geyser_research` datapoints that computed duration metrics (e.g., `lock_duration_us`, `verify_duration_us`). The per-tx `fast_geyser_latency` metrics now only emit timestamps, not durations.
+
 ## PR Guidelines
 
 - Small, frequent PRs preferred (~1000 lines max for functional changes)

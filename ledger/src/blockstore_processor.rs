@@ -735,7 +735,7 @@ fn queue_batches_with_lock_retry(
     ) -> Result<()>,
 ) -> Result<()> {
     // try to lock the accounts
-    let before_lock_us = solana_time_utils::timestamp();
+    let _before_lock_us = solana_time_utils::timestamp();
     let lock_results = bank.try_lock_accounts(&transactions);
     let after_lock_us = solana_time_utils::timestamp();
     let first_lock_err = first_err(&lock_results);
@@ -1607,7 +1607,7 @@ fn confirm_slot_entries(
          num_txs: {num_txs}, slot_full: {slot_full}",
     );
 
-    let before_verify_us = solana_time_utils::timestamp();
+    let _before_verify_us = solana_time_utils::timestamp();
 
     if !skip_verification {
         let tick_hash_count = &mut progress.tick_hash_count;
