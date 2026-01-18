@@ -99,12 +99,6 @@ impl ShredFetchStage {
         let mut stats = ShredFetchStats::default();
 
         for mut packet_batch in recvr {
-            let elapsed_since_last_update_us = last_updated.elapsed().as_micros() as i64;
-            datapoint_info!(
-                "fast_geyser_research",
-                ("shred_fetch_batch_size", packet_batch.len() as i64, i64),
-                ("shred_fetch_elapsed_us", elapsed_since_last_update_us, i64),
-            );
             if last_updated.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
                 last_updated = Instant::now();
                 let root_bank = {

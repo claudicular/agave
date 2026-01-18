@@ -402,11 +402,6 @@ fn execute_batches_internal(
                     None::<fn(&_) -> _>,
                 ));
 
-                datapoint_info!(
-                    "fast_geyser_research",
-                    ("execute_batch_us", execute_batches_us as i64, i64),
-                );
-
                 let thread_index = replay_tx_thread_pool.current_thread_index().unwrap();
                 execution_timings_per_thread
                     .lock()
@@ -745,18 +740,15 @@ fn queue_batches_with_lock_retry(
     let after_lock_us = solana_time_utils::timestamp();
     let first_lock_err = first_err(&lock_results);
     if first_lock_err.is_ok() {
-        // Emit fast_geyser_latency metric for accounts locked
-        datapoint_info!(
-            "fast_geyser_latency",
-            ("stage", "accounts_locked", String),
-            ("slot", bank.slot() as i64, i64),
-            ("timestamp_us", after_lock_us as i64, i64),
-            (
-                "lock_duration_us",
-                (after_lock_us.saturating_sub(before_lock_us)) as i64,
-                i64
-            ),
-        );
+        // Emit per-transaction metric for accounts locked
+        for tx in &transactions {
+            datapoint_info!(
+                "fast_geyser_latency",
+                ("stage", "accounts_locked", String),
+                ("timestamp_us", after_lock_us as i64, i64),
+                ("tx_signature", tx.signature().to_string(), String),
+            );
+        }
         batches.push(LockedTransactionsWithIndexes {
             lock_results,
             transactions,
@@ -1530,14 +1522,6 @@ pub fn confirm_slot(
             timing.fetch_fail_elapsed += load_elapsed.as_us();
         } else {
             timing.fetch_elapsed += load_elapsed.as_us();
-            if let Ok((_, num_shreds, _)) = &load_result {
-                datapoint_info!(
-                    "fast_geyser_research",
-                    ("blockstore_entry_load_us", load_elapsed.as_us() as i64, i64),
-                    ("blockstore_entry_load_slot", slot as i64, i64),
-                    ("blockstore_entry_load_num_shreds", *num_shreds as i64, i64),
-                );
-            }
         }
         load_result
     }?;
@@ -1589,15 +1573,6 @@ fn confirm_slot_entries(
 
     let slot = bank.slot();
     let (entries, num_shreds, slot_full) = slot_entries_load_result;
-
-    // Emit fast_geyser_latency metric for entries received at replay
-    let entries_received_us = solana_time_utils::timestamp();
-    datapoint_info!(
-        "fast_geyser_latency",
-        ("stage", "replay_entries_received", String),
-        ("slot", slot as i64, i64),
-        ("timestamp_us", entries_received_us as i64, i64),
-    );
 
     let num_entries = entries.len();
     let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
@@ -1704,19 +1679,20 @@ fn confirm_slot_entries(
         .entries()
         .expect("Transaction verification generates entries");
 
-    // Emit fast_geyser_latency metric for verification complete
+    // Emit per-transaction metric for verification complete
     let after_verify_us = solana_time_utils::timestamp();
-    datapoint_info!(
-        "fast_geyser_latency",
-        ("stage", "verification_complete", String),
-        ("slot", slot as i64, i64),
-        ("timestamp_us", after_verify_us as i64, i64),
-        (
-            "verify_duration_us",
-            (after_verify_us.saturating_sub(before_verify_us)) as i64,
-            i64
-        ),
-    );
+    for entry_type in entries.iter() {
+        if let EntryType::Transactions(txs) = entry_type {
+            for tx in txs {
+                datapoint_info!(
+                    "fast_geyser_latency",
+                    ("stage", "verification_complete", String),
+                    ("timestamp_us", after_verify_us as i64, i64),
+                    ("tx_signature", tx.signature().to_string(), String),
+                );
+            }
+        }
+    }
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let replay_entries: Vec<_> = entries

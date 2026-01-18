@@ -3829,16 +3829,6 @@ impl Bank {
             },
         ));
 
-        datapoint_info!(
-            "fast_geyser_research",
-            (
-                "batch_tx_count",
-                batch.sanitized_transactions().len() as i64,
-                i64
-            ),
-            ("load_and_execute_us", load_and_execute_us, i64),
-        );
-
         // pre_commit_callback could initiate an atomic operation (i.e. poh recording with block
         // producing unified scheduler). in that case, it returns Some(freeze_lock), which should
         // unlocked only after calling commit_transactions() immediately after calling the
