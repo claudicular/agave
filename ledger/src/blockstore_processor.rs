@@ -744,7 +744,7 @@ fn queue_batches_with_lock_retry(
         for tx in &transactions {
             datapoint_info!(
                 "fast_geyser_latency",
-                ("stage", "accounts_locked", String),
+                "stage" => "accounts_locked",
                 ("timestamp_us", after_lock_us as i64, i64),
                 ("tx_signature", tx.signature().to_string(), String),
             );
@@ -1686,7 +1686,7 @@ fn confirm_slot_entries(
             for tx in txs {
                 datapoint_info!(
                     "fast_geyser_latency",
-                    ("stage", "verification_complete", String),
+                    "stage" => "verification_complete",
                     ("timestamp_us", after_verify_us as i64, i64),
                     ("tx_signature", tx.signature().to_string(), String),
                 );

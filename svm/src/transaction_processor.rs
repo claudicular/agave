@@ -503,7 +503,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     let execution_complete_us = solana_time_utils::timestamp();
                     datapoint_info!(
                         "fast_geyser_latency",
-                        ("stage", "execution_complete", String),
+                        "stage" => "execution_complete",
                         ("slot", self.slot as i64, i64),
                         ("timestamp_us", execution_complete_us as i64, i64),
                         ("tx_signature", tx.signature().to_string(), String),

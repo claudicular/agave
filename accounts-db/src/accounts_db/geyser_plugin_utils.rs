@@ -97,7 +97,7 @@ impl AccountsDb {
                 let geyser_notify_us = solana_time_utils::timestamp();
                 datapoint_info!(
                     "fast_geyser_latency",
-                    ("stage", "geyser_notify", String),
+                    "stage" => "geyser_notify",
                     ("timestamp_us", geyser_notify_us as i64, i64),
                     ("tx_signature", transaction.signature().to_string(), String),
                 );
