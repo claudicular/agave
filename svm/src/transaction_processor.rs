@@ -28,6 +28,7 @@ use {
         compiled_instruction::CompiledInstruction,
         inner_instruction::{InnerInstruction, InnerInstructionsList},
     },
+    solana_metrics::datapoint_info,
     solana_nonce::{
         state::{DurableNonce, State as NonceState},
         versions::Versions as NonceVersions,
@@ -497,6 +498,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     if executed_tx.was_successful() {
                         program_cache_for_tx_batch.merge(&executed_tx.programs_modified_by_tx);
                     }
+
+                    // Emit fast_geyser_latency metric for execution complete
+                    let execution_complete_us = solana_time_utils::timestamp();
+                    datapoint_info!(
+                        "fast_geyser_latency",
+                        ("stage", "execution_complete", String),
+                        ("slot", self.slot as i64, i64),
+                        ("timestamp_us", execution_complete_us as i64, i64),
+                        ("tx_signature", tx.signature().to_string(), String),
+                    );
 
                     Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
                 }

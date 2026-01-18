@@ -3831,7 +3831,11 @@ impl Bank {
 
         datapoint_info!(
             "fast_geyser_research",
-            ("batch_tx_count", batch.sanitized_transactions().len() as i64, i64),
+            (
+                "batch_tx_count",
+                batch.sanitized_transactions().len() as i64,
+                i64
+            ),
             ("load_and_execute_us", load_and_execute_us, i64),
         );
 

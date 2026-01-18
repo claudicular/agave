@@ -242,6 +242,17 @@ where
         metrics,
     )?;
 
+    // Emit fast_geyser_latency metric for each completed data set
+    let entry_available_timestamp = solana_time_utils::timestamp();
+    for data_set in &completed_data_sets {
+        datapoint_info!(
+            "fast_geyser_latency",
+            ("stage", "entry_available", String),
+            ("slot", data_set.slot as i64, i64),
+            ("timestamp_us", entry_available_timestamp as i64, i64),
+        );
+    }
+
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;
     }

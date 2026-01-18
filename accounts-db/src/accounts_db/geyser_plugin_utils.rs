@@ -92,6 +92,16 @@ impl AccountsDb {
         write_version: u64,
     ) {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
+            // Emit fast_geyser_latency metric for geyser notify
+            let geyser_notify_us = solana_time_utils::timestamp();
+            datapoint_info!(
+                "fast_geyser_latency",
+                ("stage", "geyser_notify", String),
+                ("slot", slot as i64, i64),
+                ("timestamp_us", geyser_notify_us as i64, i64),
+                ("pubkey", pubkey.to_string(), String),
+            );
+
             accounts_update_notifier.notify_account_update(
                 slot,
                 account,
