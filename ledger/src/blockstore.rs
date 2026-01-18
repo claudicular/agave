@@ -1296,6 +1296,30 @@ impl Blockstore {
         metrics.total_elapsed_us += total_start.as_us();
         metrics.index_meta_time_us += shred_insertion_tracker.index_meta_time_us;
 
+        datapoint_info!(
+            "fast_geyser_research",
+            (
+                "blockstore_insert_total_us",
+                metrics.total_elapsed_us as i64,
+                i64
+            ),
+            (
+                "blockstore_insert_lock_wait_us",
+                metrics.insert_lock_elapsed_us as i64,
+                i64
+            ),
+            (
+                "blockstore_insert_write_batch_us",
+                metrics.write_batch_elapsed_us as i64,
+                i64
+            ),
+            (
+                "blockstore_insert_completed_data_sets",
+                shred_insertion_tracker.newly_completed_data_sets.len() as i64,
+                i64
+            ),
+        );
+
         Ok(InsertResults {
             completed_data_set_infos: shred_insertion_tracker.newly_completed_data_sets,
             duplicate_shreds: shred_insertion_tracker.duplicate_shreds,

@@ -1516,6 +1516,14 @@ pub fn confirm_slot(
             timing.fetch_fail_elapsed += load_elapsed.as_us();
         } else {
             timing.fetch_elapsed += load_elapsed.as_us();
+            if let Ok((_, num_shreds, _)) = &load_result {
+                datapoint_info!(
+                    "fast_geyser_research",
+                    ("blockstore_entry_load_us", load_elapsed.as_us() as i64, i64),
+                    ("blockstore_entry_load_slot", slot as i64, i64),
+                    ("blockstore_entry_load_num_shreds", *num_shreds as i64, i64),
+                );
+            }
         }
         load_result
     }?;

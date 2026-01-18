@@ -201,6 +201,17 @@ where
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
+
+    datapoint_info!(
+        "fast_geyser_research",
+        (
+            "window_service_recv_elapsed_us",
+            shred_receiver_elapsed.as_us() as i64,
+            i64
+        ),
+        ("window_service_shred_count", shreds.len() as i64, i64),
+    );
+
     let handle_shred = |(shred, repair): (shred::Payload, bool)| {
         if accept_repairs_only && !repair {
             return None;

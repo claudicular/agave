@@ -99,6 +99,15 @@ impl ShredFetchStage {
         let mut stats = ShredFetchStats::default();
 
         for mut packet_batch in recvr {
+            datapoint_info!(
+                "fast_geyser_research",
+                ("shred_fetch_batch_size", packet_batch.len() as i64, i64),
+                (
+                    "shred_fetch_timestamp_us",
+                    solana_time_utils::timestamp() as i64,
+                    i64
+                ),
+            );
             if last_updated.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
                 last_updated = Instant::now();
                 let root_bank = {

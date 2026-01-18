@@ -1182,6 +1182,7 @@ impl ReplayStage {
                 start_leader_time.stop();
 
                 let mut wait_receive_time = Measure::start("wait_receive_time");
+                let mut signal_received = false;
                 if !did_complete_bank {
                     // only wait for the signal if we did not just process a bank; maybe there are more slots available
 
@@ -1190,10 +1191,25 @@ impl ReplayStage {
                     match result {
                         Err(RecvTimeoutError::Timeout) => (),
                         Err(_) => break,
-                        Ok(_) => trace!("blockstore signal"),
+                        Ok(_) => {
+                            trace!("blockstore signal");
+                            signal_received = true;
+                        }
                     };
                 }
                 wait_receive_time.stop();
+
+                if !did_complete_bank {
+                    datapoint_info!(
+                        "fast_geyser_research",
+                        (
+                            "replay_stage_signal_wait_us",
+                            wait_receive_time.as_us() as i64,
+                            i64
+                        ),
+                        ("replay_stage_signal_received", signal_received as i64, i64),
+                    );
+                }
 
                 replay_timing.update(
                     collect_frozen_banks_time.as_us(),
