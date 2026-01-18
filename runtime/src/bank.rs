@@ -3808,11 +3808,14 @@ impl Bank {
             impl FnOnce(&mut ExecuteTimings, &[TransactionProcessingResult]) -> PreCommitResult<'a>,
         >,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
-        let LoadAndExecuteTransactionsOutput {
-            processing_results,
-            processed_counts,
-            balance_collector,
-        } = self.load_and_execute_transactions(
+        let (
+            LoadAndExecuteTransactionsOutput {
+                processing_results,
+                processed_counts,
+                balance_collector,
+            },
+            load_and_execute_us,
+        ) = measure_us!(self.load_and_execute_transactions(
             batch,
             max_age,
             timings,
@@ -3824,6 +3827,11 @@ impl Bank {
                 limit_to_load_programs: false,
                 recording_config,
             },
+        ));
+
+        datapoint_info!(
+            "fast_geyser_research",
+            ("load_and_execute_us", load_and_execute_us, i64),
         );
 
         // pre_commit_callback could initiate an atomic operation (i.e. poh recording with block
