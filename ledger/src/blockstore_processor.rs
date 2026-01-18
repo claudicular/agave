@@ -68,7 +68,7 @@ use {
         path::PathBuf,
         result,
         sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
         vec::Drain,
     },
     thiserror::Error,
@@ -735,9 +735,9 @@ fn queue_batches_with_lock_retry(
     ) -> Result<()>,
 ) -> Result<()> {
     // try to lock the accounts
-    let _before_lock_us = solana_time_utils::timestamp();
+    let _before_lock_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
     let lock_results = bank.try_lock_accounts(&transactions);
-    let after_lock_us = solana_time_utils::timestamp();
+    let after_lock_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
     let first_lock_err = first_err(&lock_results);
     if first_lock_err.is_ok() {
         // Emit per-transaction metric for accounts locked
@@ -1607,7 +1607,7 @@ fn confirm_slot_entries(
          num_txs: {num_txs}, slot_full: {slot_full}",
     );
 
-    let _before_verify_us = solana_time_utils::timestamp();
+    let _before_verify_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
 
     if !skip_verification {
         let tick_hash_count = &mut progress.tick_hash_count;
@@ -1680,7 +1680,7 @@ fn confirm_slot_entries(
         .expect("Transaction verification generates entries");
 
     // Emit per-transaction metric for verification complete
-    let after_verify_us = solana_time_utils::timestamp();
+    let after_verify_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
     for entry_type in entries.iter() {
         if let EntryType::Transactions(txs) = entry_type {
             for tx in txs {

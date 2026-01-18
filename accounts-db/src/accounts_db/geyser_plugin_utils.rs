@@ -14,7 +14,7 @@ use {
     std::{
         cmp::Reverse,
         ops::AddAssign,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -94,7 +94,7 @@ impl AccountsDb {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
             // Emit per-transaction metric for geyser notify (only when txn is Some)
             if let Some(transaction) = txn {
-                let geyser_notify_us = solana_time_utils::timestamp();
+                let geyser_notify_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
                 datapoint_info!(
                     "fast_geyser_latency",
                     "stage" => "geyser_notify",

@@ -60,6 +60,7 @@ use {
         fmt::{Debug, Formatter},
         rc::Rc,
         sync::Weak,
+        time::{SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -500,7 +501,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     }
 
                     // Emit fast_geyser_latency metric for execution complete
-                    let execution_complete_us = solana_time_utils::timestamp();
+                    let execution_complete_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
                     datapoint_info!(
                         "fast_geyser_latency",
                         "stage" => "execution_complete",
