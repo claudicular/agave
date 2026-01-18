@@ -3814,7 +3814,7 @@ impl Bank {
                 processed_counts,
                 balance_collector,
             },
-            load_and_execute_us,
+            _load_and_execute_us,
         ) = measure_us!(self.load_and_execute_transactions(
             batch,
             max_age,
