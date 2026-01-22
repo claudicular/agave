@@ -171,7 +171,7 @@ fn run_check_duplicate(
 
         Ok(())
     };
-    const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+    const RECV_TIMEOUT: Duration = Duration::from_millis(20);
     std::iter::once(shred_receiver.recv_timeout(RECV_TIMEOUT)?)
         .chain(shred_receiver.try_iter())
         .try_for_each(check_duplicate)
