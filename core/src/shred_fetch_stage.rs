@@ -211,7 +211,7 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
+                    Some(Duration::from_millis(1)), // coalesce
                     true,                           // use_pinned_memory
                     None,                           // in_vote_only_mode
                     false,                          // is_staked_service
