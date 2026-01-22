@@ -194,7 +194,7 @@ fn run_insert<F>(
 where
     F: Fn(PossibleDuplicateShred),
 {
-    const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+    const RECV_TIMEOUT: Duration = Duration::from_millis(20);
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
     shreds.extend(verified_receiver.try_iter().flatten());
