@@ -3612,6 +3612,9 @@ impl Bank {
                 &processing_results,
             );
 
+            // Notify grouped transaction accounts if any plugin wants them
+            self.notify_transaction_accounts_to_plugins(sanitized_txs, &processing_results);
+
             let to_store = (self.slot(), accounts_to_store.as_slice());
             self.update_bank_hash_stats(&to_store);
             // See https://github.com/solana-labs/solana/pull/31455 for discussion
@@ -3744,6 +3747,96 @@ impl Bank {
                 }
             })
             .collect()
+    }
+
+    /// Notify plugins of grouped account updates per transaction.
+    /// This provides all writable accounts modified by a transaction in a single notification.
+    /// Additionally, read-only accounts owned by programs in the readonly_owners filter
+    /// are included (useful for Token/Token2022 mint accounts).
+    fn notify_transaction_accounts_to_plugins(
+        &self,
+        sanitized_txs: &[impl TransactionWithMeta],
+        processing_results: &[TransactionProcessingResult],
+    ) {
+        // Check if any plugin wants grouped transaction-account notifications
+        let accounts_holder = self.accounts();
+        let Some(notifier) = accounts_holder.accounts_db.accounts_update_notifier() else {
+            return;
+        };
+        if !notifier.transaction_accounts_notifications_enabled() {
+            return;
+        }
+
+        let slot = self.slot();
+        let write_version = accounts_holder
+            .accounts_db
+            .write_version
+            .load(Ordering::Acquire);
+
+        // Get the list of program owners for which read-only accounts should be included
+        let readonly_owners = notifier.transaction_accounts_include_readonly_owners();
+
+        for (index, (processing_result, tx)) in
+            processing_results.iter().zip(sanitized_txs).enumerate()
+        {
+            let Some(processed_tx) = processing_result.processed_transaction() else {
+                continue;
+            };
+
+            let sanitized_tx = tx.as_sanitized_transaction();
+            let signature = sanitized_tx.signature();
+
+            // Collect accounts for this transaction:
+            // - All writable accounts
+            // - Read-only accounts whose owner is in readonly_owners filter
+            let accounts: Vec<(&Pubkey, &AccountSharedData)> = match processed_tx {
+                ProcessedTransaction::Executed(executed_tx) => {
+                    if executed_tx.execution_details.status.is_ok() {
+                        // For successful transactions, collect writable accounts
+                        // plus read-only accounts matching the owner filter
+                        executed_tx
+                            .loaded_transaction
+                            .accounts
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, (pubkey, account))| {
+                                let is_writable = sanitized_tx.message().is_writable(i);
+                                let owner_in_filter = !readonly_owners.is_empty()
+                                    && readonly_owners.contains(account.owner());
+
+                                if is_writable || owner_in_filter {
+                                    Some((pubkey, account))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        // For failed transactions, use rollback accounts
+                        executed_tx
+                            .loaded_transaction
+                            .rollback_accounts
+                            .iter()
+                            .map(|(pubkey, account)| (pubkey, account))
+                            .collect()
+                    }
+                }
+                ProcessedTransaction::FeesOnly(fees_only_tx) => {
+                    // For fees-only transactions, use rollback accounts
+                    fees_only_tx
+                        .rollback_accounts
+                        .iter()
+                        .map(|(pubkey, account)| (pubkey, account))
+                        .collect()
+                }
+            };
+
+            if accounts.is_empty() {
+                continue;
+            }
+
+            notifier.notify_transaction_accounts(slot, signature, index, &accounts, write_version);
+        }
     }
 
     fn run_incinerator(&self) {

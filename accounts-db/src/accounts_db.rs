@@ -1406,6 +1406,11 @@ impl AccountsDb {
         self.accounts_update_notifier.is_some()
     }
 
+    /// Returns a reference to the accounts update notifier if present.
+    pub fn accounts_update_notifier(&self) -> Option<&AccountsUpdateNotifier> {
+        self.accounts_update_notifier.as_ref()
+    }
+
     fn next_id(&self) -> AccountsFileId {
         let next_id = self.next_id.fetch_add(1, Ordering::AcqRel);
         assert!(
