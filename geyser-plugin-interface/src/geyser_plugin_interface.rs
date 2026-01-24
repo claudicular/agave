@@ -5,6 +5,7 @@
 use {
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
+    solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_status::{Reward, RewardsAndNumPartitions, TransactionStatusMeta},
@@ -189,6 +190,34 @@ pub enum ReplicaTransactionInfoVersions<'a> {
     V0_0_1(&'a ReplicaTransactionInfo<'a>),
     V0_0_2(&'a ReplicaTransactionInfoV2<'a>),
     V0_0_3(&'a ReplicaTransactionInfoV3<'a>),
+}
+
+/// All accounts modified by a single transaction, grouped together.
+/// This provides a way to receive all account updates for a transaction
+/// in a single notification, rather than individual account updates.
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct ReplicaTransactionAccountsInfo<'a> {
+    /// The transaction signature
+    pub signature: &'a Signature,
+
+    /// Slot where this transaction executed
+    pub slot: Slot,
+
+    /// The transaction's index in the block
+    pub index: usize,
+
+    /// All writable accounts modified by this transaction
+    pub accounts: &'a [ReplicaAccountInfoV3<'a>],
+}
+
+/// A wrapper to future-proof ReplicaTransactionAccountsInfo handling.
+/// If there were a change to the structure of ReplicaTransactionAccountsInfo,
+/// there would be new enum entry for the newer version, forcing
+/// plugin implementations to handle the change.
+#[repr(u32)]
+pub enum ReplicaTransactionAccountsInfoVersions<'a> {
+    V0_0_1(&'a ReplicaTransactionAccountsInfo<'a>),
 }
 
 #[derive(Clone, Debug)]
@@ -499,5 +528,40 @@ pub trait GeyserPlugin: Any + Send + Sync + std::fmt::Debug {
     /// entry data, return true.
     fn entry_notifications_enabled(&self) -> bool {
         false
+    }
+
+    /// Called when all accounts modified by a transaction are ready to be notified.
+    /// This provides grouped account updates per transaction, allowing plugins to
+    /// receive all account changes from a single transaction in one callback.
+    ///
+    /// This is called in addition to (not instead of) the individual `update_account`
+    /// calls, allowing plugins to choose which notification style they prefer.
+    #[allow(unused_variables)]
+    fn notify_transaction_accounts(
+        &self,
+        transaction_accounts: ReplicaTransactionAccountsInfoVersions,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Check if the plugin is interested in grouped transaction-account notifications.
+    /// Default is false -- if the plugin wants to receive all account updates
+    /// for a transaction grouped together, return true.
+    fn transaction_accounts_notifications_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns a list of program owner pubkeys for which read-only accounts should be
+    /// included in transaction_accounts notifications.
+    ///
+    /// By default, only writable accounts are included. If this returns a non-empty list,
+    /// read-only accounts owned by any of these programs will also be included.
+    ///
+    /// This is useful for including Token/Token2022 mint accounts (which are typically
+    /// read-only in swap transactions) to access transfer fee configurations.
+    ///
+    /// Example: Return `[TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]` to include mint accounts.
+    fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+        vec![]
     }
 }
