@@ -152,9 +152,9 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
             }
 
             let mut measure = Measure::start("geyser-plugin-notify-transaction-accounts");
-            match plugin.notify_transaction_accounts(ReplicaTransactionAccountsInfoVersions::V0_0_1(
-                &transaction_accounts_info,
-            )) {
+            match plugin.notify_transaction_accounts(
+                ReplicaTransactionAccountsInfoVersions::V0_0_1(&transaction_accounts_info),
+            ) {
                 Err(err) => {
                     error!(
                         "Failed to notify transaction accounts for signature {} at slot {}, error: {} to plugin {}",

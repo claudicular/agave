@@ -93,6 +93,7 @@ dependencies = [
  "log",
  "solana-clock",
  "solana-hash 3.1.0",
+ "solana-pubkey",
  "solana-signature",
  "solana-transaction",
  "solana-transaction-status",
