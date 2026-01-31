@@ -4044,31 +4044,32 @@ pub mod rpc_full {
                     )));
                 }
 
-                if result.is_err() {
-                    Some(vec![None; config_accounts.addresses.len()])
-                } else {
-                    let mut post_simulation_accounts_map = HashMap::new();
+                let post_simulation_accounts_map = if result.is_ok() {
+                    let mut map = HashMap::new();
                     for (pubkey, data) in post_simulation_accounts {
-                        post_simulation_accounts_map.insert(pubkey, data);
+                        map.insert(pubkey, data);
                     }
+                    Some(map)
+                } else {
+                    None
+                };
 
-                    Some(
-                        config_accounts
-                            .addresses
-                            .iter()
-                            .map(|address_str| {
-                                let pubkey = verify_pubkey(address_str)?;
-                                get_encoded_account(
-                                    bank,
-                                    &pubkey,
-                                    accounts_encoding,
-                                    None,
-                                    Some(&post_simulation_accounts_map),
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    )
-                }
+                Some(
+                    config_accounts
+                        .addresses
+                        .iter()
+                        .map(|address_str| {
+                            let pubkey = verify_pubkey(address_str)?;
+                            get_encoded_account(
+                                bank,
+                                &pubkey,
+                                accounts_encoding,
+                                None,
+                                post_simulation_accounts_map.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
             } else {
                 None
             };
