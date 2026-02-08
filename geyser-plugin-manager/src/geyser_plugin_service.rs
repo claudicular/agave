@@ -65,6 +65,7 @@ impl GeyserPluginService {
             confirmed_bank_receiver,
             geyser_plugin_always_enabled,
             geyser_plugin_config_files,
+            false, // accounts_notify_async
             None,
         )
     }
@@ -73,6 +74,7 @@ impl GeyserPluginService {
         confirmed_bank_receiver: Receiver<SlotNotification>,
         geyser_plugin_always_enabled: bool,
         geyser_plugin_config_files: &[PathBuf],
+        accounts_notify_async: bool,
         rpc_to_plugin_manager_receiver_and_exit: Option<(
             Receiver<GeyserPluginManagerRequest>,
             Arc<AtomicBool>,
@@ -100,6 +102,7 @@ impl GeyserPluginService {
                 let accounts_update_notifier = AccountsUpdateNotifierImpl::new(
                     plugin_manager.clone(),
                     account_data_snapshot_notifications_enabled,
+                    accounts_notify_async,
                 );
                 Some(Arc::new(accounts_update_notifier))
             } else {

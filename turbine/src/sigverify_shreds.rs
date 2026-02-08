@@ -4,7 +4,7 @@ use {
         retransmit_stage::RetransmitStage,
     },
     agave_feature_set as feature_set,
-    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
+    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     itertools::{Either, Itertools},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
     solana_clock::Slot,
@@ -82,6 +82,8 @@ pub fn spawn_shred_sigverify(
     retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     num_sigverify_threads: NonZeroUsize,
+    max_sigverify_batches: NonZeroUsize,
+    max_oldest_batch_age_us: u64,
 ) -> JoinHandle<()> {
     let recycler_cache = RecyclerCache::warmed();
     let mut stats = ShredSigVerifyStats::new(Instant::now());
@@ -95,6 +97,8 @@ pub fn spawn_shred_sigverify(
         .thread_name(|i| format!("solSvrfyShred{i:02}"))
         .build()
         .expect("new rayon threadpool");
+    let max_sigverify_batches = std::cmp::min(max_sigverify_batches.get(), SIGVERIFY_SHRED_BATCH_SIZE);
+    let max_oldest_batch_age = Duration::from_micros(std::cmp::max(max_oldest_batch_age_us, 1));
     let run_shred_sigverify = move || {
         let mut rng = rand::thread_rng();
         let mut deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
@@ -119,6 +123,8 @@ pub fn spawn_shred_sigverify(
                 &verified_sender,
                 &cluster_nodes_cache,
                 &cache,
+                max_sigverify_batches,
+                max_oldest_batch_age,
                 &mut stats,
                 &mut shred_buffer,
             ) {
@@ -150,6 +156,8 @@ fn run_shred_sigverify<const K: usize>(
     verified_sender: &Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     cache: &RwLock<LruCache>,
+    max_sigverify_batches: usize,
+    max_oldest_batch_age: Duration,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
 ) -> Result<(), ShredSigverifyError> {
@@ -157,13 +165,26 @@ fn run_shred_sigverify<const K: usize>(
     let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
     stats.num_packets += packets.len();
     shred_buffer.push(packets);
-    for packets in shred_fetch_receiver
-        .try_iter()
-        .take(SIGVERIFY_SHRED_BATCH_SIZE - 1)
-    {
-        stats.num_packets += packets.len();
-        shred_buffer.push(packets);
+    let oldest_batch_start = Instant::now();
+    while shred_buffer.len() < max_sigverify_batches {
+        if oldest_batch_start.elapsed() >= max_oldest_batch_age {
+            stats.num_microbatch_age_limit_hits += 1;
+            break;
+        }
+        match shred_fetch_receiver.try_recv() {
+            Ok(packets) => {
+                stats.num_packets += packets.len();
+                shred_buffer.push(packets);
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => return Err(ShredSigverifyError::RecvDisconnected),
+        }
     }
+    if shred_buffer.len() >= max_sigverify_batches {
+        stats.num_microbatch_batch_limit_hits += 1;
+    }
+    stats.num_microbatch_flushes += 1;
+    stats.microbatch_oldest_age_us += oldest_batch_start.elapsed().as_micros() as u64;
 
     let now = Instant::now();
     stats.num_iters += 1;
@@ -475,6 +496,10 @@ struct ShredSigVerifyStats {
     num_retransmit_shreds: usize,
     num_unknown_slot_leader: AtomicUsize,
     num_unknown_turbine_parent: AtomicUsize,
+    num_microbatch_flushes: usize,
+    num_microbatch_batch_limit_hits: usize,
+    num_microbatch_age_limit_hits: usize,
+    microbatch_oldest_age_us: u64,
     elapsed_micros: u64,
     resign_micros: u64,
 }
@@ -499,6 +524,10 @@ impl ShredSigVerifyStats {
             num_retransmit_shreds: 0usize,
             num_unknown_slot_leader: AtomicUsize::default(),
             num_unknown_turbine_parent: AtomicUsize::default(),
+            num_microbatch_flushes: 0,
+            num_microbatch_batch_limit_hits: 0,
+            num_microbatch_age_limit_hits: 0,
+            microbatch_oldest_age_us: 0,
             elapsed_micros: 0u64,
             resign_micros: 0u64,
         }
@@ -548,6 +577,22 @@ impl ShredSigVerifyStats {
             (
                 "num_unknown_turbine_parent",
                 self.num_unknown_turbine_parent.load(Ordering::Relaxed),
+                i64
+            ),
+            ("num_microbatch_flushes", self.num_microbatch_flushes, i64),
+            (
+                "num_microbatch_batch_limit_hits",
+                self.num_microbatch_batch_limit_hits,
+                i64
+            ),
+            (
+                "num_microbatch_age_limit_hits",
+                self.num_microbatch_age_limit_hits,
+                i64
+            ),
+            (
+                "microbatch_oldest_age_us",
+                self.microbatch_oldest_age_us,
                 i64
             ),
             ("elapsed_micros", self.elapsed_micros, i64),

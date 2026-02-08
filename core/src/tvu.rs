@@ -100,6 +100,10 @@ pub struct TvuConfig {
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
+    pub shred_sigverify_max_batches: NonZeroUsize,
+    pub shred_sigverify_max_age_us: u64,
+    pub replay_fast_ingress: bool,
+    pub replay_control_loop_ms: u64,
     pub xdp_sender: Option<XdpSender>,
 }
 
@@ -114,6 +118,10 @@ impl Default for TvuConfig {
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
+            shred_sigverify_max_batches: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+            shred_sigverify_max_age_us: u64::MAX,
+            replay_fast_ingress: false,
+            replay_control_loop_ms: 50,
             xdp_sender: None,
         }
     }
@@ -217,6 +225,8 @@ impl Tvu {
             retransmit_sender.clone(),
             verified_sender,
             tvu_config.shred_sigverify_threads,
+            tvu_config.shred_sigverify_max_batches,
+            tvu_config.shred_sigverify_max_age_us,
         );
 
         let retransmit_stage = RetransmitStage::new(
@@ -336,6 +346,8 @@ impl Tvu {
             wait_to_vote_slot,
             replay_forks_threads: tvu_config.replay_forks_threads,
             replay_transactions_threads: tvu_config.replay_transactions_threads,
+            replay_fast_ingress: tvu_config.replay_fast_ingress,
+            replay_control_loop_ms: tvu_config.replay_control_loop_ms,
             blockstore: blockstore.clone(),
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),

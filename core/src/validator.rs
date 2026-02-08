@@ -300,6 +300,24 @@ impl SchedulerPacing {
     }
 }
 
+#[derive(Clone, EnumString, EnumVariantNames, Default, IntoStaticStr, Display)]
+#[strum(serialize_all = "kebab-case")]
+pub enum LatencyMode {
+    #[default]
+    Standard,
+    HybridSpeculative,
+}
+
+impl LatencyMode {
+    pub const fn cli_names() -> &'static [&'static str] {
+        Self::VARIANTS
+    }
+
+    pub fn cli_message() -> &'static str {
+        "Switch latency optimization behavior"
+    }
+}
+
 /// Configuration for the block generator invalidator for replay.
 #[derive(Clone, Debug)]
 pub struct GeneratorConfig {
@@ -378,6 +396,13 @@ pub struct ValidatorConfig {
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub tvu_shred_sigverify_threads: NonZeroUsize,
+    pub tvu_shred_sigverify_max_batches: NonZeroUsize,
+    pub tvu_shred_sigverify_max_age_us: u64,
+    pub replay_fast_ingress: bool,
+    pub replay_control_loop_ms: u64,
+    pub replay_hot_cache_mb: usize,
+    pub latency_mode: LatencyMode,
+    pub accounts_notify_async: bool,
     pub delay_leader_block_for_pending_fork: bool,
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
@@ -460,6 +485,13 @@ impl ValidatorConfig {
             replay_transactions_threads: max_thread_count,
             tvu_shred_sigverify_threads: NonZeroUsize::new(get_thread_count())
                 .expect("thread count is non-zero"),
+            tvu_shred_sigverify_max_batches: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+            tvu_shred_sigverify_max_age_us: u64::MAX,
+            replay_fast_ingress: false,
+            replay_control_loop_ms: 50,
+            replay_hot_cache_mb: 0,
+            latency_mode: LatencyMode::default(),
+            accounts_notify_async: false,
             delay_leader_block_for_pending_fork: false,
             use_tpu_client_next: true,
             retransmit_xdp: None,
@@ -708,6 +740,18 @@ impl Validator {
 
         info!("identity pubkey: {id}");
         info!("vote account pubkey: {vote_account}");
+        info!(
+            "latency config: mode={} replay_fast_ingress={} replay_control_loop_ms={} \
+             replay_hot_cache_mb={} sigverify_max_batches={} sigverify_max_age_us={} \
+             accounts_notify_async={}",
+            config.latency_mode,
+            config.replay_fast_ingress,
+            config.replay_control_loop_ms,
+            config.replay_hot_cache_mb,
+            config.tvu_shred_sigverify_max_batches,
+            config.tvu_shred_sigverify_max_age_us,
+            config.accounts_notify_async,
+        );
 
         if !config.no_os_network_stats_reporting {
             verify_net_stats_access().map_err(|e| {
@@ -739,6 +783,7 @@ impl Validator {
                         confirmed_bank_receiver,
                         config.geyser_plugin_always_enabled,
                         geyser_plugin_config_files.as_ref(),
+                        config.accounts_notify_async,
                         rpc_to_plugin_manager_receiver_and_exit,
                     )
                     .map_err(|err| {
@@ -1645,6 +1690,10 @@ impl Validator {
                 replay_forks_threads: config.replay_forks_threads,
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
+                shred_sigverify_max_batches: config.tvu_shred_sigverify_max_batches,
+                shred_sigverify_max_age_us: config.tvu_shred_sigverify_max_age_us,
+                replay_fast_ingress: config.replay_fast_ingress,
+                replay_control_loop_ms: config.replay_control_loop_ms,
                 xdp_sender: xdp_sender.clone(),
             },
             &max_slots,
@@ -2173,6 +2222,7 @@ fn load_blockstore(
 
     let blockstore = Blockstore::open_with_options(ledger_path, config.blockstore_options.clone())
         .map_err(|err| format!("Failed to open Blockstore: {err:?}"))?;
+    blockstore.set_replay_hot_cache_capacity_bytes(config.replay_hot_cache_mb * 1024 * 1024);
 
     let (ledger_signal_sender, ledger_signal_receiver) = bounded(MAX_REPLAY_WAKE_UP_SIGNALS);
     blockstore.add_new_shred_signal(ledger_signal_sender);

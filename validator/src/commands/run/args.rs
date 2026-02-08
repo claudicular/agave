@@ -20,7 +20,7 @@ use {
     },
     solana_core::{
         banking_trace::DirByteLimit,
-        validator::{BlockProductionMethod, BlockVerificationMethod},
+        validator::{BlockProductionMethod, BlockVerificationMethod, LatencyMode},
     },
     solana_keypair::Keypair,
     solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
@@ -739,6 +739,76 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "A list of validators to gossip with. If specified, gossip will not push/pull \
                  from from validators outside this set. [default: all validators]",
             ),
+    )
+    .arg(
+        Arg::with_name("tpu_coalesce_ms")
+            .long("tpu-coalesce-ms")
+            .value_name("MILLISECS")
+            .takes_value(true)
+            .validator(is_parsable::<u64>)
+            .help("Milliseconds to wait in the TPU receiver for packet coalescing."),
+    )
+    .arg(
+        Arg::with_name("latency_mode")
+            .long("latency-mode")
+            .takes_value(true)
+            .possible_values(LatencyMode::cli_names())
+            .default_value("standard")
+            .help(LatencyMode::cli_message()),
+    )
+    .arg(
+        Arg::with_name("tvu_shred_sigverify_max_batches")
+            .long("tvu-shred-sigverify-max-batches")
+            .value_name("COUNT")
+            .takes_value(true)
+            .validator(is_non_zero)
+            .help(
+                "Maximum shred packet-batches to process per sigverify iteration \
+                 (default: 1024 in standard mode, 64 in hybrid-speculative mode).",
+            ),
+    )
+    .arg(
+        Arg::with_name("tvu_shred_sigverify_max_age_us")
+            .long("tvu-shred-sigverify-max-age-us")
+            .value_name("MICROSECONDS")
+            .takes_value(true)
+            .validator(is_non_zero)
+            .help(
+                "Maximum age of the oldest batch before flushing shred sigverify work \
+                 (default: disabled in standard mode, 250us in hybrid-speculative mode).",
+            ),
+    )
+    .arg(
+        Arg::with_name("replay_fast_ingress")
+            .long("replay-fast-ingress")
+            .takes_value(false)
+            .help("Enable replay fast-ingress mode to prioritize signal-driven replay iterations."),
+    )
+    .arg(
+        Arg::with_name("replay_control_loop_ms")
+            .long("replay-control-loop-ms")
+            .value_name("MILLISECS")
+            .takes_value(true)
+            .validator(is_non_zero)
+            .default_value("50")
+            .help("Control-loop cadence in replay fast-ingress mode."),
+    )
+    .arg(
+        Arg::with_name("replay_hot_cache_mb")
+            .long("replay-hot-cache-mb")
+            .value_name("MEGABYTES")
+            .takes_value(true)
+            .validator(is_parsable::<usize>)
+            .help(
+                "Memory budget for replay completed-data hot cache \
+                 (default: 0 in standard mode, 256 in hybrid-speculative mode).",
+            ),
+    )
+    .arg(
+        Arg::with_name("accounts_notify_async")
+            .long("accounts-notify-async")
+            .takes_value(false)
+            .help("Dispatch account update plugin notifications through an async bounded queue."),
     )
     .arg(
         Arg::with_name("tpu_connection_pool_size")
