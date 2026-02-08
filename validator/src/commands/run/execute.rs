@@ -63,10 +63,7 @@ use {
     solana_signer::Signer,
     solana_streamer::{
         nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
-        quic::{
-            QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig,
-            DEFAULT_TPU_COALESCE,
-        },
+        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
     },
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_turbine::{
@@ -83,7 +80,6 @@ use {
         process::exit,
         str::FromStr,
         sync::{atomic::AtomicBool, Arc, RwLock},
-        time::Duration,
     },
 };
 
@@ -164,9 +160,6 @@ pub fn execute(
 
     let private_rpc = matches.is_present("private_rpc");
     let do_port_check = !matches.is_present("no_port_check");
-    let tpu_coalesce = value_t!(matches, "tpu_coalesce_ms", u64)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_TPU_COALESCE);
     let latency_mode = value_t_or_exit!(matches, "latency_mode", LatencyMode);
     let latency_mode_hybrid = matches!(latency_mode, LatencyMode::HybridSpeculative);
     let tvu_shred_sigverify_max_batches =
