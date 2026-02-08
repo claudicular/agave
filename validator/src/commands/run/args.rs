@@ -803,6 +803,15 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Dispatch account update plugin notifications through an async bounded queue."),
     )
     .arg(
+        Arg::with_name("enable_transaction_accounts_notify")
+            .long("enable-transaction-accounts-notify")
+            .takes_value(false)
+            .help(
+                "Enable grouped transaction-account notifications to geyser plugins \
+                 (disabled by default for compatibility).",
+            ),
+    )
+    .arg(
         Arg::with_name("tpu_connection_pool_size")
             .long("tpu-connection-pool-size")
             .takes_value(true)
