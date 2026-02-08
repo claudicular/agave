@@ -848,27 +848,29 @@ impl ReplayStage {
                     wait_receive_time.stop();
                     replay_timing.fast_ingress_skipped_control_count += 1;
                     replay_timing.fast_ingress_wait_receive_us += wait_receive_time.as_us();
-                    replay_timing.update(
-                        0,                                // collect_frozen_banks_time
-                        0,                                // compute_bank_stats_time
-                        0,                                // select_vote_and_reset_forks_time
-                        0,                                // start_leader_time
-                        0,                                // reset_bank_time
-                        0,                                // voting_time
-                        0,                                // select_forks_time
-                        0,                                // compute_slot_stats_time
-                        0,                                // generate_new_bank_forks_time
-                        replay_active_banks_time.as_us(), // replay_active_banks_time
-                        wait_receive_time.as_us(),        // wait_receive_time
-                        0,                                // heaviest_fork_failures_time
-                        u64::from(did_complete_bank),     // did_complete_bank
-                        0,                                // process_ancestor_hashes_duplicate_slots
-                        0,                                // process_duplicate_confirmed_slots
+                    replay_timing.update_non_alpenglow(
+                        0,                            // collect_frozen_banks_time
+                        0,                            // compute_bank_stats_time
+                        0,                            // select_vote_and_reset_forks_time
+                        0,                            // reset_bank_time
+                        0,                            // voting_time
+                        0,                            // select_forks_time
+                        0,                            // compute_slot_stats_time
+                        0,                            // heaviest_fork_failures_time
+                        u64::from(did_complete_bank), // did_complete_bank
+                        0,                            // process_ancestor_hashes_duplicate_slots
+                        0,                            // process_duplicate_confirmed_slots
                         0, // process_unfrozen_gossip_verified_vote_hashes
                         0, // process_popular_pruned_forks
                         0, // process_duplicate_slots
                         0, // dump_then_repair_correct_slots
                         0, // retransmit_not_propagated_time
+                        0, // start_leader_time
+                    );
+                    replay_timing.update_common(
+                        0,                                // generate_new_bank_forks_time
+                        replay_active_banks_time.as_us(), // replay_active_banks_time
+                        wait_receive_time.as_us(),        // wait_receive_time
                     );
                     continue;
                 }
