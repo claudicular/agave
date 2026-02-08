@@ -403,6 +403,7 @@ pub struct ValidatorConfig {
     pub replay_hot_cache_mb: usize,
     pub latency_mode: LatencyMode,
     pub accounts_notify_async: bool,
+    pub enable_transaction_accounts_notify: bool,
     pub delay_leader_block_for_pending_fork: bool,
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
@@ -492,6 +493,7 @@ impl ValidatorConfig {
             replay_hot_cache_mb: 0,
             latency_mode: LatencyMode::default(),
             accounts_notify_async: false,
+            enable_transaction_accounts_notify: false,
             delay_leader_block_for_pending_fork: false,
             use_tpu_client_next: true,
             retransmit_xdp: None,
@@ -743,7 +745,7 @@ impl Validator {
         info!(
             "latency config: mode={} replay_fast_ingress={} replay_control_loop_ms={} \
              replay_hot_cache_mb={} sigverify_max_batches={} sigverify_max_age_us={} \
-             accounts_notify_async={}",
+             accounts_notify_async={} enable_transaction_accounts_notify={}",
             config.latency_mode,
             config.replay_fast_ingress,
             config.replay_control_loop_ms,
@@ -751,6 +753,7 @@ impl Validator {
             config.tvu_shred_sigverify_max_batches,
             config.tvu_shred_sigverify_max_age_us,
             config.accounts_notify_async,
+            config.enable_transaction_accounts_notify,
         );
 
         if !config.no_os_network_stats_reporting {
@@ -784,6 +787,7 @@ impl Validator {
                         config.geyser_plugin_always_enabled,
                         geyser_plugin_config_files.as_ref(),
                         config.accounts_notify_async,
+                        config.enable_transaction_accounts_notify,
                         rpc_to_plugin_manager_receiver_and_exit,
                     )
                     .map_err(|err| {

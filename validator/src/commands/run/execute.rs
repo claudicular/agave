@@ -190,6 +190,8 @@ pub fn execute(
         0
     };
     let accounts_notify_async = matches.is_present("accounts_notify_async");
+    let enable_transaction_accounts_notify =
+        matches.is_present("enable_transaction_accounts_notify");
 
     let ledger_path = run_args.ledger_path;
 
@@ -637,6 +639,7 @@ pub fn execute(
         replay_hot_cache_mb,
         latency_mode,
         accounts_notify_async,
+        enable_transaction_accounts_notify,
         delay_leader_block_for_pending_fork: matches
             .is_present("delay_leader_block_for_pending_fork"),
         wen_restart_proto_path: value_t!(matches, "wen_restart", PathBuf).ok(),

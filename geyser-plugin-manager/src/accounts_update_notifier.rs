@@ -28,6 +28,7 @@ pub(crate) struct AccountsUpdateNotifierImpl {
     plugin_manager: Arc<RwLock<GeyserPluginManager>>,
     snapshot_notifications_enabled: bool,
     async_dispatch: Option<AsyncAccountsDispatch>,
+    enable_transaction_accounts_notify: bool,
 }
 
 const ASYNC_ACCOUNTS_DISPATCH_CHANNEL_CAPACITY: usize = 16_384;
@@ -188,6 +189,9 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
         accounts: &[(&Pubkey, &AccountSharedData)],
         write_version_start: u64,
     ) {
+        if !self.enable_transaction_accounts_notify {
+            return;
+        }
         let plugin_manager = self.plugin_manager.read().unwrap();
         if plugin_manager.plugins.is_empty() {
             return;
@@ -254,6 +258,9 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
     }
 
     fn transaction_accounts_notifications_enabled(&self) -> bool {
+        if !self.enable_transaction_accounts_notify {
+            return false;
+        }
         let plugin_manager = self.plugin_manager.read().unwrap();
         plugin_manager
             .plugins
@@ -262,6 +269,9 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
     }
 
     fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+        if !self.enable_transaction_accounts_notify {
+            return vec![];
+        }
         let plugin_manager = self.plugin_manager.read().unwrap();
         // Collect all unique owners from all plugins
         let mut owners: Vec<Pubkey> = plugin_manager
@@ -280,6 +290,7 @@ impl AccountsUpdateNotifierImpl {
         plugin_manager: Arc<RwLock<GeyserPluginManager>>,
         snapshot_notifications_enabled: bool,
         accounts_notify_async: bool,
+        enable_transaction_accounts_notify: bool,
     ) -> Self {
         let async_dispatch = accounts_notify_async.then(|| {
             let (sender, receiver) = bounded(ASYNC_ACCOUNTS_DISPATCH_CHANNEL_CAPACITY);
@@ -298,6 +309,7 @@ impl AccountsUpdateNotifierImpl {
             plugin_manager,
             snapshot_notifications_enabled,
             async_dispatch,
+            enable_transaction_accounts_notify,
         }
     }
 

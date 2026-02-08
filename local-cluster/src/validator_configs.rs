@@ -84,6 +84,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         replay_hot_cache_mb: config.replay_hot_cache_mb,
         latency_mode: config.latency_mode.clone(),
         accounts_notify_async: config.accounts_notify_async,
+        enable_transaction_accounts_notify: config.enable_transaction_accounts_notify,
         delay_leader_block_for_pending_fork: config.delay_leader_block_for_pending_fork,
         use_tpu_client_next: config.use_tpu_client_next,
         retransmit_xdp: config.retransmit_xdp.clone(),
