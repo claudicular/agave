@@ -26,7 +26,7 @@ use {
     agave_feature_set::FeatureSet,
     agave_snapshots::unpack_genesis_archive,
     assert_matches::debug_assert_matches,
-    bincode::{deserialize, serialize},
+    bincode::{deserialize, serialize, serialized_size},
     crossbeam_channel::{bounded, Receiver, Sender, TrySendError},
     dashmap::DashSet,
     itertools::Itertools,
@@ -42,7 +42,7 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_metrics::datapoint_error,
+    solana_metrics::{datapoint_error, inc_new_counter_debug},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signature::Signature,
@@ -237,6 +237,70 @@ pub struct CompletedDataSetInfo {
     pub indices: Range<u32>,
 }
 
+type CompletedDataRangeKey = (Slot, u32, u32);
+
+#[derive(Default)]
+struct CompletedDataEntriesCache {
+    capacity_bytes: usize,
+    size_bytes: usize,
+    // Keys are (slot, start_index, end_index) where end_index is exclusive.
+    entries_by_range: HashMap<CompletedDataRangeKey, Arc<Vec<Entry>>>,
+    lru_order: VecDeque<CompletedDataRangeKey>,
+}
+
+impl CompletedDataEntriesCache {
+    fn set_capacity_bytes(&mut self, capacity_bytes: usize) {
+        self.capacity_bytes = capacity_bytes;
+        self.evict_if_needed();
+    }
+
+    fn insert(&mut self, key: CompletedDataRangeKey, entries: Vec<Entry>) {
+        if self.capacity_bytes == 0 {
+            return;
+        }
+        let Ok(size_bytes) = serialized_size(&entries).map(|size| size as usize) else {
+            return;
+        };
+        if size_bytes > self.capacity_bytes {
+            return;
+        }
+        if let Some(existing) = self.entries_by_range.remove(&key) {
+            self.size_bytes = self
+                .size_bytes
+                .saturating_sub(serialized_size(existing.as_ref()).unwrap_or(0) as usize);
+        }
+        self.lru_order.retain(|existing_key| *existing_key != key);
+        self.size_bytes = self.size_bytes.saturating_add(size_bytes);
+        self.entries_by_range.insert(key, Arc::new(entries));
+        self.lru_order.push_back(key);
+        self.evict_if_needed();
+    }
+
+    fn get(&self, key: CompletedDataRangeKey) -> Option<Arc<Vec<Entry>>> {
+        self.entries_by_range.get(&key).cloned()
+    }
+
+    fn evict_if_needed(&mut self) {
+        if self.capacity_bytes == 0 {
+            self.entries_by_range.clear();
+            self.lru_order.clear();
+            self.size_bytes = 0;
+            return;
+        }
+        while self.size_bytes > self.capacity_bytes {
+            let Some(key) = self.lru_order.pop_front() else {
+                break;
+            };
+            let Some(entries) = self.entries_by_range.remove(&key) else {
+                continue;
+            };
+            self.size_bytes = self
+                .size_bytes
+                .saturating_sub(serialized_size(entries.as_ref()).unwrap_or(0) as usize);
+        }
+    }
+}
+
 pub struct BlockstoreSignals {
     pub blockstore: Blockstore,
     pub ledger_signal_receiver: Receiver<bool>,
@@ -276,6 +340,7 @@ pub struct Blockstore {
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
     pub lowest_cleanup_slot: RwLock<Slot>,
     pub slots_stats: SlotsStats,
+    completed_data_entries_cache: RwLock<CompletedDataEntriesCache>,
 }
 
 pub struct IndexMetaWorkingSetEntry {
@@ -374,6 +439,22 @@ impl Blockstore {
         banking_retrace_path(&self.ledger_path)
     }
 
+    pub fn set_replay_hot_cache_capacity_bytes(&self, capacity_bytes: usize) {
+        let mut cache = self.completed_data_entries_cache.write().unwrap();
+        cache.set_capacity_bytes(capacity_bytes);
+    }
+
+    pub fn cache_completed_data_block_entries(
+        &self,
+        slot: Slot,
+        indices: Range<u32>,
+        entries: Vec<Entry>,
+    ) {
+        let key = (slot, indices.start, indices.end);
+        let mut cache = self.completed_data_entries_cache.write().unwrap();
+        cache.insert(key, entries);
+    }
+
     /// Opens a Ledger in directory, provides "infinite" window of shreds
     pub fn open(ledger_path: &Path) -> Result<Blockstore> {
         Self::do_open(ledger_path, BlockstoreOptions::default())
@@ -453,6 +534,7 @@ impl Blockstore {
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
             slots_stats: SlotsStats::default(),
+            completed_data_entries_cache: RwLock::new(CompletedDataEntriesCache::default()),
         };
         blockstore.cleanup_old_entries()?;
         blockstore.update_highest_primary_index_slot()?;
@@ -3664,6 +3746,23 @@ impl Blockstore {
         completed_ranges: CompletedRanges,
         slot_meta: Option<&SlotMeta>,
     ) -> Result<Vec<Entry>> {
+        let maybe_cached_entries = {
+            let cache = self.completed_data_entries_cache.read().unwrap();
+            completed_ranges
+                .iter()
+                .map(|range| cache.get((slot, range.start, range.end)))
+                .collect::<Option<Vec<_>>>()
+        };
+        if let Some(cached_entries) = maybe_cached_entries {
+            inc_new_counter_debug!("blockstore-replay-hot-cache-hit", 1, 1000, 1000);
+            let mut merged = Vec::new();
+            for entries in cached_entries {
+                merged.extend(entries.iter().cloned());
+            }
+            return Ok(merged);
+        }
+        inc_new_counter_debug!("blockstore-replay-hot-cache-miss", 1, 1000, 1000);
+
         debug_assert!(completed_ranges
             .iter()
             .tuple_windows()
@@ -3728,7 +3827,11 @@ impl Blockstore {
         range: Range<u32>,
         slot_meta: Option<&SlotMeta>,
     ) -> Result<Vec<Entry>> {
-        self.get_slot_entries_in_block(slot, vec![range], slot_meta)
+        let entries = self.get_slot_entries_in_block(slot, vec![range.clone()], slot_meta)?;
+        if !entries.is_empty() {
+            self.cache_completed_data_block_entries(slot, range, entries.clone());
+        }
+        Ok(entries)
     }
 
     /// Performs checks on the last fec set of a replayed slot, and returns the block_id.

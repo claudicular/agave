@@ -5,6 +5,7 @@ use {
         ReplicaAccountInfoV3, ReplicaAccountInfoVersions, ReplicaTransactionAccountsInfo,
         ReplicaTransactionAccountsInfoVersions,
     },
+    crossbeam_channel::{bounded, Receiver, Sender, TrySendError},
     log::*,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::accounts_update_notifier_interface::{
@@ -17,7 +18,8 @@ use {
     solana_signature::Signature,
     solana_transaction::sanitized::SanitizedTransaction,
     std::{
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
+        thread::{Builder, JoinHandle},
         time::Instant,
     },
 };
@@ -25,6 +27,50 @@ use {
 pub(crate) struct AccountsUpdateNotifierImpl {
     plugin_manager: Arc<RwLock<GeyserPluginManager>>,
     snapshot_notifications_enabled: bool,
+    async_dispatch: Option<AsyncAccountsDispatch>,
+}
+
+const ASYNC_ACCOUNTS_DISPATCH_CHANNEL_CAPACITY: usize = 16_384;
+
+#[derive(Debug)]
+struct QueuedAccountUpdate {
+    slot: Slot,
+    pubkey: Pubkey,
+    account: AccountSharedData,
+    txn: Option<SanitizedTransaction>,
+    write_version: u64,
+    is_startup: bool,
+    enqueue_at: Instant,
+}
+
+#[derive(Debug)]
+enum DispatchMessage {
+    Account(QueuedAccountUpdate),
+}
+
+#[derive(Debug)]
+struct AsyncAccountsDispatch {
+    sender: Mutex<Option<Sender<DispatchMessage>>>,
+    thread_hdl: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl AsyncAccountsDispatch {
+    fn try_send(&self, message: DispatchMessage) -> Result<(), TrySendError<DispatchMessage>> {
+        let sender = self.sender.lock().unwrap();
+        if let Some(sender) = sender.as_ref() {
+            sender.try_send(message)
+        } else {
+            Err(TrySendError::Disconnected(message))
+        }
+    }
+
+    fn stop(&self) {
+        // Drop sender first so receiver exits after draining queued work.
+        self.sender.lock().unwrap().take();
+        if let Some(thread_hdl) = self.thread_hdl.lock().unwrap().take() {
+            let _ = thread_hdl.join();
+        }
+    }
 }
 
 impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
@@ -40,6 +86,30 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
         pubkey: &Pubkey,
         write_version: u64,
     ) {
+        if let Some(async_dispatch) = &self.async_dispatch {
+            let message = DispatchMessage::Account(QueuedAccountUpdate {
+                slot,
+                pubkey: *pubkey,
+                account: account.clone(),
+                txn: txn.as_ref().map(|tx| (*tx).clone()),
+                write_version,
+                is_startup: false,
+                enqueue_at: Instant::now(),
+            });
+            match async_dispatch.try_send(message) {
+                Ok(()) => {
+                    inc_new_counter_debug!("geyser-plugin-async-account-dispatch-queued", 1);
+                    return;
+                }
+                Err(TrySendError::Full(_)) => {
+                    inc_new_counter_warn!("geyser-plugin-async-account-dispatch-overflow", 1);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    inc_new_counter_warn!("geyser-plugin-async-account-dispatch-disconnected", 1);
+                }
+            }
+        }
+
         let account_info =
             self.accountinfo_from_shared_account_data(account, txn, pubkey, write_version);
         self.notify_plugins_of_account_update(account_info, slot, false);
@@ -209,10 +279,60 @@ impl AccountsUpdateNotifierImpl {
     pub fn new(
         plugin_manager: Arc<RwLock<GeyserPluginManager>>,
         snapshot_notifications_enabled: bool,
+        accounts_notify_async: bool,
     ) -> Self {
+        let async_dispatch = accounts_notify_async.then(|| {
+            let (sender, receiver) = bounded(ASYNC_ACCOUNTS_DISPATCH_CHANNEL_CAPACITY);
+            let plugin_manager = plugin_manager.clone();
+            let thread_hdl = Builder::new()
+                .name("solGeyserAcctAsync".to_string())
+                .spawn(move || Self::run_async_dispatch(receiver, plugin_manager))
+                .expect("spawn geyser async account notifier");
+            AsyncAccountsDispatch {
+                sender: Mutex::new(Some(sender)),
+                thread_hdl: Mutex::new(Some(thread_hdl)),
+            }
+        });
+
         AccountsUpdateNotifierImpl {
             plugin_manager,
             snapshot_notifications_enabled,
+            async_dispatch,
+        }
+    }
+
+    fn run_async_dispatch(
+        receiver: Receiver<DispatchMessage>,
+        plugin_manager: Arc<RwLock<GeyserPluginManager>>,
+    ) {
+        while let Ok(message) = receiver.recv() {
+            match message {
+                DispatchMessage::Account(update) => {
+                    inc_new_counter_debug!(
+                        "geyser-plugin-async-account-dispatch-latency-us",
+                        update.enqueue_at.elapsed().as_micros() as usize,
+                        100000,
+                        100000
+                    );
+                    let account_info = ReplicaAccountInfoV3 {
+                        pubkey: update.pubkey.as_ref(),
+                        lamports: update.account.lamports(),
+                        owner: update.account.owner().as_ref(),
+                        executable: update.account.executable(),
+                        rent_epoch: update.account.rent_epoch(),
+                        data: update.account.data(),
+                        write_version: update.write_version,
+                        txn: update.txn.as_ref(),
+                    };
+                    Self::notify_plugins_of_account_update_inner(
+                        &plugin_manager,
+                        account_info,
+                        update.slot,
+                        update.is_startup,
+                    );
+                    inc_new_counter_debug!("geyser-plugin-async-account-dispatch-drained", 1);
+                }
+            }
         }
     }
 
@@ -257,8 +377,22 @@ impl AccountsUpdateNotifierImpl {
         slot: Slot,
         is_startup: bool,
     ) {
+        Self::notify_plugins_of_account_update_inner(
+            &self.plugin_manager,
+            account,
+            slot,
+            is_startup,
+        );
+    }
+
+    fn notify_plugins_of_account_update_inner(
+        plugin_manager: &Arc<RwLock<GeyserPluginManager>>,
+        account: ReplicaAccountInfoV3,
+        slot: Slot,
+        is_startup: bool,
+    ) {
         let mut measure2 = Measure::start("geyser-plugin-notify_plugins_of_account_update");
-        let plugin_manager = self.plugin_manager.read().unwrap();
+        let plugin_manager = plugin_manager.read().unwrap();
 
         if plugin_manager.plugins.is_empty() {
             return;
@@ -303,5 +437,13 @@ impl AccountsUpdateNotifierImpl {
             100000,
             100000
         );
+    }
+}
+
+impl Drop for AccountsUpdateNotifierImpl {
+    fn drop(&mut self) {
+        if let Some(async_dispatch) = &self.async_dispatch {
+            async_dispatch.stop();
+        }
     }
 }

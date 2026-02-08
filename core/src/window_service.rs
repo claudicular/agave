@@ -46,8 +46,10 @@ struct WindowServiceMetrics {
     run_insert_count: u64,
     num_repairs: AtomicUsize,
     num_shreds_received: usize,
+    num_completed_data_sets: usize,
     handle_packets_elapsed_us: u64,
     shred_receiver_elapsed_us: u64,
+    prewarm_completed_data_sets_elapsed_us: u64,
     num_errors: u64,
     num_errors_blockstore: u64,
     num_errors_cross_beam_recv_timeout: u64,
@@ -67,9 +69,15 @@ impl WindowServiceMetrics {
             ("run_insert_count", self.run_insert_count as i64, i64),
             ("num_repairs", self.num_repairs.load(Ordering::Relaxed), i64),
             ("num_shreds_received", self.num_shreds_received, i64),
+            ("num_completed_data_sets", self.num_completed_data_sets, i64),
             (
                 "shred_receiver_elapsed_us",
                 self.shred_receiver_elapsed_us as i64,
+                i64
+            ),
+            (
+                "prewarm_completed_data_sets_elapsed_us",
+                self.prewarm_completed_data_sets_elapsed_us as i64,
                 i64
             ),
             ("num_errors", self.num_errors, i64),
@@ -230,6 +238,18 @@ where
         reed_solomon_cache,
         metrics,
     )?;
+    ws_metrics.num_completed_data_sets += completed_data_sets.len();
+
+    let now = Instant::now();
+    for completed_data_set in &completed_data_sets {
+        // Populate replay hot-cache as soon as a complete data set is observed.
+        let _ = blockstore.get_entries_in_data_block(
+            completed_data_set.slot,
+            completed_data_set.indices.clone(),
+            None,
+        );
+    }
+    ws_metrics.prewarm_completed_data_sets_elapsed_us += now.elapsed().as_micros() as u64;
 
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;

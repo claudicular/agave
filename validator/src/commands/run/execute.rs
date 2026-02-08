@@ -39,8 +39,8 @@ use {
         tpu::MAX_VOTES_PER_SECOND,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod,
-            SchedulerPacing, Validator, ValidatorConfig, ValidatorError, ValidatorStartProgress,
-            ValidatorTpuConfig,
+            LatencyMode, SchedulerPacing, Validator, ValidatorConfig, ValidatorError,
+            ValidatorStartProgress, ValidatorTpuConfig,
         },
     },
     solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
@@ -63,7 +63,10 @@ use {
     solana_signer::Signer,
     solana_streamer::{
         nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
-        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+        quic::{
+            QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig,
+            DEFAULT_TPU_COALESCE,
+        },
     },
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_turbine::{
@@ -80,6 +83,7 @@ use {
         process::exit,
         str::FromStr,
         sync::{atomic::AtomicBool, Arc, RwLock},
+        time::Duration,
     },
 };
 
@@ -160,6 +164,39 @@ pub fn execute(
 
     let private_rpc = matches.is_present("private_rpc");
     let do_port_check = !matches.is_present("no_port_check");
+    let tpu_coalesce = value_t!(matches, "tpu_coalesce_ms", u64)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_TPU_COALESCE);
+    let latency_mode = value_t_or_exit!(matches, "latency_mode", LatencyMode);
+    let latency_mode_hybrid = matches!(latency_mode, LatencyMode::HybridSpeculative);
+    let tvu_shred_sigverify_max_batches =
+        if matches.occurrences_of("tvu_shred_sigverify_max_batches") > 0 {
+            value_t_or_exit!(matches, "tvu_shred_sigverify_max_batches", NonZeroUsize)
+        } else if latency_mode_hybrid {
+            NonZeroUsize::new(64).expect("64 is non-zero")
+        } else {
+            // Legacy behavior: drain up to the hard-coded packet batch cap.
+            NonZeroUsize::new(1024).expect("1024 is non-zero")
+        };
+    let tvu_shred_sigverify_max_age_us =
+        if matches.occurrences_of("tvu_shred_sigverify_max_age_us") > 0 {
+            value_t_or_exit!(matches, "tvu_shred_sigverify_max_age_us", u64)
+        } else if latency_mode_hybrid {
+            250
+        } else {
+            // Legacy behavior: no age-based flush cap in standard mode.
+            u64::MAX
+        };
+    let replay_fast_ingress = matches.is_present("replay_fast_ingress") || latency_mode_hybrid;
+    let replay_control_loop_ms = value_t_or_exit!(matches, "replay_control_loop_ms", u64);
+    let replay_hot_cache_mb = if matches.occurrences_of("replay_hot_cache_mb") > 0 {
+        value_t_or_exit!(matches, "replay_hot_cache_mb", usize)
+    } else if latency_mode_hybrid {
+        256
+    } else {
+        0
+    };
+    let accounts_notify_async = matches.is_present("accounts_notify_async");
 
     let ledger_path = run_args.ledger_path;
 
@@ -600,6 +637,13 @@ pub fn execute(
         replay_forks_threads,
         replay_transactions_threads,
         tvu_shred_sigverify_threads: tvu_sigverify_threads,
+        tvu_shred_sigverify_max_batches,
+        tvu_shred_sigverify_max_age_us,
+        replay_fast_ingress,
+        replay_control_loop_ms,
+        replay_hot_cache_mb,
+        latency_mode,
+        accounts_notify_async,
         delay_leader_block_for_pending_fork: matches
             .is_present("delay_leader_block_for_pending_fork"),
         wen_restart_proto_path: value_t!(matches, "wen_restart", PathBuf).ok(),

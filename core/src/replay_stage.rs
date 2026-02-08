@@ -279,6 +279,8 @@ pub struct ReplayStageConfig {
     pub wait_to_vote_slot: Option<Slot>,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
+    pub replay_fast_ingress: bool,
+    pub replay_control_loop_ms: u64,
     pub blockstore: Arc<Blockstore>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub cluster_info: Arc<ClusterInfo>,
@@ -324,6 +326,8 @@ pub struct ReplayReceivers {
 struct ReplayLoopTiming {
     last_submit: u64,
     loop_count: u64,
+    fast_ingress_skipped_control_count: u64,
+    fast_ingress_wait_receive_us: u64,
     collect_frozen_banks_elapsed_us: u64,
     compute_bank_stats_elapsed_us: u64,
     select_vote_and_reset_forks_elapsed_us: u64,
@@ -439,6 +443,16 @@ impl ReplayLoopTiming {
                 "replay-loop-timing-stats",
                 ("loop_count", self.loop_count as i64, i64),
                 ("total_elapsed_us", elapsed_ms * 1000, i64),
+                (
+                    "fast_ingress_skipped_control_count",
+                    self.fast_ingress_skipped_control_count as i64,
+                    i64
+                ),
+                (
+                    "fast_ingress_wait_receive_us",
+                    self.fast_ingress_wait_receive_us as i64,
+                    i64
+                ),
                 (
                     "collect_frozen_banks_elapsed_us",
                     self.collect_frozen_banks_elapsed_us as i64,
@@ -585,6 +599,8 @@ impl ReplayStage {
             wait_to_vote_slot,
             replay_forks_threads,
             replay_transactions_threads,
+            replay_fast_ingress,
+            replay_control_loop_ms,
             blockstore,
             bank_forks,
             cluster_info,
@@ -705,6 +721,9 @@ impl ReplayStage {
                 last_refresh_time: Instant::now(),
                 last_print_time: Instant::now(),
             };
+            let replay_control_interval =
+                Duration::from_millis(std::cmp::max(replay_control_loop_ms, 1));
+            let mut last_replay_control = Instant::now();
             let mut tbft_structs = TowerBFTStructures {
                 heaviest_subtree_fork_choice,
                 duplicate_slots_tracker,
@@ -812,6 +831,48 @@ impl ReplayStage {
                     &mut is_alpenglow_migration_complete,
                 );
                 replay_active_banks_time.stop();
+
+                let should_run_control_path = !replay_fast_ingress
+                    || did_complete_bank
+                    || last_replay_control.elapsed() >= replay_control_interval;
+                if !should_run_control_path {
+                    let mut wait_receive_time = Measure::start("wait_receive_time");
+                    if !did_complete_bank {
+                        let timer = Duration::from_millis(2);
+                        match ledger_signal_receiver.recv_timeout(timer) {
+                            Err(RecvTimeoutError::Timeout) => (),
+                            Err(_) => break,
+                            Ok(_) => trace!("blockstore signal"),
+                        };
+                    }
+                    wait_receive_time.stop();
+                    replay_timing.fast_ingress_skipped_control_count += 1;
+                    replay_timing.fast_ingress_wait_receive_us += wait_receive_time.as_us();
+                    replay_timing.update(
+                        0,                                // collect_frozen_banks_time
+                        0,                                // compute_bank_stats_time
+                        0,                                // select_vote_and_reset_forks_time
+                        0,                                // start_leader_time
+                        0,                                // reset_bank_time
+                        0,                                // voting_time
+                        0,                                // select_forks_time
+                        0,                                // compute_slot_stats_time
+                        0,                                // generate_new_bank_forks_time
+                        replay_active_banks_time.as_us(), // replay_active_banks_time
+                        wait_receive_time.as_us(),        // wait_receive_time
+                        0,                                // heaviest_fork_failures_time
+                        u64::from(did_complete_bank),     // did_complete_bank
+                        0,                                // process_ancestor_hashes_duplicate_slots
+                        0,                                // process_duplicate_confirmed_slots
+                        0, // process_unfrozen_gossip_verified_vote_hashes
+                        0, // process_popular_pruned_forks
+                        0, // process_duplicate_slots
+                        0, // dump_then_repair_correct_slots
+                        0, // retransmit_not_propagated_time
+                    );
+                    continue;
+                }
+                last_replay_control = Instant::now();
 
                 let forks_root = bank_forks.read().unwrap().root();
 
