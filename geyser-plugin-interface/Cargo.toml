@@ -24,6 +24,7 @@ solana-clock = { workspace = true }
 solana-entry = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
+solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-status = { workspace = true }

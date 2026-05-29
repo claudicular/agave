@@ -176,6 +176,7 @@ dependencies = [
  "solana-entry",
  "solana-hash 4.6.0",
  "solana-message",
+ "solana-pubkey 4.3.0",
  "solana-signature",
  "solana-transaction",
  "solana-transaction-status",
