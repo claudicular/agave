@@ -4102,7 +4102,7 @@ pub mod rpc_full {
             let TransactionSimulationResult {
                 result,
                 logs,
-                post_simulation_accounts,
+                post_simulation_accounts: _,
                 units_consumed,
                 loaded_accounts_data_size,
                 return_data,
@@ -4134,31 +4134,18 @@ pub mod rpc_full {
                     )));
                 }
 
-                if result.is_err() {
-                    Some(vec![None; config_accounts.addresses.len()])
-                } else {
-                    let mut post_simulation_accounts_map = HashMap::new();
-                    for (pubkey, data) in post_simulation_accounts {
-                        post_simulation_accounts_map.insert(pubkey, data);
-                    }
+                let requested_pubkeys = config_accounts
+                    .addresses
+                    .iter()
+                    .map(|address_str| verify_pubkey(address_str))
+                    .collect::<Result<Vec<_>>>()?;
 
-                    Some(
-                        config_accounts
-                            .addresses
-                            .iter()
-                            .map(|address_str| {
-                                let pubkey = verify_pubkey(address_str)?;
-                                get_encoded_account(
-                                    bank,
-                                    &pubkey,
-                                    accounts_encoding,
-                                    None,
-                                    Some(&post_simulation_accounts_map),
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    )
-                }
+                Some(
+                    requested_pubkeys
+                    .iter()
+                    .map(|pubkey| get_encoded_account(bank, pubkey, accounts_encoding, None, None))
+                    .collect::<Result<Vec<_>>>()?,
+                )
             } else {
                 None
             };
@@ -6211,14 +6198,7 @@ pub mod tests {
                 "value":{
                     "accounts": [
                         null,
-                        {
-                            "data": ["", "base64"],
-                            "executable": false,
-                            "owner": "11111111111111111111111111111111",
-                            "lamports": rent_exempt_amount,
-                            "rentEpoch": u64::MAX,
-                            "space": 0,
-                        }
+                        null
                     ],
                     "err":null,
                     "innerInstructions": null,
@@ -6617,9 +6597,9 @@ pub mod tests {
                                 "space": 165
                               },
                               "executable": false,
-                              "lamports": (token_account_rent_exempt_amount + 1),
+                              "lamports": token_account_rent_exempt_amount,
                               "owner": bs58::encode(spl_token_interface::id()).into_string(),
-                              "rentEpoch": u64::MAX,
+                              "rentEpoch": 0,
                               "space": spl_token_interface::state::Account::LEN
                         },
                     ],
