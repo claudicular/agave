@@ -82,6 +82,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         replay_transactions_threads: config.replay_transactions_threads,
         tvu_shred_sigverify_threads: config.tvu_shred_sigverify_threads,
         tvu_bls_sigverify_threads: config.tvu_bls_sigverify_threads,
+        enable_transaction_accounts_notify: config.enable_transaction_accounts_notify,
         delay_leader_block_for_pending_fork: config.delay_leader_block_for_pending_fork,
         voting_service_test_override: config.voting_service_test_override.clone(),
         repair_handler_type: config.repair_handler_type.clone(),

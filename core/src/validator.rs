@@ -393,6 +393,7 @@ pub struct ValidatorConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub tvu_shred_sigverify_threads: NonZeroUsize,
     pub tvu_bls_sigverify_threads: NonZeroUsize,
+    pub enable_transaction_accounts_notify: bool,
     pub delay_leader_block_for_pending_fork: bool,
     pub voting_service_test_override: Option<VotingServiceOverride>,
     pub repair_handler_type: RepairHandlerType,
@@ -479,6 +480,7 @@ impl ValidatorConfig {
             replay_transactions_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
             tvu_shred_sigverify_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
             tvu_bls_sigverify_threads: NonZeroUsize::new(2).expect("2 is non-zero"),
+            enable_transaction_accounts_notify: false,
             delay_leader_block_for_pending_fork: true,
             voting_service_test_override: None,
             repair_handler_type: RepairHandlerType::default(),
@@ -801,6 +803,7 @@ impl Validator {
                         confirmed_bank_receiver,
                         config.geyser_plugin_always_enabled,
                         geyser_plugin_config_files.as_ref(),
+                        config.enable_transaction_accounts_notify,
                         rpc_to_plugin_manager_receiver_and_exit,
                     )
                     .map_err(|err| {

@@ -38,6 +38,7 @@ mod tests {
         },
         dashmap::DashMap,
         solana_account::ReadableAccount as _,
+        solana_signature::Signature,
         std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -93,6 +94,17 @@ mod tests {
 
         fn notify_end_of_restore_from_snapshot(&self) {
             self.is_startup_done.store(true, Ordering::Relaxed);
+        }
+
+        fn notify_transaction_accounts(
+            &self,
+            _slot: Slot,
+            _signature: &Signature,
+            _transaction_index: usize,
+            _accounts: &[(&Pubkey, &AccountSharedData)],
+            _write_version_start: u64,
+        ) {
+            // No-op for test plugin
         }
     }
 

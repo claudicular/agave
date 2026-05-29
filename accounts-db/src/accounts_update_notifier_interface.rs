@@ -2,6 +2,7 @@ use {
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
+    solana_signature::Signature,
     solana_transaction::sanitized::SanitizedTransaction,
     std::sync::Arc,
 };
@@ -31,6 +32,30 @@ pub trait AccountsUpdateNotifierInterface: std::fmt::Debug {
 
     /// Notified when all accounts have been notified when restoring from a snapshot.
     fn notify_end_of_restore_from_snapshot(&self);
+
+    /// Notified when all accounts for a transaction are ready.
+    /// This provides grouped account updates per transaction.
+    /// The accounts slice contains (pubkey, account_data) pairs for all writable
+    /// accounts modified by this transaction.
+    fn notify_transaction_accounts(
+        &self,
+        slot: Slot,
+        signature: &Signature,
+        transaction_index: usize,
+        accounts: &[(&Pubkey, &AccountSharedData)],
+        write_version_start: u64,
+    );
+
+    /// Check if grouped transaction-account notifications are enabled
+    fn transaction_accounts_notifications_enabled(&self) -> bool {
+        false
+    }
+
+    /// Returns program owners for which read-only accounts should be included
+    /// in transaction_accounts notifications.
+    fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+        vec![]
+    }
 }
 
 pub type AccountsUpdateNotifier = Arc<dyn AccountsUpdateNotifierInterface + Sync + Send>;

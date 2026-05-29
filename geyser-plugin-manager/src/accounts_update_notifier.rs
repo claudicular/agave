@@ -2,7 +2,8 @@
 use {
     crate::geyser_plugin_manager::GeyserPluginManager,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaAccountInfoV3, ReplicaAccountInfoVersions,
+        ReplicaAccountInfoV3, ReplicaAccountInfoVersions, ReplicaTransactionAccountsInfo,
+        ReplicaTransactionAccountsInfoVersions,
     },
     arc_swap::ArcSwap,
     log::*,
@@ -12,6 +13,7 @@ use {
     },
     solana_clock::Slot,
     solana_pubkey::Pubkey,
+    solana_signature::Signature,
     solana_transaction::sanitized::SanitizedTransaction,
     std::sync::Arc,
 };
@@ -19,6 +21,7 @@ use {
 pub(crate) struct AccountsUpdateNotifierImpl {
     plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
     snapshot_notifications_enabled: bool,
+    enable_transaction_accounts_notify: bool,
 }
 
 impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
@@ -74,16 +77,113 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
             }
         }
     }
+
+    fn notify_transaction_accounts(
+        &self,
+        slot: Slot,
+        signature: &Signature,
+        transaction_index: usize,
+        accounts: &[(&Pubkey, &AccountSharedData)],
+        write_version_start: u64,
+    ) {
+        if !self.enable_transaction_accounts_notify {
+            return;
+        }
+        let plugin_manager = self.plugin_manager.load();
+        if plugin_manager.plugins.is_empty() {
+            return;
+        }
+
+        // Build ReplicaAccountInfoV3 for each account
+        let account_infos: Vec<ReplicaAccountInfoV3> = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, (pubkey, account))| ReplicaAccountInfoV3 {
+                pubkey: pubkey.as_ref(),
+                lamports: account.lamports(),
+                owner: account.owner().as_ref(),
+                executable: account.executable(),
+                rent_epoch: account.rent_epoch(),
+                data: account.data(),
+                write_version: write_version_start.saturating_add(i as u64),
+                txn: None, // Transaction reference not needed in grouped notification
+            })
+            .collect();
+
+        let transaction_accounts_info = ReplicaTransactionAccountsInfo {
+            signature,
+            slot,
+            index: transaction_index,
+            accounts: &account_infos,
+        };
+
+        for plugin in plugin_manager.plugins.iter() {
+            if !plugin.transaction_accounts_notifications_enabled() {
+                continue;
+            }
+
+            match plugin.notify_transaction_accounts(
+                ReplicaTransactionAccountsInfoVersions::V0_0_1(&transaction_accounts_info),
+            ) {
+                Err(err) => {
+                    error!(
+                        "Failed to notify transaction accounts for signature {} at slot {}, error: {} to plugin {}",
+                        signature,
+                        slot,
+                        err,
+                        plugin.name()
+                    )
+                }
+                Ok(_) => {
+                    trace!(
+                        "Successfully notified transaction accounts for signature {} at slot {} to plugin {}",
+                        signature,
+                        slot,
+                        plugin.name()
+                    );
+                }
+            }
+        }
+    }
+
+    fn transaction_accounts_notifications_enabled(&self) -> bool {
+        if !self.enable_transaction_accounts_notify {
+            return false;
+        }
+        let plugin_manager = self.plugin_manager.load();
+        plugin_manager
+            .plugins
+            .iter()
+            .any(|plugin| plugin.transaction_accounts_notifications_enabled())
+    }
+
+    fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+        if !self.enable_transaction_accounts_notify {
+            return vec![];
+        }
+        let plugin_manager = self.plugin_manager.load();
+        // Collect all unique owners from all plugins
+        let mut owners: Vec<Pubkey> = plugin_manager
+            .plugins
+            .iter()
+            .flat_map(|plugin| plugin.transaction_accounts_include_readonly_owners())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        owners
+    }
 }
 
 impl AccountsUpdateNotifierImpl {
     pub fn new(
         plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
         snapshot_notifications_enabled: bool,
+        enable_transaction_accounts_notify: bool,
     ) -> Self {
         AccountsUpdateNotifierImpl {
             plugin_manager,
             snapshot_notifications_enabled,
+            enable_transaction_accounts_notify,
         }
     }
 
@@ -239,7 +339,7 @@ mod tests {
                 }),
             ],
         })));
-        let notifier = AccountsUpdateNotifierImpl::new(plugin_manager, false);
+        let notifier = AccountsUpdateNotifierImpl::new(plugin_manager, false, false);
         let account = AccountSharedData::new(1, 0, &Pubkey::new_unique());
         let pubkey = Pubkey::new_unique();
 

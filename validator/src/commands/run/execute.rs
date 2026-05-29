@@ -778,6 +778,8 @@ pub fn execute(
         rpc_config: run_args.json_rpc_config,
         on_start_geyser_plugin_config_files,
         geyser_plugin_always_enabled: matches.is_present("geyser_plugin_always_enabled"),
+        enable_transaction_accounts_notify: matches
+            .is_present("enable_transaction_accounts_notify"),
         rpc_addrs: value_t!(matches, "rpc_port", u16).ok().map(|rpc_port| {
             (
                 SocketAddr::new(rpc_bind_address, rpc_port),
