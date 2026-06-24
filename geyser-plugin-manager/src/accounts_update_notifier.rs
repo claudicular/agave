@@ -166,7 +166,7 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
         let mut owners: Vec<Pubkey> = plugin_manager
             .plugins
             .iter()
-            .flat_map(|plugin| plugin.transaction_accounts_include_readonly_owners())
+            .flat_map(|plugin| plugin.transaction_accounts_include_readonly_owners().to_vec())
             .collect();
         owners.sort();
         owners.dedup();

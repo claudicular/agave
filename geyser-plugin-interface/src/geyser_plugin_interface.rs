@@ -804,7 +804,7 @@ pub trait GeyserPlugin: Any + Send + Sync + std::fmt::Debug {
     /// read-only in swap transactions) to access transfer fee configurations.
     ///
     /// Example: Return `[TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]` to include mint accounts.
-    fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
-        vec![]
+    fn transaction_accounts_include_readonly_owners(&self) -> &[Pubkey] {
+        &[]
     }
 }
