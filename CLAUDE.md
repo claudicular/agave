@@ -203,12 +203,13 @@ on the commit path.
 
 **Yellowstone integration:** See `~/.claude/plans/agave-yellowstone-tx-grouped-account-updates.md` for full implementation plan including Yellowstone-side changes.
 
-> **v4.0.0 rebase note:** This branch is based on the **v4.0.0** release. A set of
-> v3.1-era replay/geyser **latency optimizations** (replay fast-ingress, replay
-> hot cache, TVU sigverify batching, async notifier dispatch, `--latency-mode`)
-> was **dropped** during the rebase because it collided with v4.0 internals
-> (Alpenglow replay loop, `get_slot_entries_in_block` signature). They are
-> documented for future re-design in
+> **Rebase note:** This branch is currently based on the **v4.2.0** release
+> (rebase chain: v3.1.10 → v4.0.0 → v4.1.0 → v4.2.0). A set of v3.1-era
+> replay/geyser **latency optimizations** (replay fast-ingress, replay hot
+> cache, TVU sigverify batching, async notifier dispatch, `--latency-mode`)
+> was **dropped** during the v4.0.0 rebase because it collided with v4.0
+> internals (Alpenglow replay loop, `get_slot_entries_in_block` signature) and
+> has not been reinstated since. They are documented for future re-design in
 > [`docs/dropped-latency-optimizations.md`](docs/dropped-latency-optimizations.md);
 > the original code is preserved on the `backup/pre-v4-rebase` branch.
 
