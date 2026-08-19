@@ -174,10 +174,16 @@ config.early_account_notifier = Some(Arc::new(MyNotifier::new()));
 Extends the Geyser plugin interface to stream all accounts modified by a transaction in a single grouped notification. Useful for arbitrage bots that need all relevant account state changes together.
 
 **Key features:**
-- Groups all writable accounts per transaction into one notification
+- Groups all touched writable accounts per transaction into one notification
+  (untouched write-locked accounts are skipped, matching the v4.2 store path)
 - Includes transaction signature, slot, and transaction index
 - Optionally includes read-only Token/Token2022 accounts (for mint data like transfer fees)
 - Fires alongside existing individual `update_account()` calls (backwards compatible)
+- Each group reserves its own write-version block from the shared
+  `AccountsDb::write_version` counter: write versions are unique node-wide and
+  strictly increasing per pubkey across commits, so `(slot, write_version)` is
+  a valid staleness guard — same semantics as the per-account stream (raw
+  values differ across the two streams; only ordering matches)
 
 **New trait methods in `GeyserPlugin`:**
 ```rust
