@@ -4519,19 +4519,25 @@ impl Bank {
             let accounts: Vec<(&Pubkey, &AccountSharedData)> = match processed_tx {
                 ProcessedTransaction::Executed(executed_tx) => {
                     if executed_tx.execution_details.status.is_ok() {
-                        // For successful transactions, collect writable accounts
-                        // plus read-only accounts matching the owner filter
+                        // For successful transactions, collect touched writable
+                        // accounts plus read-only accounts matching the owner
+                        // filter. Untouched write-locked accounts are skipped to
+                        // match the store path (`collect_accounts_for_successful_tx`),
+                        // which no longer writes them back or emits per-account
+                        // notifications for them.
+                        let touched_flags = &executed_tx.loaded_transaction.touched_flags;
                         executed_tx
                             .loaded_transaction
                             .accounts
                             .iter()
                             .enumerate()
                             .filter_map(|(i, (pubkey, account))| {
-                                let is_writable = sanitized_tx.message().is_writable(i);
+                                let is_written = sanitized_tx.message().is_writable(i)
+                                    && touched_flags[i];
                                 let owner_in_filter = !readonly_owners.is_empty()
                                     && readonly_owners.contains(account.owner());
 
-                                if is_writable || owner_in_filter {
+                                if is_written || owner_in_filter {
                                     Some((pubkey, account))
                                 } else {
                                     None
