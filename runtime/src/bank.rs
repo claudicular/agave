@@ -4495,10 +4495,6 @@ impl Bank {
         }
 
         let slot = self.slot();
-        let write_version = accounts_holder
-            .accounts_db
-            .write_version
-            .load(Acquire);
 
         // Get the list of program owners for which read-only accounts should be included
         let readonly_owners = notifier.transaction_accounts_include_readonly_owners();
@@ -4568,7 +4564,26 @@ impl Bank {
                 continue;
             }
 
-            notifier.notify_transaction_accounts(slot, signature, index, &accounts, write_version);
+            // Reserve a dedicated write-version block for this transaction's
+            // group, mirroring the store path (`Accounts::_store_accounts`).
+            // Atomic disjoint blocks keep every emitted write version unique
+            // node-wide, and account locks serialize commits of the same
+            // pubkey, so a later state always carries a strictly greater
+            // (slot, write_version) — making it a valid staleness guard for
+            // grouped consumers, with the same semantics as the per-account
+            // notification stream.
+            let write_version_start = accounts_holder
+                .accounts_db
+                .write_version
+                .fetch_add(accounts.len() as u64, AcqRel);
+
+            notifier.notify_transaction_accounts(
+                slot,
+                signature,
+                index,
+                &accounts,
+                write_version_start,
+            );
         }
     }
 

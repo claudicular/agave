@@ -12733,3 +12733,155 @@ fn test_new_for_block_tests_with_vote_account() {
         "8ZixvxzpQPr8zWvMyxoTsnFYFmUUKEytytyztDhgQ7oD"
     );
 }
+
+#[test]
+fn test_grouped_transaction_accounts_write_versions() {
+    use solana_accounts_db::accounts_update_notifier_interface::{
+        AccountForGeyser, AccountsUpdateNotifierInterface,
+    };
+
+    #[derive(Debug)]
+    struct GroupedRecorder {
+        readonly_owner: Pubkey,
+        grouped: Mutex<Vec<Vec<(Pubkey, u64)>>>,
+    }
+
+    impl AccountsUpdateNotifierInterface for GroupedRecorder {
+        fn snapshot_notifications_enabled(&self) -> bool {
+            false
+        }
+
+        fn notify_account_update(
+            &self,
+            _slot: Slot,
+            _account: &AccountSharedData,
+            _txn: &Option<&SanitizedTransaction>,
+            _pubkey: &Pubkey,
+            _write_version: u64,
+        ) {
+        }
+
+        fn notify_account_restore_from_snapshot(
+            &self,
+            _slot: Slot,
+            _write_version: u64,
+            _account: &AccountForGeyser<'_>,
+        ) {
+        }
+
+        fn notify_end_of_restore_from_snapshot(&self) {}
+
+        fn notify_transaction_accounts(
+            &self,
+            _slot: Slot,
+            _signature: &Signature,
+            _transaction_index: usize,
+            accounts: &[(&Pubkey, &AccountSharedData)],
+            write_version_start: u64,
+        ) {
+            let group = accounts
+                .iter()
+                .enumerate()
+                .map(|(i, (pubkey, _account))| {
+                    (**pubkey, write_version_start.saturating_add(i as u64))
+                })
+                .collect();
+            self.grouped.lock().unwrap().push(group);
+        }
+
+        fn transaction_accounts_notifications_enabled(&self) -> bool {
+            true
+        }
+
+        fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+            vec![self.readonly_owner]
+        }
+    }
+
+    let (genesis_config, mint_keypair) = create_genesis_config(1_000_000_000);
+    let readonly_owner = Pubkey::new_unique();
+    let recorder = Arc::new(GroupedRecorder {
+        readonly_owner,
+        grouped: Mutex::new(Vec::new()),
+    });
+    let bank = Bank::new_from_genesis(
+        &genesis_config,
+        Arc::new(RuntimeConfig::default()),
+        Vec::new(),
+        None,
+        BankTestConfig::default().accounts_db_config,
+        Some(recorder.clone()),
+        None,
+        Arc::default(),
+        None,
+        None,
+    );
+    let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+
+    // A read-only account matched by the owner filter: it inflates the group
+    // beyond the stored-account count and appears in both transactions.
+    let readonly_matched = Pubkey::new_unique();
+    bank.store_account(
+        &readonly_matched,
+        &AccountSharedData::new(10_000_000, 0, &readonly_owner),
+    );
+    // A write-locked account no instruction touches: must not appear in groups.
+    let untouched_writable = Pubkey::new_unique();
+    bank.store_account(
+        &untouched_writable,
+        &AccountSharedData::new(10_000_000, 0, &system_program::id()),
+    );
+
+    let payer = mint_keypair.pubkey();
+    let make_transfer = |recipient: &Pubkey| {
+        let mut ix = system_instruction::transfer(&payer, recipient, 5_000_000);
+        ix.accounts.push(AccountMeta::new(untouched_writable, false));
+        ix.accounts
+            .push(AccountMeta::new_readonly(readonly_matched, false));
+        let message = Message::new(&[ix], Some(&payer));
+        Transaction::new(&[&mint_keypair], message, genesis_config.hash())
+    };
+
+    // Two separate commits in the same slot, sharing `payer` and
+    // `readonly_matched`.
+    bank.process_transaction(&make_transfer(&Pubkey::new_unique()))
+        .unwrap();
+    bank.process_transaction(&make_transfer(&Pubkey::new_unique()))
+        .unwrap();
+
+    let grouped = recorder.grouped.lock().unwrap();
+    assert_eq!(grouped.len(), 2);
+
+    // Touched filter: untouched write-locked accounts are excluded; read-only
+    // owner-matched accounts are included.
+    for group in grouped.iter() {
+        let pubkeys: Vec<Pubkey> = group.iter().map(|(pubkey, _)| *pubkey).collect();
+        assert!(pubkeys.contains(&payer));
+        assert!(pubkeys.contains(&readonly_matched));
+        assert!(!pubkeys.contains(&untouched_writable));
+    }
+
+    // Write versions are globally unique across all grouped notifications:
+    // each group must reserve its own disjoint block from the shared counter.
+    let all_versions: Vec<u64> = grouped
+        .iter()
+        .flat_map(|group| group.iter().map(|(_, version)| *version))
+        .collect();
+    let unique_versions: HashSet<u64> = all_versions.iter().copied().collect();
+    assert_eq!(
+        unique_versions.len(),
+        all_versions.len(),
+        "grouped write versions must be globally unique: {all_versions:?}"
+    );
+
+    // The later commit's block sits strictly above the earlier commit's, so
+    // every shared pubkey (payer, readonly_matched) strictly increases and
+    // `(slot, write_version)` is a valid staleness guard for consumers.
+    let first_max = grouped[0].iter().map(|(_, version)| *version).max().unwrap();
+    let second_min = grouped[1].iter().map(|(_, version)| *version).min().unwrap();
+    assert!(
+        second_min > first_max,
+        "later commit's write-version block must sit strictly above the earlier \
+         one's (first max {first_max}, second min {second_min})"
+    );
+}
