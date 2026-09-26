@@ -209,8 +209,8 @@ on the commit path.
 
 **Yellowstone integration:** See `~/.claude/plans/agave-yellowstone-tx-grouped-account-updates.md` for full implementation plan including Yellowstone-side changes.
 
-> **Rebase note:** This branch is currently based on the **v4.2.0** release
-> (rebase chain: v3.1.10 → v4.0.0 → v4.1.0 → v4.2.0). A set of v3.1-era
+> **Rebase note:** This branch is currently based on the **v4.3.0** release
+> (rebase chain: v3.1.10 → v4.0.0 → v4.1.0 → v4.2.0 → v4.3.0). A set of v3.1-era
 > replay/geyser **latency optimizations** (replay fast-ingress, replay hot
 > cache, TVU sigverify batching, async notifier dispatch, `--latency-mode`)
 > was **dropped** during the v4.0.0 rebase because it collided with v4.0
