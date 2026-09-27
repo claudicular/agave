@@ -82,6 +82,7 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
     fn notify_transaction_accounts(
         &self,
         slot: Slot,
+        bank_id: BankId,
         signature: &Signature,
         transaction_index: usize,
         accounts: &[(&Pubkey, &AccountSharedData)],
@@ -125,6 +126,7 @@ impl AccountsUpdateNotifierInterface for AccountsUpdateNotifierImpl {
 
             match plugin.notify_transaction_accounts(
                 ReplicaTransactionAccountsInfoVersions::V0_0_1(&transaction_accounts_info),
+                bank_id,
             ) {
                 Err(err) => {
                     error!(
@@ -364,7 +366,50 @@ mod tests {
         }
     }
 
-    fn loaded_test_plugin(plugin: TestAccountPlugin) -> Arc<LoadedGeyserPlugin> {
+    /// `(slot, bank_id, index, [(pubkey, write_version)])` of a grouped notification
+    type GroupedNotification = (Slot, BankId, usize, Vec<(Pubkey, u64)>);
+
+    #[derive(Debug)]
+    struct TestTransactionAccountsPlugin {
+        name: &'static str,
+        transaction_accounts_enabled: bool,
+        notifications: Arc<Mutex<Vec<GroupedNotification>>>,
+    }
+
+    impl GeyserPlugin for TestTransactionAccountsPlugin {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn notify_transaction_accounts(
+            &self,
+            transaction_accounts: ReplicaTransactionAccountsInfoVersions,
+            bank_id: BankId,
+        ) -> agave_geyser_plugin_interface::geyser_plugin_interface::Result<()> {
+            let ReplicaTransactionAccountsInfoVersions::V0_0_1(info) = transaction_accounts;
+            let accounts = info
+                .accounts
+                .iter()
+                .map(|account| {
+                    (
+                        Pubkey::try_from(account.pubkey).unwrap(),
+                        account.write_version,
+                    )
+                })
+                .collect();
+            self.notifications
+                .lock()
+                .unwrap()
+                .push((info.slot, bank_id, info.index, accounts));
+            Ok(())
+        }
+
+        fn transaction_accounts_notifications_enabled(&self) -> bool {
+            self.transaction_accounts_enabled
+        }
+    }
+
+    fn loaded_test_plugin(plugin: impl GeyserPlugin) -> Arc<LoadedGeyserPlugin> {
         #[cfg(unix)]
         let library = libloading::os::unix::Library::this();
         #[cfg(windows)]
@@ -444,5 +489,61 @@ mod tests {
             *account_update_bank_ids.lock().unwrap(),
             Vec::<BankId>::new()
         );
+    }
+
+    #[test]
+    fn test_notify_transaction_accounts_forwards_bank_id() {
+        let enabled_notifications = Arc::new(Mutex::new(Vec::new()));
+        let disabled_notifications = Arc::new(Mutex::new(Vec::new()));
+        let plugin_manager = Arc::new(ArcSwap::from(Arc::new(GeyserPluginManager {
+            plugins: vec![
+                loaded_test_plugin(TestTransactionAccountsPlugin {
+                    name: "enabled",
+                    transaction_accounts_enabled: true,
+                    notifications: enabled_notifications.clone(),
+                }),
+                loaded_test_plugin(TestTransactionAccountsPlugin {
+                    name: "disabled",
+                    transaction_accounts_enabled: false,
+                    notifications: disabled_notifications.clone(),
+                }),
+            ],
+        })));
+        let pubkey0 = Pubkey::new_unique();
+        let pubkey1 = Pubkey::new_unique();
+        let account = AccountSharedData::new(1, 0, &Pubkey::new_unique());
+        let accounts = [(&pubkey0, &account), (&pubkey1, &account)];
+        let signature = Signature::default();
+        let (slot, bank_id, index, write_version_start) = (42, 9, 3, 100);
+
+        // The validator-level gate suppresses delivery to every plugin.
+        let gated_notifier = AccountsUpdateNotifierImpl::new(plugin_manager.clone(), false, false);
+        assert!(!gated_notifier.transaction_accounts_notifications_enabled());
+        gated_notifier.notify_transaction_accounts(
+            slot,
+            bank_id,
+            &signature,
+            index,
+            &accounts,
+            write_version_start,
+        );
+        assert!(enabled_notifications.lock().unwrap().is_empty());
+
+        let notifier = AccountsUpdateNotifierImpl::new(plugin_manager, false, true);
+        assert!(notifier.transaction_accounts_notifications_enabled());
+        notifier.notify_transaction_accounts(
+            slot,
+            bank_id,
+            &signature,
+            index,
+            &accounts,
+            write_version_start,
+        );
+
+        assert_eq!(
+            *enabled_notifications.lock().unwrap(),
+            vec![(slot, bank_id, index, vec![(pubkey0, 100), (pubkey1, 101)])]
+        );
+        assert!(disabled_notifications.lock().unwrap().is_empty());
     }
 }

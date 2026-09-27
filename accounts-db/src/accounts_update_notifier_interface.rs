@@ -37,10 +37,12 @@ pub trait AccountsUpdateNotifierInterface: std::fmt::Debug {
     /// Notified when all accounts for a transaction are ready.
     /// This provides grouped account updates per transaction.
     /// The accounts slice contains (pubkey, account_data) pairs for all writable
-    /// accounts modified by this transaction.
+    /// accounts modified by this transaction. `bank_id` identifies the bank
+    /// that committed the transaction.
     fn notify_transaction_accounts(
         &self,
         slot: Slot,
+        bank_id: BankId,
         signature: &Signature,
         transaction_index: usize,
         accounts: &[(&Pubkey, &AccountSharedData)],

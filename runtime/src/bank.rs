@@ -4673,6 +4673,7 @@ impl Bank {
 
             notifier.notify_transaction_accounts(
                 slot,
+                self.bank_id(),
                 signature,
                 index,
                 &accounts,

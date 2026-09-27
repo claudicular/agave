@@ -176,9 +176,14 @@ Extends the Geyser plugin interface to stream all accounts modified by a transac
 **Key features:**
 - Groups all touched writable accounts per transaction into one notification
   (untouched write-locked accounts are skipped, matching the v4.2 store path)
-- Includes transaction signature, slot, and transaction index
+- Includes transaction signature, slot, transaction index, and the committing
+  bank's `bank_id` (v4.3+: under Alpenglow an UpdateParent marker can clear a
+  slot's bank and replace it with a new bank for the same slot; consumers
+  discard grouped updates whose `bank_id` matches
+  `notify_entry_update_parent`'s `cleared_bank_id`)
 - Optionally includes read-only Token/Token2022 accounts (for mint data like transfer fees)
-- Fires alongside existing individual `update_account()` calls (backwards compatible)
+- Fires alongside existing individual `update_account_for_bank()` calls
+  (backwards compatible; the legacy `update_account()` is deprecated in v4.3)
 - Each group reserves its own write-version block from the shared
   `AccountsDb::write_version` counter: write versions are unique node-wide and
   strictly increasing per pubkey across commits, so `(slot, write_version)` is
@@ -188,13 +193,13 @@ Extends the Geyser plugin interface to stream all accounts modified by a transac
 **New trait methods in `GeyserPlugin`:**
 ```rust
 // Receive grouped account updates per transaction
-fn notify_transaction_accounts(&self, transaction_accounts: ReplicaTransactionAccountsInfoVersions) -> Result<()>;
+fn notify_transaction_accounts(&self, transaction_accounts: ReplicaTransactionAccountsInfoVersions, bank_id: BankId) -> Result<()>;
 
 // Enable grouped notifications
 fn transaction_accounts_notifications_enabled(&self) -> bool;
 
 // Specify read-only account owners to include (e.g., Token program for mint accounts)
-fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey>;
+fn transaction_accounts_include_readonly_owners(&self) -> &[Pubkey];
 ```
 
 **Key files:**

@@ -948,12 +948,20 @@ pub trait GeyserPlugin: Any + Send + Sync + std::fmt::Debug {
     /// This provides grouped account updates per transaction, allowing plugins to
     /// receive all account changes from a single transaction in one callback.
     ///
-    /// This is called in addition to (not instead of) the individual `update_account`
-    /// calls, allowing plugins to choose which notification style they prefer.
+    /// This is called in addition to (not instead of) the individual
+    /// `update_account_for_bank` calls, allowing plugins to choose which
+    /// notification style they prefer.
+    ///
+    /// `bank_id` identifies the concrete bank instance that committed the
+    /// transaction. Under Alpenglow, an UpdateParent marker can clear a bank
+    /// and replace it with a new bank for the same slot; plugins should use
+    /// `bank_id` together with `notify_entry_update_parent` to discard grouped
+    /// updates from the cleared bank.
     #[allow(unused_variables)]
     fn notify_transaction_accounts(
         &self,
         transaction_accounts: ReplicaTransactionAccountsInfoVersions,
+        bank_id: BankId,
     ) -> Result<()> {
         Ok(())
     }

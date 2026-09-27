@@ -105,6 +105,7 @@ mod tests {
         fn notify_transaction_accounts(
             &self,
             _slot: Slot,
+            _bank_id: BankId,
             _signature: &Signature,
             _transaction_index: usize,
             _accounts: &[(&Pubkey, &AccountSharedData)],
