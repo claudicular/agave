@@ -723,6 +723,58 @@ mod tests {
         assert_eq!(r.resets, 0);
     }
 
+    /// The byte layout of one TX record, pinned (geyserbench's `fastlane_ring` reader tests
+    /// parse these exact bytes). `t_publish_ns` (offset 48) is zeroed before comparing.
+    pub const GOLDEN_TX: &str = concat!(
+        "010000000000000001000900e000000039300000000000003830000000000000",
+        "0500000001000200070000000000000000000000000000002a00000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "00000000d2040000020202020202020202020202020202020202020202020202",
+        "020202020202020206ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b3791",
+        "3a8cf5857eff00a980000000000000000300000001000000aabbcc0000000000",
+    );
+
+    #[test]
+    fn test_abi_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.ring");
+        let mut w = OutRing::create(&path, 1 << 16).unwrap();
+        let key = Pubkey::new_from_array([2; 32]);
+        let token: Pubkey = crate::output::TOKEN_PROGRAM;
+        let mut a = AccountSharedData::new(128, 3, &token);
+        solana_account::WritableAccount::data_as_mut_slice(&mut a).copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+        let header = RecordHeader {
+            flags: FLAG_OK | FLAG_FROM_RING,
+            slot: 12345,
+            parent_slot: 12344,
+            tx_ordinal: 5,
+            incarnations: 2,
+            fork_id: 7,
+            t_source_ns: 42,
+            ..RecordHeader::default()
+        };
+        w.publish_tx(
+            header,
+            &[1; 64],
+            0,
+            1234,
+            &[AccountRef {
+                pubkey: &key,
+                account: &a,
+                written: true,
+            }],
+        )
+        .unwrap();
+        let len = RECORD_HEADER_SIZE + TX_BODY_FIXED + ACCOUNT_HEADER_SIZE + 8;
+        let mut bytes = vec![0u8; len];
+        unsafe { ptr::copy_nonoverlapping(w.ptr.add(HEADER_SIZE), bytes.as_mut_ptr(), len) };
+        bytes[48..56].fill(0);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!("GOLDEN {hex}");
+        assert_eq!(hex, GOLDEN_TX);
+    }
+
     #[test]
     fn test_lap_generation_and_limits() {
         let dir = tempfile::tempdir().unwrap();
