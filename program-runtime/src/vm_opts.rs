@@ -12,11 +12,35 @@
 //! changes between the two halves of an operation (for example between handing out and
 //! returning a pooled buffer).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 const UNINITIALIZED: u8 = 0;
 const DISABLED: u8 = 1;
 const ENABLED: u8 = 2;
+
+thread_local! {
+    /// Per-thread override: on this thread every switch of this module reads as enabled,
+    /// whatever the process-wide setting.
+    static THREAD_ENABLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enables every switch of this module for the calling thread only, independently of the
+/// environment (used by the fast lane's executor threads, which must not change how agave's
+/// own replay threads execute). The switches are result-identical, so this changes only the
+/// speed of this thread's executions. Their pools and caches are per thread, so a thread
+/// may flip this between executions.
+pub fn set_thread_enabled(enabled: bool) {
+    let _ = THREAD_ENABLED.try_with(|cell| cell.set(enabled));
+}
+
+/// Whether [`set_thread_enabled`] is on for the calling thread.
+#[inline]
+pub fn thread_enabled() -> bool {
+    THREAD_ENABLED.try_with(Cell::get).unwrap_or(false)
+}
 
 /// A boolean switch backed by an environment variable that is read once.
 pub struct EnvFlag {
@@ -39,13 +63,14 @@ impl EnvFlag {
         self.name
     }
 
-    /// Whether the switch is on. The first call reads the environment variable.
+    /// Whether the switch is on: process-wide (the first call reads the environment
+    /// variable) or for this thread ([`set_thread_enabled`]).
     #[inline]
     pub fn enabled(&self) -> bool {
         match self.state.load(Ordering::Relaxed) {
             ENABLED => true,
-            DISABLED => false,
-            _ => self.init_from_env(),
+            DISABLED => thread_enabled(),
+            _ => self.init_from_env() || thread_enabled(),
         }
     }
 
@@ -125,6 +150,20 @@ mod tests {
         for value in ["", "0", "false", "off", "no", "2", "enabled"] {
             assert!(!parse_bool_env_flag(value), "{value}");
         }
+    }
+
+    #[test]
+    fn test_thread_override_is_per_thread() {
+        static FLAG: EnvFlag = EnvFlag::new("SOLANA_VM_TEST_ONLY_FLAG_THREAD", "test flag");
+        assert!(!FLAG.enabled());
+        set_thread_enabled(true);
+        assert!(FLAG.enabled() && thread_enabled());
+        // Another thread is unaffected.
+        std::thread::spawn(|| assert!(!FLAG.enabled() && !thread_enabled()))
+            .join()
+            .unwrap();
+        set_thread_enabled(false);
+        assert!(!FLAG.enabled());
     }
 
     #[test]

@@ -252,6 +252,7 @@ fn start_threads(
         )
         .with_rebase(config.rebase),
     );
+    control::set_vm_opts(config.vm_opts);
     let readonly_owners = Arc::new(shared.readonly_owners.get().cloned().unwrap_or_default());
     info!(
         "fast lane: starting {} workers (cores {:?}), readonly owners {:?}",

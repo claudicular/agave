@@ -14,6 +14,19 @@ use {
 
 static FL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FL_POISONED: AtomicBool = AtomicBool::new(false);
+static FL_VM_OPTS: AtomicBool = AtomicBool::new(false);
+
+/// Result-identical VM shortcuts (`solana_program_runtime::vm_opts`: mapped-prefix heap reset,
+/// PDA on-curve cache, pooled program-input buffers) on the fast lane's executor threads only;
+/// agave's own threads keep the process-wide setting. Workers apply it before each execution.
+#[inline]
+pub fn vm_opts() -> bool {
+    FL_VM_OPTS.load(Ordering::Relaxed)
+}
+
+pub fn set_vm_opts(on: bool) {
+    FL_VM_OPTS.store(on, Ordering::Relaxed);
+}
 
 /// Whether taps/tees should forward events and FL threads should work.
 #[inline]
@@ -174,6 +187,7 @@ pub fn poll_control_file(
                     tunables.set_speculation(matches!(value.as_str(), "true" | "on" | "1"))
                 }
                 "rebase" => tunables.set_rebase(matches!(value.as_str(), "true" | "on" | "1")),
+                "vm_opts" => set_vm_opts(matches!(value.as_str(), "true" | "on" | "1")),
                 "theta" => match value.parse::<f32>() {
                     Ok(theta) if (0.0..=1000.0).contains(&theta) => tunables.set_theta(theta),
                     _ => warn!("fast lane: bad theta {value}"),
@@ -217,6 +231,11 @@ mod tests {
         std::fs::write(&path, "rebase = on\n").unwrap();
         poll_control_file(&path, &mut last, &t, false);
         assert!(t.rebase());
+        let before = vm_opts();
+        std::fs::write(&path, "vm_opts=on\n").unwrap();
+        poll_control_file(&path, &mut last, &t, false);
+        assert!(vm_opts());
+        set_vm_opts(before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

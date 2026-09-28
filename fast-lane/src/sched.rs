@@ -156,6 +156,8 @@ pub struct RunSummary {
     pub unprocessable: u64,
     /// Predicted (delta-rebased) versions installed.
     pub predictions: u64,
+    /// Shadow predictions (computed and verified, not installed: account miss rate too high).
+    pub shadow_predictions: u64,
     /// Predictions checked by the transaction's next incarnation on the same input: equal
     /// (hit) or not (miss).
     pub pred_hits: u64,
@@ -174,6 +176,9 @@ struct PredRec {
     /// The input value the prediction was computed for.
     basis: AccountSharedData,
     predicted: AccountSharedData,
+    /// Installed as the transaction's version (else a shadow prediction, kept only to learn
+    /// the account's miss rate).
+    installed: bool,
 }
 
 impl PredRec {
@@ -189,6 +194,10 @@ const MISS_PRIOR: f32 = 1.0;
 /// An unexecuted certain writer (fee payer, nonce) blocks speculation unless the account's
 /// rebase-miss rate is at most this.
 const CERTAIN_MISS_MAX: f32 = 0.3;
+/// Predictions are installed only for accounts whose miss rate is at most this; above it
+/// they are shadow predictions (verified to learn the rate, never installed), so accounts
+/// whose changes depend on their input (pool vaults) do not trigger extra re-executions.
+const PREDICT_MISS_MAX: f32 = 0.3;
 /// EWMA weight of the rebase-miss hint.
 const MISS_ALPHA: f32 = 1.0 / 16.0;
 /// Most readers one cascade step examines (bounds coordinator time per event).
@@ -287,6 +296,12 @@ pub struct Hints {
     prior: f32,
     cap: usize,
     miss: FastMap<Pubkey, f32>,
+    /// Rebase parameters (the `*_MISS_*` constants; fields so replays can vary them).
+    pub(crate) miss_prior_payer: f32,
+    pub(crate) miss_prior: f32,
+    pub(crate) certain_miss_max: f32,
+    pub(crate) predict_miss_max: f32,
+    pub(crate) miss_alpha: f32,
 }
 
 impl Hints {
@@ -297,15 +312,20 @@ impl Hints {
             prior: 0.5,
             cap: 262_144,
             miss: FastMap::default(),
+            miss_prior_payer: MISS_PRIOR_PAYER,
+            miss_prior: MISS_PRIOR,
+            certain_miss_max: CERTAIN_MISS_MAX,
+            predict_miss_max: PREDICT_MISS_MAX,
+            miss_alpha: MISS_ALPHA,
         }
     }
     /// Probability that a change of `key` is not predicted by rebasing the writer's own
     /// change (learned; prior by kind).
     pub fn miss(&self, key: &Pubkey, payer: bool) -> f32 {
         self.miss.get(key).copied().unwrap_or(if payer {
-            MISS_PRIOR_PAYER
+            self.miss_prior_payer
         } else {
-            MISS_PRIOR
+            self.miss_prior
         })
     }
     pub fn observe_miss(&mut self, key: &Pubkey, payer: bool, missed: bool) {
@@ -313,9 +333,14 @@ impl Hints {
             self.miss.clear();
         }
         let x = if missed { 1.0 } else { 0.0 };
-        let prior = if payer { MISS_PRIOR_PAYER } else { MISS_PRIOR };
+        let prior = if payer {
+            self.miss_prior_payer
+        } else {
+            self.miss_prior
+        };
+        let alpha = self.miss_alpha;
         let p = self.miss.entry(*key).or_insert(prior);
-        *p += MISS_ALPHA * (x - *p);
+        *p += alpha * (x - *p);
     }
     pub fn miss_len(&self) -> usize {
         self.miss.len()
@@ -358,15 +383,35 @@ pub fn worker_loop(
     exit: Arc<AtomicBool>,
     spin: Duration,
 ) {
-    loop {
+    let mut vm_opts = false;
+    let mut pda_cache_used = false;
+    let mut pool_reported = 0i64;
+    let result = loop {
         let task = match recv_spin(&tasks, spin, &exit) {
             Some(task) => task,
-            None => return,
+            None => break,
         };
+        // FL-only VM shortcuts (result-identical; per-thread pools and caches).
+        let want = crate::control::vm_opts();
+        if want != vm_opts {
+            solana_program_runtime::vm_opts::set_thread_enabled(want);
+            vm_opts = want;
+            pda_cache_used |= want;
+        }
         let out = task.run.execute(task.k, task.inc);
         task.run
             .overlay()
             .install(task.k, task.inc, &out.writes, &task.prev_writes);
+        let pool = solana_program_runtime::serialization::pooled_parameter_bytes() as i64
+            + if pda_cache_used {
+                solana_program_runtime::pda::curve_cache_bytes() as i64
+            } else {
+                0
+            };
+        if pool != pool_reported {
+            crate::mem::VM_POOL_BYTES.add(pool - pool_reported);
+            pool_reported = pool;
+        }
         if done
             .send(CoordMsg::Done {
                 run_id: task.run_id,
@@ -376,9 +421,11 @@ pub fn worker_loop(
             })
             .is_err()
         {
-            return;
+            break;
         }
-    }
+    };
+    crate::mem::VM_POOL_BYTES.sub(pool_reported);
+    result
 }
 
 /// Spin durations at or above this never park (for threads that own their core).
@@ -570,7 +617,8 @@ impl<S: FinalSink> Coordinator<S> {
                 });
             }
             if !self.hints.is_empty() {
-                self.hints = Hints::new(self.hints.alpha());
+                self.hints.phat.clear();
+                self.hints.miss.clear();
             }
         }
         crate::mem::HINT_BYTES.set((self.hints.len() + self.hints.miss_len()) as i64 * 64);
@@ -825,7 +873,7 @@ impl<S: FinalSink> Coordinator<S> {
                 1.0
             };
             if acct.unexec_certain.range(..k).next().is_some()
-                && !(rebase && miss <= CERTAIN_MISS_MAX)
+                && !(rebase && miss <= hints.certain_miss_max)
             {
                 return false;
             }
@@ -987,7 +1035,7 @@ impl<S: FinalSink> Coordinator<S> {
             if rebase_on {
                 // Its outputs were computed from inputs that have moved on: predict them
                 // from this incarnation's own change and let readers speculate on that.
-                let mut changed = Self::repredict(run, k);
+                let mut changed = Self::repredict(run, k, &self.hints);
                 changed.extend(new_keys.iter().chain(&prev_keys).copied());
                 self.cascade(run_id, vec![(k, changed)]);
             } else {
@@ -1031,7 +1079,11 @@ impl<S: FinalSink> Coordinator<S> {
                 return;
             };
             // Stale but out of speculative incarnations: still predict its outputs.
-            let mut changed = if stale { Self::repredict(run, k) } else { Vec::new() };
+            let mut changed = if stale {
+                Self::repredict(run, k, &self.hints)
+            } else {
+                Vec::new()
+            };
             changed.extend(new_keys.iter().chain(&prev_keys).copied());
             self.cascade(run_id, vec![(k, changed)]);
         } else if eager {
@@ -1049,7 +1101,7 @@ impl<S: FinalSink> Coordinator<S> {
     /// input is back to what the incarnation read, reinstall its actual output. Only for
     /// Executed/Ready transactions (never while an incarnation runs, whose worker installs
     /// its own writes). Returns the keys whose installed version changed.
-    fn repredict(run: &mut RunS, r: TxIdx) -> Vec<Pubkey> {
+    fn repredict(run: &mut RunS, r: TxIdx, hints: &Hints) -> Vec<Pubkey> {
         let sched_run = Arc::clone(&run.run);
         let overlay = sched_run.overlay();
         let tx = &run.txs[r as usize];
@@ -1083,18 +1135,32 @@ impl<S: FinalSink> Coordinator<S> {
                     None => continue,
                 }
             };
-            match overlay.version_of(key, r) {
-                Some((_, current)) if !accounts_equal(&current, &target) => {}
-                _ => continue,
+            let payer = run
+                .acct_idx
+                .get(key)
+                .is_some_and(|&a| run.accts[a as usize].payer);
+            let install = !predicted || hints.miss(key, payer) <= hints.predict_miss_max;
+            if install {
+                match overlay.version_of(key, r) {
+                    Some((_, current)) if !accounts_equal(&current, &target) => {}
+                    _ => continue,
+                }
+            } else if tx.pred_recs.iter().any(|rec| {
+                rec.key == *key && !rec.installed && accounts_equal(&rec.basis, new_in)
+            }) {
+                continue;
             }
             if predicted {
                 recs.push(PredRec {
                     key: *key,
                     basis: new_in.clone(),
                     predicted: target.clone(),
+                    installed: install,
                 });
             }
-            installs.push((*key, target, predicted));
+            if install {
+                installs.push((*key, target, predicted));
+            }
         }
         for (key, target, predicted) in installs {
             let inc = if predicted {
@@ -1114,9 +1180,11 @@ impl<S: FinalSink> Coordinator<S> {
             changed.push(key);
         }
         if !recs.is_empty() {
-            run.summary.predictions += recs.len() as u64;
+            let installed = recs.iter().filter(|rec| rec.installed).count();
+            run.summary.predictions += installed as u64;
+            run.summary.shadow_predictions += (recs.len() - installed) as u64;
             let tx = &mut run.txs[r as usize];
-            tx.rebased += recs.len() as u32;
+            tx.rebased += installed as u32;
             for rec in recs {
                 let bytes = rec.bytes();
                 run.pred_bytes += bytes;
@@ -1176,7 +1244,7 @@ impl<S: FinalSink> Coordinator<S> {
                             let vis = overlay.visible_below(key, r);
                             if vis.origin != read.origin && !same_value(&vis.value, &read.value) {
                                 stale_readers.insert((r, true));
-                            } else if !tx.pred_recs.is_empty() {
+                            } else if tx.pred_recs.iter().any(|rec| rec.installed) {
                                 // Input back to what it read: undo its predictions.
                                 stale_readers.insert((r, false));
                             }
@@ -1194,7 +1262,7 @@ impl<S: FinalSink> Coordinator<S> {
                     let class = if tx.is_vote { CLASS_VOTE } else { CLASS_SPEC };
                     Self::push_ready(&mut self.heap, run, run_id, r, class);
                 }
-                let changed = Self::repredict(run, r);
+                let changed = Self::repredict(run, r, &self.hints);
                 if !changed.is_empty() {
                     work.entry(r).or_default().extend(changed);
                 }
@@ -1277,7 +1345,7 @@ impl<S: FinalSink> Coordinator<S> {
             if rebase_on {
                 // Its inputs are final now: keep its versions as predictions, rebased onto
                 // the final inputs, while it re-executes (it cannot become final before).
-                let changed = Self::repredict(run, k);
+                let changed = Self::repredict(run, k, &self.hints);
                 Self::push_ready(&mut self.heap, run, run_id, k, CLASS_RETRY);
                 self.cascade(run_id, vec![(k, changed)]);
                 return;

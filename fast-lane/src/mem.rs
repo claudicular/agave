@@ -72,6 +72,9 @@ pub static PROGRAM_ENTRIES: Gauge = Gauge::new();
 pub static PROGRAM_BYTES: Gauge = Gauge::new();
 /// Scheduler change-probability and rebase-miss hints (bytes estimate).
 pub static HINT_BYTES: Gauge = Gauge::new();
+/// Idle program-input buffers and PDA on-curve caches of FL's executor threads (`vm_opts`;
+/// bounded per thread by the runtime: ≤ 9 × 4 MiB buffers, one fixed-size cache).
+pub static VM_POOL_BYTES: Gauge = Gauge::new();
 /// Delta-rebase prediction records the coordinator keeps until the predicted transaction's
 /// next incarnation verifies them (record + predicted account data; released with the run).
 pub static PRED_BYTES: Gauge = Gauge::new();
@@ -92,6 +95,7 @@ pub struct Snapshot {
     pub program: i64,
     pub hints: i64,
     pub pred: i64,
+    pub vm_pool: i64,
 }
 
 impl Snapshot {
@@ -108,6 +112,7 @@ impl Snapshot {
             program: PROGRAM_BYTES.get(),
             hints: HINT_BYTES.get(),
             pred: PRED_BYTES.get(),
+            vm_pool: VM_POOL_BYTES.get(),
         }
     }
 
@@ -120,6 +125,7 @@ impl Snapshot {
             + self.ingest_pending
             + self.hints
             + self.pred
+            + self.vm_pool
     }
 }
 

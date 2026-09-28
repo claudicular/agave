@@ -61,6 +61,11 @@ pub struct Config {
     /// predictions are never final and every FINAL read is checked against executed values.
     /// Runtime toggle: `rebase=on|off` in the control file.
     pub rebase: bool,
+    /// Result-identical VM shortcuts on FL's executor threads only (`control::vm_opts`):
+    /// mapped-prefix heap reset, PDA on-curve cache, pooled program-input buffers — agave's
+    /// `SOLANA_VM_HEAP_ZERO_OPT`, `SOLANA_VM_PDA_CACHE`, `SOLANA_VM_SER_POOL`, without
+    /// setting them for agave's threads. Runtime toggle: `vm_opts=on|off` in the control file.
+    pub vm_opts: bool,
     /// Give up on a slot whose parent does not freeze within this time.
     pub parent_wait_ms: u64,
     /// Maximum concurrently active runs.
@@ -131,6 +136,7 @@ impl Default for Config {
             max_incarnations: 3,
             eager_reexec: true,
             rebase: false,
+            vm_opts: false,
             parent_wait_ms: 300,
             max_runs: 4,
             mem_cap_mb: 1024,
@@ -275,6 +281,7 @@ impl Config {
             "max_incarnations" => self.max_incarnations = parse_scalar(key, value)?,
             "eager_reexec" => self.eager_reexec = parse_bool(key, value)?,
             "rebase" => self.rebase = parse_bool(key, value)?,
+            "vm_opts" => self.vm_opts = parse_bool(key, value)?,
             "parent_wait_ms" => self.parent_wait_ms = parse_scalar(key, value)?,
             "max_runs" => self.max_runs = parse_scalar(key, value)?,
             "mem_cap_mb" => self.mem_cap_mb = parse_scalar(key, value)?,
@@ -429,6 +436,8 @@ mod tests {
     fn test_parse_fra_rebase_config() {
         let config = Config::parse(FRA_REBASE_TOML).unwrap();
         assert!(config.rebase && config.eager_reexec && config.speculation);
+        assert!(config.vm_opts);
+        assert!(!Config::parse("").unwrap().vm_opts);
         assert_eq!(config.workers, 8);
         assert_eq!(config.theta, 0.5);
         assert!(config.chain && config.out_ring && config.input_dual);
@@ -439,11 +448,12 @@ mod tests {
 
     const FRA_REBASE_TOML: &str = r#"
 # Fast lane shadow #4 (FRA): the live shadow #3 config (/home/sol/fast_lane.toml, 2026-09-28
-# 15:25Z) + `rebase = true` (delta-rebase value prediction for fee-payer / fee-sink chains,
-# DESIGN §19). Nothing else changed.
-# Binary: /home/sol/fl-bin/agave-validator-75936fc3f5 (fast-lane 75936fc3f5 = c3f25234d5 + rebase).
-# The older binaries reject the `rebase` key (unknown keys fail the config parse): deploy
-# binary and config together. Runtime A/B without restart: `rebase=off` / `rebase=on` in the
+# 15:25Z) + `vm_opts = true` (result-identical VM shortcuts on FL's executor threads only,
+# DESIGN §20) + `rebase = true` (delta-rebase value prediction for fee-payer / fee-sink
+# chains, DESIGN §19). Nothing else changed.
+# Binary: /home/sol/fl-bin/agave-validator-<sha10> named in PROGRESS.md's latest READY line.
+# The older binaries reject these keys (unknown keys fail the config parse): deploy binary
+# and config together. Runtime A/B without restart: `vm_opts=off|on`, `rebase=off|on` in the
 # control file.
 # Install: copy to /home/sol/fast_lane.toml (validator.sh exports AGAVE_FAST_LANE_CONFIG).
 # Layout (48 logical CPUs, SMT sibling of N is N+24):
@@ -493,6 +503,10 @@ eager_reexec = true
 # sinks, and rebase-aware speculation gating. Exactness does not depend on it (predictions are
 # never final or emitted). Runtime toggle: rebase=on|off in the control file.
 rebase = true
+# FL executor threads run agave's SOLANA_VM_HEAP_ZERO_OPT / _PDA_CACHE / _SER_POOL shortcuts
+# (result-identical; per-thread pools, `mem_vm_pool_kb`); agave's own threads are unchanged.
+# Runtime toggle: vm_opts=on|off in the control file.
+vm_opts = true
 
 parent_wait_ms = 300
 max_runs = 4

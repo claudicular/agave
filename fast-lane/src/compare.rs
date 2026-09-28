@@ -213,6 +213,7 @@ struct Interval {
     sysvar_checks_ok: u64,
     sysvar_check_mismatch: u64,
     predictions: u64,
+    shadow_predictions: u64,
     pred_hits: u64,
     pred_misses: u64,
     spec_relaxed: u64,
@@ -412,6 +413,7 @@ impl Comparator {
                 self.interval.spec_dispatches += summary.spec_dispatches;
                 self.interval.nonspec_dispatches += summary.nonspec_dispatches;
                 self.interval.predictions += summary.predictions;
+                self.interval.shadow_predictions += summary.shadow_predictions;
                 self.interval.pred_hits += summary.pred_hits;
                 self.interval.pred_misses += summary.pred_misses;
                 self.interval.spec_relaxed += summary.spec_relaxed;
@@ -915,8 +917,8 @@ impl Comparator {
              mem_total_mb={} mem_overlay_mb={} live_runs={} mem_frame_queue_mb={} \
              mem_cmp_queue_mb={} mem_cmp_held_mb={} cmp_fl={} cmp_agave={} cmp_runs={} \
              mem_ingest_pending_kb={} banks_held={} program_entries={} program_mb={} \
-             hints_kb={} mem_pred_kb={} cap_trips={} rebase_preds={} rebase_hit={} \
-             rebase_miss={} spec_relaxed={} final_fixups={}",
+             hints_kb={} mem_pred_kb={} mem_vm_pool_kb={} cap_trips={} rebase_preds={} rebase_shadow={} \
+             rebase_hit={} rebase_miss={} spec_relaxed={} final_fixups={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -971,8 +973,10 @@ impl Comparator {
             mem.program >> 20,
             mem.hints >> 10,
             mem.pred >> 10,
+            mem.vm_pool >> 10,
             cap_trips,
             iv.predictions,
+            iv.shadow_predictions,
             iv.pred_hits,
             iv.pred_misses,
             iv.spec_relaxed,
@@ -1014,6 +1018,7 @@ impl Comparator {
             ("sysvar_checks_ok", iv.sysvar_checks_ok as i64, i64),
             ("sysvar_check_mismatch", iv.sysvar_check_mismatch as i64, i64),
             ("rebase_predictions", iv.predictions as i64, i64),
+            ("rebase_shadow_predictions", iv.shadow_predictions as i64, i64),
             ("rebase_hits", iv.pred_hits as i64, i64),
             ("rebase_misses", iv.pred_misses as i64, i64),
             ("spec_relaxed", iv.spec_relaxed as i64, i64),
@@ -1036,6 +1041,7 @@ impl Comparator {
             ("program_bytes", mem.program, i64),
             ("hint_bytes", mem.hints, i64),
             ("pred_bytes", mem.pred, i64),
+            ("vm_pool_bytes", mem.vm_pool, i64),
             ("cap_trips", cap_trips as i64, i64),
         );
         if let Some(w) = self.summaries.as_mut() {
@@ -1052,8 +1058,8 @@ impl Comparator {
                  \"sysvar_checks_ok\":{},\"sysvar_check_mismatch\":{},\"mem\":{{\"total\":{},\
                  \"overlay\":{},\"live_runs\":{},\"frame_queue\":{},\"cmp_queue\":{},\"cmp_held\":{},\
                  \"ingest_pending\":{},\"banks_held\":{},\"program_entries\":{},\"program\":{},\
-                 \"hints\":{},\"pred\":{},\"cap_trips\":{}}},\"rebase\":{{\"predictions\":{},\
-                 \"hits\":{},\"misses\":{},\"spec_relaxed\":{},\"final_fixups\":{}}}}}",
+                 \"hints\":{},\"pred\":{},\"vm_pool\":{},\"cap_trips\":{}}},\"rebase\":{{\"predictions\":{},\
+                 \"shadow\":{},\"hits\":{},\"misses\":{},\"spec_relaxed\":{},\"final_fixups\":{}}}}}",
                 unix_ns(),
                 iv.matched,
                 iv.mismatched,
@@ -1107,8 +1113,10 @@ impl Comparator {
                 mem.program,
                 mem.hints,
                 mem.pred,
+                mem.vm_pool,
                 cap_trips,
                 iv.predictions,
+                iv.shadow_predictions,
                 iv.pred_hits,
                 iv.pred_misses,
                 iv.spec_relaxed,

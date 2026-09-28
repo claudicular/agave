@@ -283,8 +283,14 @@ fn assert_identical_under_all_switches(
     let mut reference: Option<Vec<Observation>> = None;
     // Two rounds so that the second round runs on pools and caches dirtied by every setting.
     for round in 0..2 {
-        for (setting, heap, pda, ser, timers) in SWITCH_SETTINGS {
+        // The last setting: every switch off process-wide but on for this thread only
+        // (`vm_opts::set_thread_enabled`, how the fast lane enables them on its executors).
+        let thread_only = ("thread-local", false, false, false, false);
+        for (index, (setting, heap, pda, ser, timers)) in
+            SWITCH_SETTINGS.into_iter().chain([thread_only]).enumerate()
+        {
             set_switches(heap, pda, ser, timers);
+            vm_opts::set_thread_enabled(index == SWITCH_SETTINGS.len());
             let observed = execute_batch(
                 accounts,
                 feature_set,
@@ -311,6 +317,7 @@ fn assert_identical_under_all_switches(
             }
         }
     }
+    vm_opts::set_thread_enabled(false);
     set_switches(initial.0, initial.1, initial.2, initial.3);
     reference.unwrap()
 }
