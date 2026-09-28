@@ -63,6 +63,8 @@ struct SlotIngest {
     pending: BTreeMap<u32, (u32, Instant, u64)>,
     released: Vec<ReleasedSet>,
     run: Option<(RunId, Arc<Run>)>,
+    /// Kept after the run's input completes (the Arc is released then).
+    run_id: Option<RunId>,
     next_ordinal: TxIdx,
     status: SlotStatus,
     parent_frozen_at_first_set: bool,
@@ -151,7 +153,7 @@ impl Ingest {
         let keep = self.slots.split_off(&root);
         for (slot, state) in std::mem::replace(&mut self.slots, keep) {
             if let Some((run_id, _)) = state.run {
-                if !matches!(state.status, SlotStatus::Complete) {
+                if !matches!(state.status, SlotStatus::Complete | SlotStatus::Skipped(_)) {
                     let _ = self.coord_tx.send(CoordMsg::AbortRun {
                         run_id,
                         reason: "below_root",
@@ -198,7 +200,17 @@ impl Ingest {
 
     fn skip(&mut self, slot: Slot, reason: &'static str) {
         if let Some(state) = self.slots.get_mut(&slot) {
-            if matches!(state.status, SlotStatus::Skipped(_) | SlotStatus::Complete) {
+            if matches!(state.status, SlotStatus::Skipped(_)) {
+                return;
+            }
+            if state.status == SlotStatus::Complete {
+                // Input was complete but the coordinator may still be executing it.
+                if let Some(run_id) = state.run_id {
+                    let _ = self.coord_tx.send(CoordMsg::AbortRun { run_id, reason });
+                }
+                state.status = SlotStatus::Skipped(reason);
+                *self.stats.slots_skipped.entry(reason).or_default() += 1;
+                let _ = self.cmp_tx.try_send(CmpMsg::SlotSkipped { slot, reason });
                 return;
             }
             state.status = SlotStatus::Skipped(reason);
@@ -340,6 +352,7 @@ impl Ingest {
                         pending: BTreeMap::new(),
                         released: Vec::new(),
                         run: None,
+                        run_id: None,
                         next_ordinal: 0,
                         status: SlotStatus::Collecting,
                         parent_frozen_at_first_set: parent_frozen,
@@ -480,6 +493,7 @@ impl Ingest {
             return Err("gone");
         };
         state.run = Some((run_id, Arc::clone(&run)));
+        state.run_id = Some(run_id);
         state.status = SlotStatus::Running;
         let parent_wait_us = state.first_seen.elapsed().as_micros() as u64;
         let parent_frozen_at_first_set = state.parent_frozen_at_first_set;
@@ -541,6 +555,8 @@ impl Ingest {
         state.next_ordinal = ordinal;
         if state.input_complete && state.released.is_empty() && state.pending.is_empty() {
             state.status = SlotStatus::Complete;
+            // The coordinator and comparator hold the run from here on.
+            state.run = None;
             let _ = self.coord_tx.send(CoordMsg::InputComplete {
                 run_id,
                 total: ordinal,
