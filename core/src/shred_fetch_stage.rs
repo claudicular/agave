@@ -13,6 +13,7 @@ use {
         evicting_sender::EvictingSender,
         streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
     },
+    solana_turbine::receive_diet::{self, TraceStage},
     std::{
         net::UdpSocket,
         sync::{Arc, RwLock, atomic::AtomicBool},
@@ -66,6 +67,12 @@ impl ShredFetchStage {
         );
 
         for mut packet_batch in recvr {
+            if receive_diet::trace_enabled() {
+                packet_batch
+                    .iter()
+                    .filter_map(shred::wire::get_shred)
+                    .for_each(|shred| receive_diet::trace_shred(TraceStage::FetchDequeued, shred));
+            }
             shred_filter_ctx.maybe_update(sharable_banks.root());
             shred_filter_ctx.stats.shred_count += packet_batch.len();
 

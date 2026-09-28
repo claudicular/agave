@@ -29,6 +29,7 @@ use {
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::{BankForks, SharableBanks},
     solana_streamer::evicting_sender::EvictingSender,
+    solana_turbine::receive_diet::{self, TraceStage, receive_diet},
     std::{
         borrow::Cow,
         net::UdpSocket,
@@ -227,6 +228,10 @@ fn run_insert<'db, F>(
     metrics: &mut BlockstoreInsertionMetrics,
     ws_metrics: &mut WindowServiceMetrics,
     completed_data_sets_sender: Option<&CompletedDataSetsSender>,
+    // Receive diet `skip_empty_data_sets`.
+    skip_empty_data_sets: bool,
+    // Receive diet tracer on.
+    tracing: bool,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -236,6 +241,11 @@ where
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
     shreds.extend(verified_receiver.try_iter().flatten());
     shred_receiver_elapsed.stop();
+    if tracing {
+        for (shred, _, _) in &shreds {
+            receive_diet::trace_shred(TraceStage::InsertDequeued, shred);
+        }
+    }
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
     let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
@@ -268,11 +278,30 @@ where
     // Fast lane (no-op unless enabled): observe the data sets replay is about to read.
     agave_fast_lane::tap::on_completed_data_sets(&completed_data_sets);
 
-    if let Some(sender) = completed_data_sets_sender {
+    if tracing {
+        for data_set in &completed_data_sets {
+            trace_data_set(TraceStage::DataSetCompleted, data_set);
+        }
+    }
+    if let Some(sender) = completed_data_sets_sender
+        // Most inserts complete no data set; with the receive diet switch an empty message is
+        // not sent, since it would only wake CompletedDataSetsService for nothing.
+        && !(completed_data_sets.is_empty() && skip_empty_data_sets)
+    {
         sender.try_send(completed_data_sets)?;
     }
 
     Ok(())
+}
+
+/// Traces a completed data set under the index of its data-complete (last) shred.
+pub(crate) fn trace_data_set(
+    stage: TraceStage,
+    data_set: &solana_ledger::blockstore::CompletedDataSetInfo,
+) {
+    if let Some(last) = data_set.indices.end.checked_sub(1) {
+        receive_diet::trace(stage, data_set.slot, last);
+    }
 }
 
 pub struct WindowServiceChannels {
@@ -470,6 +499,8 @@ impl WindowService {
                         &mut metrics,
                         &mut ws_metrics,
                         completed_data_sets_sender.as_ref(),
+                        receive_diet().skip_empty_data_sets(),
+                        receive_diet::trace_enabled(),
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e) {
@@ -558,6 +589,77 @@ mod test {
             &mut ProcessShredsStats::default(),
         );
         data_shreds
+    }
+
+    #[test]
+    fn test_run_insert_skip_empty_data_sets() {
+        let genesis_config =
+            solana_ledger::genesis_utils::create_genesis_config(100).genesis_config;
+        let root_bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let entries = create_ticks(300, 0, Hash::default());
+        let shreds = local_entries_to_shred(&entries, 1, 0, &Keypair::new());
+        assert!(shreds.len() > 1);
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for skip_empty_data_sets in [false, true] {
+            let ledger_path = get_tmp_ledger_path_auto_delete!();
+            let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+            let (verified_sender, verified_receiver) = unbounded();
+            let (completed_sender, completed_receiver) = unbounded();
+            let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(16);
+            let mut shred_recovery_context = ShredRecoveryContext::new(
+                ReedSolomonCache::default(),
+                retransmit_sender,
+                root_bank.clone(),
+                0, // shred_version
+            );
+            let mut pinnable_slice = blockstore.new_pinnable_slice();
+            let mut write_batch = blockstore.get_write_batch().unwrap();
+            let mut metrics = BlockstoreInsertionMetrics::default();
+            let mut ws_metrics = WindowServiceMetrics::default();
+            let mut insert = |shreds: &[Shred]| {
+                verified_sender
+                    .send(
+                        shreds
+                            .iter()
+                            .map(|shred| (shred.payload().clone(), false, BlockLocation::Original))
+                            .collect(),
+                    )
+                    .unwrap();
+                run_insert(
+                    &thread_pool,
+                    &verified_receiver,
+                    &blockstore,
+                    &mut shred_recovery_context,
+                    &mut pinnable_slice,
+                    &mut write_batch,
+                    |_| (),
+                    &mut metrics,
+                    &mut ws_metrics,
+                    Some(&completed_sender),
+                    skip_empty_data_sets,
+                    false, // tracing
+                )
+                .unwrap();
+                completed_receiver.try_iter().collect::<Vec<_>>()
+            };
+            // Every shred but the data-complete one: no data set completes.
+            let (last, rest) = shreds.split_last().unwrap();
+            let messages = insert(rest);
+            if skip_empty_data_sets {
+                assert!(messages.is_empty());
+            } else {
+                assert_eq!(messages, vec![vec![]]);
+            }
+            // The last shred completes the data set; it is always sent.
+            let messages = insert(std::slice::from_ref(last));
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].len(), 1);
+            assert_eq!(messages[0][0].slot, 1);
+            assert_eq!(messages[0][0].indices, 0..shreds.len() as u32);
+        }
     }
 
     #[test]

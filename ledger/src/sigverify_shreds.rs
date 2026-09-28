@@ -74,6 +74,24 @@ pub fn verify_shreds(
     })
 }
 
+/// Same as [`verify_shreds`], on the calling thread (no thread-pool hand-offs); for iterations
+/// holding only a few packets.
+pub fn verify_shreds_serial(
+    batches: &[PacketBatch],
+    slot_leaders: &SlotPubkeys,
+    cache: &RwLock<LruCache>,
+) -> Vec<Vec<u8>> {
+    batches
+        .iter()
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|packet| u8::from(verify_shred_cpu(packet, slot_leaders, cache)))
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn sign_shred_cpu(keypair: &Keypair, packet: &mut PacketRefMut) {
     let sig = shred::layout::get_signature_range();
@@ -390,6 +408,15 @@ mod tests {
                 .map(|batch| vec![1u8; batch.len()])
                 .collect::<Vec<_>>()
         );
+        // The serial variant gives the same answer, with a warm and with a cold cache.
+        assert_eq!(
+            verify_shreds_serial(&packets, &pubkeys, &cache),
+            verify_shreds(&thread_pool, &packets, &pubkeys, &cache),
+        );
+        assert_eq!(
+            verify_shreds_serial(&packets, &pubkeys, &RwLock::new(LruCache::new(128))),
+            verify_shreds(&thread_pool, &packets, &pubkeys, &cache),
+        );
         // Invalidate signatures for a random number of packets.
         let out: Vec<_> = packets
             .iter_mut()
@@ -410,6 +437,11 @@ mod tests {
             })
             .collect();
         assert_eq!(verify_shreds(&thread_pool, &packets, &pubkeys, &cache), out);
+        assert_eq!(verify_shreds_serial(&packets, &pubkeys, &cache), out);
+        assert_eq!(
+            verify_shreds_serial(&packets, &pubkeys, &RwLock::new(LruCache::new(128))),
+            out
+        );
     }
 
     #[test_case(true)]
