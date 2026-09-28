@@ -1,0 +1,81 @@
+[package]
+name = "agave-fast-lane"
+description = "Speculative optimistic-parallel shadow executor for replayed slots (fast lane)"
+documentation = "https://docs.rs/agave-fast-lane"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[lib]
+crate-type = ["lib"]
+name = "agave_fast_lane"
+
+[features]
+agave-unstable-api = []
+dev-context-only-utils = [
+    "solana-ledger/dev-context-only-utils",
+    "solana-runtime/dev-context-only-utils",
+    "solana-svm/dev-context-only-utils",
+]
+
+[dependencies]
+agave-feature-set = { workspace = true }
+bs58 = { workspace = true, features = ["alloc"] }
+crossbeam-channel = { workspace = true }
+dashmap = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+solana-account = { workspace = true }
+solana-accounts-db = { workspace = true }
+solana-clock = { workspace = true }
+solana-entry = { workspace = true }
+solana-geyser-plugin-manager = { workspace = true }
+solana-hash = { workspace = true }
+solana-ledger = { workspace = true }
+solana-message = { workspace = true }
+solana-precompile-error = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-rpc = { workspace = true }
+solana-runtime = { workspace = true }
+solana-runtime-transaction = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-signature = { workspace = true }
+solana-svm = { workspace = true }
+solana-svm-callback = { workspace = true }
+solana-svm-transaction = { workspace = true }
+solana-transaction = { workspace = true }
+solana-transaction-error = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+agave-cpu-utils = { workspace = true }
+
+[dev-dependencies]
+agave-fast-lane = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
+rand = { workspace = true }
+solana-fee-structure = { workspace = true }
+solana-instruction = { workspace = true }
+solana-nonce = { workspace = true }
+solana-svm-timings = { workspace = true }
+serde_json = { workspace = true }
+solana-genesis-config = { workspace = true }
+solana-keypair = { workspace = true }
+solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
+solana-native-token = { workspace = true }
+solana-rent = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+solana-signer = { workspace = true }
+solana-system-interface = { workspace = true }
+solana-entry = { workspace = true, features = ["dev-context-only-utils"] }
+tempfile = { workspace = true }
+test-case = { workspace = true }
