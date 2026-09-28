@@ -156,6 +156,14 @@ impl UnverifiedSignatures {
         }
     }
 
+    /// Moves every entry of `other` to the end of `self`, preserving their order.
+    ///
+    /// Lets a caller validate entries on several threads (each into its own
+    /// `UnverifiedSignatures`) and still assemble one set in ledger order.
+    pub fn append(&mut self, other: &mut Self) {
+        self.signatures.append(&mut other.signatures);
+    }
+
     pub fn verify(&self) -> Result<()> {
         let verification_items = self.signatures.par_iter().flat_map_iter(|tx| {
             let message = tx.serialized_message.as_slice();
