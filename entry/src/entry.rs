@@ -150,7 +150,7 @@ pub struct UnverifiedSignatures {
 }
 
 impl UnverifiedSignatures {
-    fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             signatures: Vec::with_capacity(capacity),
         }
@@ -388,6 +388,24 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(EntryType::Transactions(verified_transactions))
+}
+
+/// Validates and hashes the transactions of a single entry, appending their signature
+/// verification data to `unverified_signatures`.
+///
+/// This is the per-entry building block of [`validate_and_hash_transactions`], exposed so that
+/// replay can hand each entry to the scheduler as soon as it has been validated instead of
+/// waiting for the whole data-complete range (see `blockstore_processor`'s pipelined entry
+/// submission). Like [`validate_and_hash_transactions`], it does NOT verify signatures.
+pub fn validate_and_hash_entry<Tx: TransactionWithMeta, F>(
+    entry: Entry,
+    verify: &F,
+    unverified_signatures: &mut UnverifiedSignatures,
+) -> Result<EntryType<Tx>>
+where
+    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx>,
+{
+    validate_and_hash_entry_transactions(entry, verify, unverified_signatures)
 }
 
 /// Validates and hashes the transactions included in the given entries.

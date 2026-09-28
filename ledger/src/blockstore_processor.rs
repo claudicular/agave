@@ -214,24 +214,7 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
                 }
             }
             EntryType::Transactions(transactions) => {
-                // Any bank replaying transactions must have a scheduler installed. Slot 0 -
-                // the only bank replayed before the scheduler pool is installed - is tick-only,
-                // so it never reaches here.
-                assert!(
-                    bank.has_installed_scheduler(),
-                    "no scheduler installed for bank of slot {} during replay",
-                    bank.slot()
-                );
-                validate_entry_transactions(
-                    &transactions,
-                    bank.get_transaction_account_lock_limit(),
-                )?;
-
-                let indexes = starting_index..starting_index + transactions.len();
-                // Widening usize index to OrderedTaskId (= u128) won't ever fail.
-                let task_ids = indexes.map(|i| i.try_into().unwrap());
-
-                bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))?;
+                schedule_entry_transactions(bank, transactions, starting_index)?;
             }
         }
     }
@@ -239,6 +222,30 @@ fn process_entries(bank: &BankWithScheduler, entries: Vec<ReplayEntry>) -> Resul
         bank.register_tick(&hash);
     }
     Ok(())
+}
+
+/// Hands one entry's (already validated and hashed) transactions to the bank's unified
+/// scheduler, in ledger order, with task ids starting at `starting_index`.
+fn schedule_entry_transactions(
+    bank: &BankWithScheduler,
+    transactions: Vec<RuntimeTransaction<SanitizedTransaction>>,
+    starting_index: usize,
+) -> Result<()> {
+    // Any bank replaying transactions must have a scheduler installed. Slot 0 -
+    // the only bank replayed before the scheduler pool is installed - is tick-only,
+    // so it never reaches here.
+    assert!(
+        bank.has_installed_scheduler(),
+        "no scheduler installed for bank of slot {} during replay",
+        bank.slot()
+    );
+    validate_entry_transactions(&transactions, bank.get_transaction_account_lock_limit())?;
+
+    let indexes = starting_index..starting_index + transactions.len();
+    // Widening usize index to OrderedTaskId (= u128) won't ever fail.
+    let task_ids = indexes.map(|i| i.try_into().unwrap());
+
+    bank.schedule_transaction_executions(transactions.into_iter().zip_eq(task_ids))
 }
 
 /// Validate an entry's transactions before scheduling: each transaction's account
@@ -1522,6 +1529,48 @@ pub fn confirm_slot(
     Ok(())
 }
 
+/// Environment variable that enables pipelined entry submission in replay.
+///
+/// Stock replay validates, hashes and resolves address lookup tables for *every* transaction of
+/// a data-complete range (serially below 200 txs) before scheduling the first one, so a
+/// transaction at position `k` of an `N`-transaction range waits for `N` sanitizations plus `k`
+/// task submissions. With this set to `1`/`true`, each entry is validated and then immediately
+/// handed to the unified scheduler, so it waits for `k` of each instead.
+///
+/// Execution results are unchanged: sanitization is independent of intra-slot execution (an
+/// address lookup table extended, deactivated, created or closed in slot `N` resolves identically
+/// for every transaction of slot `N`), scheduling order is still ledger order, and every entry of
+/// the range is still validated (an invalid transaction anywhere in the range still fails the
+/// slot). Only the error-path timing differs: when a later entry is invalid, earlier entries of
+/// the same range may already have been scheduled, exactly as happens today when a later range
+/// of the slot is invalid. The flag is read once per process.
+pub const REPLAY_PIPELINED_ENTRY_SUBMISSION_ENV: &str = "SOLANA_REPLAY_PIPELINED_ENTRY_SUBMISSION";
+
+fn parse_bool_env_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn pipelined_entry_submission_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var(REPLAY_PIPELINED_ENTRY_SUBMISSION_ENV)
+            .map(|value| parse_bool_env_flag(&value))
+            .unwrap_or(false);
+        info!(
+            "replay entry submission: {} ({REPLAY_PIPELINED_ENTRY_SUBMISSION_ENV})",
+            if enabled {
+                "pipelined per entry"
+            } else {
+                "per range"
+            },
+        );
+        enabled
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn confirm_slot_entries(
@@ -1534,6 +1583,33 @@ fn confirm_slot_entries(
     entry_notification_sender: Option<&EntryNotifierSender>,
     replay_vote_sender: Option<&ReplayVoteSender>,
     migration_status: &MigrationStatus,
+) -> result::Result<(), BlockstoreProcessorError> {
+    confirm_slot_entries_with_submission_mode(
+        bank,
+        replay_verification_worker_pool,
+        slot_entries_load_result,
+        timing,
+        progress,
+        skip_verification,
+        entry_notification_sender,
+        replay_vote_sender,
+        migration_status,
+        pipelined_entry_submission_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_slot_entries_with_submission_mode(
+    bank: &BankWithScheduler,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    slot_entries_load_result: (Vec<Entry>, u64, bool),
+    timing: &mut ConfirmationTiming,
+    progress: &mut ConfirmationProgress,
+    skip_verification: bool,
+    entry_notification_sender: Option<&EntryNotifierSender>,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    migration_status: &MigrationStatus,
+    pipelined_entry_submission: bool,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let ConfirmationTiming {
         confirmation_elapsed,
@@ -1638,6 +1714,82 @@ fn confirm_slot_entries(
         }
     };
 
+    if pipelined_entry_submission {
+        let PipelinedEntrySubmission {
+            unverified_signatures,
+            tick_hashes,
+        } = validate_and_schedule_entries_pipelined(
+            bank,
+            entries,
+            entry_tx_starting_indexes,
+            num_txs,
+            &validate_and_hash_transaction,
+            replay_elapsed,
+        )?;
+        spawn_transaction_signature_verification(
+            bank,
+            replay_verification_worker_pool,
+            progress,
+            unverified_signatures,
+            skip_verification,
+            replay_vote_sender,
+        )?;
+        // Ticks are registered only after every transaction of the range has been scheduled
+        // (and the signature verification has been spawned), as `process_entries` does: the
+        // block-boundary tick waits for the scheduler to drain.
+        let mut register_ticks_timer = Measure::start("register_ticks");
+        for hash in tick_hashes {
+            bank.register_tick(&hash);
+        }
+        register_ticks_timer.stop();
+        *replay_elapsed += register_ticks_timer.as_us();
+    } else {
+        confirm_entries_per_range(
+            bank,
+            replay_verification_worker_pool,
+            entries,
+            entry_tx_starting_indexes,
+            num_txs,
+            &validate_and_hash_transaction,
+            progress,
+            skip_verification,
+            replay_vote_sender,
+            replay_elapsed,
+        )?;
+    }
+
+    progress
+        .collect_available_verification_results(poh_verify_elapsed, transaction_verify_elapsed)?;
+
+    progress.num_shreds += num_shreds;
+    progress.num_entries += num_entries;
+    progress.num_txs += num_txs;
+    if let Some(last_entry_hash) = last_entry_hash {
+        progress.last_entry = last_entry_hash;
+    }
+
+    Ok(())
+}
+
+/// The stock replay path: validate and hash every transaction of the range, then schedule them.
+#[allow(clippy::too_many_arguments)]
+fn confirm_entries_per_range<F>(
+    bank: &BankWithScheduler,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    entries: Vec<Entry>,
+    entry_tx_starting_indexes: Vec<usize>,
+    num_txs: usize,
+    validate_and_hash_transaction: &F,
+    progress: &mut ConfirmationProgress,
+    skip_verification: bool,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    replay_elapsed: &mut u64,
+) -> result::Result<(), BlockstoreProcessorError>
+where
+    F: Fn(VersionedTransaction, &[u8]) -> Result<RuntimeTransaction<SanitizedTransaction>>
+        + Send
+        + Sync,
+{
     let entry::ValidatedHashedTransactions {
         entries,
         unverified_signatures,
@@ -1656,30 +1808,14 @@ fn confirm_slot_entries(
             return Err(err.into());
         }
     };
-    let bank_id = bank.bank_id();
-    if skip_verification {
-        if let Some(replay_vote_sender) = replay_vote_sender {
-            let message_hashes = unverified_signatures.vote_transaction_message_hashes();
-            if !message_hashes.is_empty() {
-                let _ = replay_vote_sender.send(ReplayVoteMessage::Verified {
-                    replay_bank_id: bank_id,
-                    replay_slot: slot,
-                    message_hashes,
-                });
-            }
-        }
-    } else {
-        let replay_vote_sender = replay_vote_sender.cloned();
-        progress
-            .async_verification(replay_verification_worker_pool)
-            .spawn_signature_verification(
-                replay_verification_worker_pool,
-                unverified_signatures,
-                slot,
-                bank_id,
-                replay_vote_sender,
-            )?;
-    }
+    spawn_transaction_signature_verification(
+        bank,
+        replay_verification_worker_pool,
+        progress,
+        unverified_signatures,
+        skip_verification,
+        replay_vote_sender,
+    )?;
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let is_vote_only_bank = bank.vote_only_bank();
@@ -1716,18 +1852,130 @@ fn confirm_slot_entries(
     replay_timer.stop();
     *replay_elapsed += replay_timer.as_us();
 
-    process_result?;
-    progress
-        .collect_available_verification_results(poh_verify_elapsed, transaction_verify_elapsed)?;
+    process_result
+}
 
-    progress.num_shreds += num_shreds;
-    progress.num_entries += num_entries;
-    progress.num_txs += num_txs;
-    if let Some(last_entry_hash) = last_entry_hash {
-        progress.last_entry = last_entry_hash;
+/// Spawns the asynchronous signature verification of a validated range (or, with
+/// `skip_verification`, forwards the vote message hashes as already verified).
+fn spawn_transaction_signature_verification(
+    bank: &BankWithScheduler,
+    replay_verification_worker_pool: &ReplayVerificationWorkerPool,
+    progress: &mut ConfirmationProgress,
+    unverified_signatures: UnverifiedSignatures,
+    skip_verification: bool,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+) -> result::Result<(), BlockstoreProcessorError> {
+    let slot = bank.slot();
+    let bank_id = bank.bank_id();
+    if skip_verification {
+        if let Some(replay_vote_sender) = replay_vote_sender {
+            let message_hashes = unverified_signatures.vote_transaction_message_hashes();
+            if !message_hashes.is_empty() {
+                let _ = replay_vote_sender.send(ReplayVoteMessage::Verified {
+                    replay_bank_id: bank_id,
+                    replay_slot: slot,
+                    message_hashes,
+                });
+            }
+        }
+        Ok(())
+    } else {
+        let replay_vote_sender = replay_vote_sender.cloned();
+        progress
+            .async_verification(replay_verification_worker_pool)
+            .spawn_signature_verification(
+                replay_verification_worker_pool,
+                unverified_signatures,
+                slot,
+                bank_id,
+                replay_vote_sender,
+            )
+    }
+}
+
+/// What [`validate_and_schedule_entries_pipelined`] leaves for its caller: the signatures still to
+/// verify and the ticks still to register.
+struct PipelinedEntrySubmission {
+    unverified_signatures: UnverifiedSignatures,
+    tick_hashes: Vec<Hash>,
+}
+
+/// Pipelined counterpart of `validate_and_hash_transactions` + `process_entries`: validates and
+/// hashes one entry, then immediately schedules its transactions, before looking at the next
+/// entry. See [`REPLAY_PIPELINED_ENTRY_SUBMISSION_ENV`] for why the results are identical.
+///
+/// Invariants kept from the per-range path:
+/// - transactions reach the scheduler in ledger order with the same task ids;
+/// - every entry of the range is validated (including any after the block-boundary tick, which
+///   `process_entries` does not schedule), and the vote-only-bank check covers every entry;
+/// - ticks are registered by the caller only after the whole range has been scheduled.
+fn validate_and_schedule_entries_pipelined<F>(
+    bank: &BankWithScheduler,
+    entries: Vec<Entry>,
+    entry_tx_starting_indexes: Vec<usize>,
+    num_txs: usize,
+    validate_and_hash_transaction: &F,
+    replay_elapsed: &mut u64,
+) -> result::Result<PipelinedEntrySubmission, BlockstoreProcessorError>
+where
+    F: Fn(VersionedTransaction, &[u8]) -> Result<RuntimeTransaction<SanitizedTransaction>>,
+{
+    let slot = bank.slot();
+    let is_vote_only_bank = bank.vote_only_bank();
+    let mut unverified_signatures = UnverifiedSignatures::with_capacity(num_txs);
+    let mut tick_hashes = vec![];
+    let mut reached_block_boundary = false;
+
+    for (entry, starting_index) in entries.into_iter().zip_eq(entry_tx_starting_indexes) {
+        let entry = entry::validate_and_hash_entry(
+            entry,
+            validate_and_hash_transaction,
+            &mut unverified_signatures,
+        )
+        .map_err(|err| {
+            warn!("Ledger transaction hash verification failed at slot: {slot}");
+            BlockstoreProcessorError::from(err)
+        })?;
+
+        // If bank is in vote-only mode, validate that entries contain only vote transactions
+        if is_vote_only_bank
+            && let EntryType::Transactions(ref transactions) = entry
+            && transactions
+                .iter()
+                .any(|tx| !is_valid_vote_only_transaction(tx))
+        {
+            return Err(BlockstoreProcessorError::UserTransactionsInVoteOnlyBank(
+                slot,
+            ));
+        }
+
+        if reached_block_boundary {
+            // Like `process_entries`, schedule nothing past the block-boundary tick, but keep
+            // validating so an invalid transaction there still fails the slot.
+            continue;
+        }
+
+        let mut submit_timer = Measure::start("pipelined_entry_submission");
+        let submit_result = match entry {
+            EntryType::Tick(hash) => {
+                tick_hashes.push(hash);
+                reached_block_boundary =
+                    bank.is_block_boundary(bank.tick_height() + tick_hashes.len() as u64);
+                Ok(())
+            }
+            EntryType::Transactions(transactions) => {
+                schedule_entry_transactions(bank, transactions, starting_index)
+            }
+        };
+        submit_timer.stop();
+        *replay_elapsed += submit_timer.as_us();
+        submit_result?;
     }
 
-    Ok(())
+    Ok(PipelinedEntrySubmission {
+        unverified_signatures,
+        tick_hashes,
+    })
 }
 
 // Special handling required for processing the entries in slot 0
@@ -5079,6 +5327,194 @@ pub mod tests {
             slot_full,
             &mut progress,
         )
+    }
+
+    /// Replays `entries` into a fresh slot-0 bank of `genesis_config` with the given entry
+    /// submission mode, waits for the scheduler and all async verification, and freezes the bank.
+    fn replay_slot_0_with_submission_mode_for_tests(
+        genesis_config: &GenesisConfig,
+        entries: Vec<Entry>,
+        slot_full: bool,
+        pipelined_entry_submission: bool,
+    ) -> (Arc<Bank>, result::Result<(), BlockstoreProcessorError>) {
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(genesis_config);
+        let pool = DefaultSchedulerPool::new_for_verification(None, None, None, None, None);
+        let replay_verification_worker_pool = ReplayVerificationWorkerPool::new(2);
+        let mut progress = ConfirmationProgress::new(genesis_config.hash());
+        let bank_with_scheduler = take_bank_with_scheduler_for_tests(&pool, bank.clone());
+        let result = confirm_slot_entries_with_submission_mode(
+            &bank_with_scheduler,
+            &replay_verification_worker_pool,
+            (entries, 0, slot_full),
+            &mut ConfirmationTiming::default(),
+            &mut progress,
+            false,
+            None,
+            None,
+            &MigrationStatus::default(),
+            pipelined_entry_submission,
+        );
+        let (wait_result, _timings) = bank_with_scheduler.wait_for_completed_scheduler().unwrap();
+        let result = result
+            .and_then(|()| progress.wait_for_all_verification_results(&mut 0, &mut 0))
+            .and_then(|()| wait_result.map_err(BlockstoreProcessorError::from));
+        bank.freeze();
+        (bank, result)
+    }
+
+    #[test]
+    fn test_parse_bool_env_flag() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_bool_env_flag(value), "{value}");
+        }
+        for value in ["", "0", "false", "off", "no", "2", "pipelined"] {
+            assert!(!parse_bool_env_flag(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn test_pipelined_entry_submission_matches_per_range() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(100 * LAMPORTS_PER_SOL);
+        let genesis_hash = genesis_config.hash();
+        let amount = genesis_config.rent.minimum_balance(0);
+        let keypairs: Vec<_> = (0..6).map(|_| Keypair::new()).collect();
+        let transfer = |from: &Keypair, to: &Keypair, lamports| {
+            system_transaction::transfer(from, &to.pubkey(), lamports, genesis_hash)
+        };
+
+        // A chain of conflicting transactions across entries (mint -> k0 -> k2 -> k4), transfers
+        // that depend on accounts funded by earlier entries, and independent ones, interleaved
+        // with ticks, ending at the block boundary.
+        let mut hash = genesis_hash;
+        let mut entries = vec![
+            next_entry_mut(
+                &mut hash,
+                1,
+                vec![
+                    transfer(&mint_keypair, &keypairs[0], LAMPORTS_PER_SOL),
+                    transfer(&mint_keypair, &keypairs[1], LAMPORTS_PER_SOL),
+                ],
+            ),
+            next_entry_mut(
+                &mut hash,
+                1,
+                vec![
+                    transfer(&keypairs[0], &keypairs[2], LAMPORTS_PER_SOL / 2),
+                    transfer(&keypairs[1], &keypairs[3], LAMPORTS_PER_SOL / 4),
+                ],
+            ),
+            next_entry_mut(&mut hash, 1, vec![]),
+            next_entry_mut(
+                &mut hash,
+                1,
+                vec![transfer(&keypairs[2], &keypairs[4], amount)],
+            ),
+            next_entry_mut(
+                &mut hash,
+                1,
+                vec![
+                    transfer(&mint_keypair, &keypairs[5], amount),
+                    // Fails at execution (insufficient funds): fee still charged.
+                    transfer(&keypairs[3], &keypairs[5], LAMPORTS_PER_SOL),
+                ],
+            ),
+        ];
+        let remaining_ticks = genesis_config.ticks_per_slot - entries.tick_count();
+        for _ in 0..remaining_ticks {
+            entries.push(next_entry_mut(&mut hash, 1, vec![]));
+        }
+
+        let (per_range_bank, per_range_result) = replay_slot_0_with_submission_mode_for_tests(
+            &genesis_config,
+            entries.clone(),
+            true,
+            false,
+        );
+        let (pipelined_bank, pipelined_result) =
+            replay_slot_0_with_submission_mode_for_tests(&genesis_config, entries, true, true);
+
+        assert_matches!(per_range_result, Ok(()));
+        assert_matches!(pipelined_result, Ok(()));
+        assert_eq!(
+            per_range_bank.tick_height(),
+            per_range_bank.max_tick_height()
+        );
+        assert_eq!(
+            pipelined_bank.tick_height(),
+            pipelined_bank.max_tick_height()
+        );
+        assert_eq!(per_range_bank.transaction_count(), 7);
+        assert_eq!(
+            pipelined_bank.transaction_count(),
+            per_range_bank.transaction_count()
+        );
+        for keypair in keypairs.iter().chain([&mint_keypair]) {
+            assert_eq!(
+                pipelined_bank.get_balance(&keypair.pubkey()),
+                per_range_bank.get_balance(&keypair.pubkey())
+            );
+        }
+        assert_eq!(pipelined_bank.hash(), per_range_bank.hash());
+    }
+
+    #[test]
+    fn test_pipelined_entry_submission_rejects_invalid_later_entry() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(100 * LAMPORTS_PER_SOL);
+        let genesis_hash = genesis_config.hash();
+        let recipient = Pubkey::new_unique();
+        let amount = genesis_config.rent.minimum_balance(0);
+
+        let valid = system_transaction::transfer(&mint_keypair, &recipient, amount, genesis_hash);
+        let mut invalid = system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            amount,
+            genesis_hash,
+        );
+        // More required signers than static account keys: fails sanitization.
+        invalid.message.header.num_required_signatures = 10;
+
+        let mut hash = genesis_hash;
+        let entries = vec![
+            next_entry_mut(&mut hash, 1, vec![valid]),
+            next_entry_mut(&mut hash, 1, vec![]),
+            next_entry_mut(&mut hash, 1, vec![invalid]),
+        ];
+
+        for pipelined_entry_submission in [false, true] {
+            let (bank, result) = replay_slot_0_with_submission_mode_for_tests(
+                &genesis_config,
+                entries.clone(),
+                false,
+                pipelined_entry_submission,
+            );
+            assert_matches!(
+                result,
+                Err(BlockstoreProcessorError::InvalidTransaction(
+                    TransactionError::SanitizeFailure
+                )),
+                "pipelined_entry_submission: {pipelined_entry_submission}"
+            );
+            // Ticks of a failed range are never registered in either mode.
+            assert_eq!(bank.tick_height(), 0);
+            // The per-range path fails before scheduling anything; the pipelined path has already
+            // executed the valid first entry into the (to be marked dead) bank, just as a
+            // per-range replay does for earlier ranges of a slot whose later range is invalid.
+            let expected_recipient_balance = if pipelined_entry_submission {
+                amount
+            } else {
+                0
+            };
+            assert_eq!(bank.get_balance(&recipient), expected_recipient_balance);
+        }
     }
 
     fn create_test_transactions(
