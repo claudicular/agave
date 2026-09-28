@@ -98,8 +98,16 @@ pub struct Overlay {
     slot: Slot,
     base: Arc<dyn BaseReader>,
     accounts: dashmap::DashMap<Pubkey, Arc<AcctEntry>>,
-    bytes: AtomicUsize,
+    /// Account data held (versions and cached base reads, plus per-account overhead); also
+    /// added to the process-wide [`crate::mem::OVERLAY_BYTES`] and released on drop.
+    bytes: std::sync::atomic::AtomicI64,
     base_reads: AtomicUsize,
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        crate::mem::OVERLAY_BYTES.sub(self.bytes.load(Ordering::Relaxed));
+    }
 }
 
 /// What a reader would see for `key` below `tx`.
@@ -118,7 +126,7 @@ impl Overlay {
             slot,
             base,
             accounts: dashmap::DashMap::new(),
-            bytes: AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicI64::new(0),
             base_reads: AtomicUsize::new(0),
         }
     }
@@ -127,9 +135,14 @@ impl Overlay {
         self.slot
     }
 
-    /// Approximate bytes of account data held in versions.
+    /// Approximate bytes of account data held (versions and cached base reads).
     pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
+        self.bytes.load(Ordering::Relaxed).max(0) as usize
+    }
+
+    fn account_bytes(&self, delta: i64) {
+        self.bytes.fetch_add(delta, Ordering::Relaxed);
+        crate::mem::OVERLAY_BYTES.add(delta);
     }
 
     pub fn base_reads(&self) -> usize {
@@ -148,7 +161,14 @@ impl Overlay {
             .base
             .get_or_init(|| {
                 self.base_reads.fetch_add(1, Ordering::Relaxed);
-                self.base.read(key)
+                let value = self.base.read(key);
+                self.account_bytes(
+                    value
+                        .as_ref()
+                        .map(|(a, _)| crate::mem::account_bytes(a))
+                        .unwrap_or(crate::mem::ACCOUNT_OVERHEAD),
+                );
+                value
             })
             .clone()
     }
@@ -285,10 +305,13 @@ impl Overlay {
                 final_: false,
             };
             if pos < versions.len() && versions[pos].tx == tx {
+                self.account_bytes(
+                    crate::mem::account_bytes(account)
+                        - crate::mem::account_bytes(&versions[pos].account),
+                );
                 versions[pos] = version;
             } else {
-                self.bytes
-                    .fetch_add(account.data().len().saturating_add(128), Ordering::Relaxed);
+                self.account_bytes(crate::mem::account_bytes(account));
                 versions.insert(pos, version);
             }
         }
@@ -306,7 +329,8 @@ impl Overlay {
         let mut versions = entry.versions.lock();
         let pos = versions.partition_point(|v| v.tx < tx);
         if pos < versions.len() && versions[pos].tx == tx {
-            versions.remove(pos);
+            let removed = versions.remove(pos);
+            self.account_bytes(-crate::mem::account_bytes(&removed.account));
         }
     }
 
@@ -365,6 +389,10 @@ mod tests {
 
     use solana_account::WritableAccount;
 
+    fn acct_len(lamports: u64, len: usize) -> AccountSharedData {
+        AccountSharedData::new(lamports, len, &Pubkey::new_from_array([9; 32]))
+    }
+
     #[test]
     fn test_versions_and_visibility() {
         let key = Pubkey::new_unique();
@@ -421,5 +449,25 @@ mod tests {
         // also falls back.
         ov.install(3, 0, &[(key, AccountSharedData::default())], &[]);
         assert_eq!(ov.visible_below(&key, 5).origin, Origin::Ver(2, 0));
+    }
+
+    #[test]
+    fn test_bytes_accounting() {
+        let key = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let base = HashMap::from([(other, acct_len(7, 1000))]);
+        let ov = Overlay::new(2, Arc::new(MapBase(base)));
+        assert_eq!(ov.bytes(), 0);
+        ov.install(1, 0, &[(key, acct_len(1, 100))], &[]);
+        assert_eq!(ov.bytes(), 228);
+        // Re-install with a bigger account replaces the version's bytes.
+        ov.install(1, 1, &[(key, acct_len(1, 300))], &[key]);
+        assert_eq!(ov.bytes(), 428);
+        // A base read of a 1000-byte account is held too.
+        let _ = ov.visible_below(&other, 5);
+        assert_eq!(ov.bytes(), 428 + 1128);
+        // Removing the version releases it.
+        ov.install(1, 2, &[], &[key]);
+        assert_eq!(ov.bytes(), 1128);
     }
 }

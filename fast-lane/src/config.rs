@@ -58,7 +58,9 @@ pub struct Config {
     pub parent_wait_ms: u64,
     /// Maximum concurrently active runs.
     pub max_runs: usize,
-    /// Pause when the overlays hold more than this many bytes of account data.
+    /// Hard cap on the memory the fast lane holds (overlays, comparator frames and records,
+    /// queues, pending entries, hints; see `mem`). Above it FL disables itself and releases
+    /// everything; no new run starts while overlays hold more than half of it.
     pub mem_cap_mb: usize,
     /// Run the shadow comparator against agave's grouped notifications.
     pub comparator: bool,

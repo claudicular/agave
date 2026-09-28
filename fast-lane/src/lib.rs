@@ -23,6 +23,7 @@ pub mod export;
 pub mod forks;
 pub mod gate;
 pub mod ingest;
+pub mod mem;
 pub mod mv;
 pub mod out_ring;
 pub mod output;
@@ -150,7 +151,7 @@ impl FastLane {
     pub fn prepare(config: Config) -> Self {
         let (tap_tx, tap_rx) = bounded(4096);
         let (event_tx, event_rx) = bounded(4096);
-        let (frame_tx, frame_rx) = bounded(262_144);
+        let (frame_tx, frame_rx) = bounded(65_536);
         let shared = Arc::new(Shared {
             tap_tx,
             event_tx,
@@ -266,7 +267,7 @@ fn start_threads(
 
     let (coord_tx, coord_rx) = unbounded::<CoordMsg>();
     let (task_tx, task_rx) = unbounded();
-    let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(262_144);
+    let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(65_536);
     let sink_drops = Arc::new(AtomicU64::new(0));
     // Phase-3 output ring (created before any thread so its failure only disables it).
     let out_stats = Arc::new(output::OutStats::default());

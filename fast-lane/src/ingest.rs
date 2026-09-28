@@ -122,6 +122,10 @@ pub struct Ingest {
     /// Runs report completion here (their slot).
     complete_tx: Sender<Slot>,
     complete_rx: Receiver<Slot>,
+    /// Everything was dropped because the fast lane is off (re-seeded when it comes back).
+    released: bool,
+    last_bank_prune: Instant,
+    last_program_stats: Instant,
     pub stats: IngestStats,
 }
 
@@ -151,6 +155,9 @@ impl Ingest {
             ring_retry_at: Instant::now(),
             complete_tx,
             complete_rx,
+            released: false,
+            last_bank_prune: Instant::now(),
+            last_program_stats: Instant::now(),
             stats: IngestStats::default(),
         };
         ingest.seed();
@@ -239,7 +246,7 @@ impl Ingest {
                 idle_since = Instant::now();
             } else {
                 // Busy-poll (dedicated core): the ring first (earliest input), then taps.
-                let mut worked = self.poll_ring();
+                let mut worked = !self.released && self.poll_ring();
                 match tap_rx.try_recv() {
                     Ok(batch) => {
                         self.on_tap(batch);
@@ -269,9 +276,7 @@ impl Ingest {
                     }
                 }
             }
-            if !crate::control::is_active() {
-                self.abort_all("disabled");
-            }
+            self.check_active();
             if last_housekeeping.elapsed() >= Duration::from_millis(20) {
                 self.housekeeping();
                 last_housekeeping = Instant::now();
@@ -307,19 +312,101 @@ impl Ingest {
         let _ = self.cmp_tx.try_send(CmpMsg::SlotSkipped { slot, reason });
     }
 
-    fn abort_all(&mut self, reason: &'static str) {
-        let slots: Vec<Slot> = self
+    /// With the fast lane off, drop everything it holds (runs, banks, program cache, slot
+    /// state); when it comes back, re-seed from bank_forks.
+    fn check_active(&mut self) {
+        if crate::control::is_active() {
+            if self.released {
+                self.released = false;
+                self.seed();
+                info!("fast lane: re-enabled, ingest re-seeded");
+            }
+            return;
+        }
+        if !self.released {
+            self.release("disabled");
+        }
+    }
+
+    fn release(&mut self, reason: &'static str) {
+        for (slot, state) in std::mem::take(&mut self.slots) {
+            if let Some(run_id) = state.run_id {
+                let _ = self.coord_tx.send(CoordMsg::AbortRun { run_id, reason });
+            }
+            if !matches!(state.status, SlotStatus::Skipped(_)) {
+                *self.stats.slots_skipped.entry(reason).or_default() += 1;
+                let _ = self.cmp_tx.try_send(CmpMsg::SlotSkipped { slot, reason });
+            }
+        }
+        self.frozen = FrozenBanks::default();
+        self.dead.clear();
+        self.programs.reset();
+        self.ring = None;
+        crate::mem::BANKS_HELD.set(0);
+        crate::mem::INGEST_PENDING_BYTES.set(0);
+        crate::mem::PROGRAM_ENTRIES.set(0);
+        crate::mem::PROGRAM_BYTES.set(0);
+        self.released = true;
+        info!("fast lane: released all ingest state ({reason})");
+    }
+
+    /// Hard memory cap: over `mem_cap_mb` of FL-held bytes, disable the fast lane (the next
+    /// loop iteration releases everything). Stays off until `enable` in the control file.
+    fn check_mem_cap(&mut self) {
+        let snapshot = crate::mem::Snapshot::now();
+        let cap = (self.config.mem_cap_mb as i64).saturating_mul(1 << 20);
+        let over = snapshot.total_bytes() > cap || snapshot.live_runs > crate::mem::MAX_LIVE_RUNS;
+        if over && crate::control::is_active() {
+            crate::mem::CAP_TRIPS.fetch_add(1, Ordering::Relaxed);
+            log::error!(
+                "fast lane: holding {} MiB (cap {} MiB), {} live runs (cap {}); disabling and \
+                 releasing: {:?}",
+                snapshot.total_bytes() >> 20,
+                self.config.mem_cap_mb,
+                snapshot.live_runs,
+                crate::mem::MAX_LIVE_RUNS,
+                snapshot
+            );
+            crate::control::set_active(false);
+        }
+    }
+
+    fn update_gauges(&mut self) {
+        let pending: i64 = self
             .slots
-            .iter()
-            .filter(|(_, s)| matches!(s.status, SlotStatus::Collecting | SlotStatus::Running))
-            .map(|(slot, _)| *slot)
-            .collect();
-        for slot in slots {
-            self.skip(slot, reason);
+            .values()
+            .flat_map(|s| s.released.iter())
+            .flat_map(|set| set.entries.iter())
+            .map(entry_bytes)
+            .sum();
+        crate::mem::INGEST_PENDING_BYTES.set(pending);
+        if self.last_bank_prune.elapsed() >= Duration::from_millis(250) {
+            self.last_bank_prune = Instant::now();
+            self.frozen
+                .retain_live(&self.deps.bank_forks, self.root, crate::mem::MAX_BANKS_HELD);
+            crate::mem::BANKS_HELD.set(self.frozen.len() as i64);
+        }
+        if self.last_program_stats.elapsed() >= Duration::from_secs(1) {
+            self.last_program_stats = Instant::now();
+            let (entries, bytes) = self.programs.loaded_stats();
+            crate::mem::PROGRAM_ENTRIES.set(entries as i64);
+            crate::mem::PROGRAM_BYTES.set(bytes as i64);
         }
     }
 
     fn housekeeping(&mut self) {
+        // Root from bank_forks: agave's rooted notifications do not reach the slot-status tee
+        // (the geyser plugin service's own observer thread sends them), so FL cannot rely
+        // on `AgaveEvent::Rooted` to prune.
+        let root = self.deps.bank_forks.read().ok().map(|forks| forks.root());
+        if let Some(root) = root {
+            self.set_root(root);
+        }
+        if self.released {
+            return;
+        }
+        self.update_gauges();
+        self.check_mem_cap();
         let parent_wait = Duration::from_millis(self.config.parent_wait_ms);
         let timed_out: Vec<Slot> = self
             .slots
@@ -670,6 +757,7 @@ impl Ingest {
             .count()
     }
 
+    #[allow(dead_code)]
     fn overlay_bytes(&self) -> usize {
         self.slots
             .values()
@@ -709,7 +797,8 @@ impl Ingest {
         if self.active_runs() >= self.config.max_runs {
             return;
         }
-        if self.overlay_bytes() > self.config.mem_cap_mb.saturating_mul(1 << 20) {
+        // Soft cap: no new run while live overlays hold more than half the hard cap.
+        if crate::mem::OVERLAY_BYTES.get() as usize > self.config.mem_cap_mb.saturating_mul(1 << 19) {
             self.skip(slot, "mem_cap");
             return;
         }
@@ -975,6 +1064,24 @@ impl Ingest {
             });
         }
     }
+}
+
+/// Approximate heap bytes of a decoded entry.
+fn entry_bytes(entry: &Entry) -> i64 {
+    48 + entry
+        .transactions
+        .iter()
+        .map(|tx| {
+            let message = &tx.message;
+            64 + 64 * tx.signatures.len() as i64
+                + 32 * message.static_account_keys().len() as i64
+                + message
+                    .instructions()
+                    .iter()
+                    .map(|ix| 24 + ix.data.len() as i64 + ix.accounts.len() as i64)
+                    .sum::<i64>()
+        })
+        .sum::<i64>()
 }
 
 fn unsupported_reason(err: solana_runtime::bank::fast_lane::FastLaneUnsupported) -> &'static str {
@@ -1415,5 +1522,51 @@ mod tests {
         assert!(ingest.slots[&2].done_run.is_none());
         assert!(ingest.slots[&3].chain_run.is_none());
         assert_eq!(ingest.stats.chains_resolved, 1);
+    }
+
+    /// Regression (2026-09-28 OOMs): agave's rooted notifications never reach the slot-status
+    /// tee, so FL used to hold every frozen bank forever. FL now follows bank_forks' root and
+    /// keeps only live banks at or above it.
+    #[test]
+    fn test_banks_released_without_rooted_events() {
+        let f = fixture();
+        let (mut ingest, _coord_rx, _cmp_rx) = ingest(&f, Config::default());
+        let mut weaks = Vec::new();
+        let mut parent = f.bank_forks.read().unwrap().get(1).unwrap();
+        for slot in 2..=300u64 {
+            let bank = Bank::new_from_parent_with_bank_forks(
+                &f.bank_forks,
+                parent.clone(),
+                SlotLeader::default(),
+                slot,
+            );
+            bank.freeze();
+            weaks.push(Arc::downgrade(&bank));
+            // What the block-metadata tee sends; no Rooted event ever arrives.
+            ingest.on_event(AgaveEvent::Frozen {
+                slot,
+                bank_id: bank.bank_id(),
+                parent_slot: slot - 1,
+                t: Instant::now(),
+            });
+            if slot > 40 {
+                f.bank_forks.write().unwrap().set_root(slot - 32, None, None);
+            }
+            ingest.last_bank_prune = Instant::now() - Duration::from_secs(1);
+            ingest.housekeeping();
+            parent = bank;
+        }
+        drop(parent);
+        let alive = weaks.iter().filter(|w| w.upgrade().is_some()).count();
+        let in_forks = f.bank_forks.read().unwrap().banks().len();
+        assert_eq!(ingest.root, 268);
+        assert!(ingest.frozen.len() <= 33, "held {}", ingest.frozen.len());
+        assert!(alive <= in_forks, "alive {alive} > {in_forks} in bank_forks");
+        assert_eq!(crate::mem::BANKS_HELD.get() as usize, ingest.frozen.len());
+
+        // Releasing (the fast lane turned off) drops every bank FL holds.
+        ingest.release("disabled");
+        assert_eq!(ingest.frozen.len(), 0);
+        assert!(ingest.slots.is_empty());
     }
 }

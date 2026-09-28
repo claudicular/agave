@@ -111,8 +111,13 @@ impl FinalSink for CmpSink {
             t_final: f.t_final,
             t_final_unix_ns: unix_ns(),
         };
-        if let Err(TrySendError::Full(_)) = self.tx.try_send(CmpMsg::Final(Box::new(record))) {
-            self.drops.fetch_add(1, Ordering::Relaxed);
+        let bytes = record_bytes(&record);
+        crate::mem::CMP_QUEUE_BYTES.add(bytes);
+        if let Err(err) = self.tx.try_send(CmpMsg::Final(Box::new(record))) {
+            crate::mem::CMP_QUEUE_BYTES.sub(bytes);
+            if matches!(err, TrySendError::Full(_)) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -134,6 +139,22 @@ impl FinalSink for CmpSink {
             out.tick();
         }
     }
+}
+
+/// Bytes an agave frame holds (for the memory gauges).
+pub fn agave_frame_bytes(frame: &AgaveFrame) -> i64 {
+    crate::mem::frame_bytes(frame.accounts.iter().map(|(_, a)| a)) + 256
+}
+
+/// Bytes a FINAL record holds (its outcome's frame).
+pub fn record_bytes(record: &FinalRecord) -> i64 {
+    record
+        .outcome
+        .frame
+        .as_ref()
+        .map(|f| crate::mem::frame_bytes(f.iter().map(|(_, a)| a)))
+        .unwrap_or(0)
+        + 256
 }
 
 /// Percentile helper over an unsorted sample.
@@ -292,10 +313,16 @@ impl Comparator {
                     Err(_) => { self.flush(); return; }
                 },
                 recv(frame_rx) -> msg => match msg {
-                    Ok(frame) => self.on_agave(frame),
+                    Ok(frame) => {
+                        crate::mem::FRAME_QUEUE_BYTES.sub(agave_frame_bytes(&frame));
+                        self.on_agave(frame);
+                    }
                     Err(_) => { self.flush(); return; }
                 },
                 default(Duration::from_millis(100)) => {},
+            }
+            if !crate::control::is_active() {
+                self.release();
             }
             if last_gc.elapsed() >= Duration::from_millis(500) {
                 self.gc();
@@ -309,6 +336,22 @@ impl Comparator {
         }
     }
 
+    /// Drop everything held (the fast lane is off): pending frames and records, and runs.
+    fn release(&mut self) {
+        if self.fl.is_empty() && self.agave.is_empty() && self.runs.is_empty() {
+            return;
+        }
+        let held: i64 = self.fl.values().map(record_bytes).sum::<i64>()
+            + self.agave.values().map(agave_frame_bytes).sum::<i64>();
+        crate::mem::CMP_HELD_BYTES.sub(held);
+        self.fl.clear();
+        self.agave.clear();
+        self.runs.clear();
+        self.slot_runs.clear();
+        self.fl.shrink_to_fit();
+        self.agave.shrink_to_fit();
+    }
+
     fn flush(&mut self) {
         for w in [&mut self.export, &mut self.mismatches, &mut self.summaries]
             .into_iter()
@@ -320,7 +363,12 @@ impl Comparator {
 
     pub fn on_msg(&mut self, msg: CmpMsg) {
         match msg {
-            CmpMsg::Final(record) => self.on_final(*record),
+            CmpMsg::Final(record) => {
+                crate::mem::CMP_QUEUE_BYTES.sub(record_bytes(&record));
+                if crate::control::is_active() {
+                    self.on_final(*record);
+                }
+            }
             CmpMsg::RunStart {
                 run_id,
                 run,
@@ -404,20 +452,31 @@ impl Comparator {
         }
         let key = (record.outcome.slot, record.outcome.signature);
         if let Some(frame) = self.agave.remove(&key) {
+            crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&frame));
             // Agave was first: FL is late for this transaction.
             self.interval.late_fl += 1;
             self.join(record, Some(frame));
         } else {
-            self.fl.insert(key, record);
+            crate::mem::CMP_HELD_BYTES.add(record_bytes(&record));
+            if let Some(old) = self.fl.insert(key, record) {
+                crate::mem::CMP_HELD_BYTES.sub(record_bytes(&old));
+            }
         }
     }
 
     fn on_agave(&mut self, frame: AgaveFrame) {
+        if !crate::control::is_active() {
+            return;
+        }
         let key = (frame.slot, frame.signature);
         if let Some(record) = self.fl.remove(&key) {
+            crate::mem::CMP_HELD_BYTES.sub(record_bytes(&record));
             self.join(record, Some(frame));
         } else {
-            self.agave.insert(key, frame);
+            crate::mem::CMP_HELD_BYTES.add(agave_frame_bytes(&frame));
+            if let Some(old) = self.agave.insert(key, frame) {
+                crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&old));
+            }
         }
     }
 
@@ -747,6 +806,7 @@ impl Comparator {
             .collect();
         for key in stale_fl {
             if let Some(record) = self.fl.remove(&key) {
+                crate::mem::CMP_HELD_BYTES.sub(record_bytes(&record));
                 self.join(record, None);
             }
         }
@@ -757,13 +817,21 @@ impl Comparator {
             .map(|(k, _)| *k)
             .collect();
         for key in stale_agave {
-            if self.agave.remove(&key).is_some() {
+            if let Some(frame) = self.agave.remove(&key) {
+                crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&frame));
                 if self.slot_runs.contains_key(&key.0) {
                     self.interval.agave_only_ran += 1;
                 } else {
                     self.interval.agave_only_skipped += 1;
                 }
             }
+        }
+        // Skipped-slot memory is bounded (rooted events do not reach the comparator).
+        while self.skipped.len() > 4096 {
+            let Some(&oldest) = self.skipped.keys().min() else {
+                break;
+            };
+            self.skipped.remove(&oldest);
         }
         // Runs that never got both "complete" and "frozen" are dropped after a while.
         let stale_runs: Vec<RunId> = self
@@ -795,6 +863,8 @@ impl Comparator {
         ] {
             v.sort_unstable();
         }
+        let mem = crate::mem::Snapshot::now();
+        let cap_trips = crate::mem::CAP_TRIPS.load(Ordering::Relaxed);
         let compared = iv.matched + iv.mismatched;
         let exact = if compared > 0 {
             iv.matched as f64 / compared as f64
@@ -825,7 +895,11 @@ impl Comparator {
              parent_wait_us_p50={} slot_checks_ok={} slot_check_bad_keys={} classes={classes:?} \
              top_programs={programs:?} tap_drops={tap_drops} frame_drops={frame_drops} \
              cmp_drops={} chained_runs={} chained_match={} chained_mismatch={} \
-             chained_lead_us_p50={} p90={} sysvar_ok={} sysvar_bad={}",
+             chained_lead_us_p50={} p90={} sysvar_ok={} sysvar_bad={} \
+             mem_total_mb={} mem_overlay_mb={} live_runs={} mem_frame_queue_mb={} \
+             mem_cmp_queue_mb={} mem_cmp_held_mb={} cmp_fl={} cmp_agave={} cmp_runs={} \
+             mem_ingest_pending_kb={} banks_held={} program_entries={} program_mb={} \
+             hints_kb={} cap_trips={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -865,6 +939,21 @@ impl Comparator {
             pct(&iv.chained_lead_us, 0.9),
             iv.sysvar_checks_ok,
             iv.sysvar_check_mismatch,
+            mem.total_bytes() >> 20,
+            mem.overlay >> 20,
+            mem.live_runs,
+            mem.frame_queue >> 20,
+            mem.cmp_queue >> 20,
+            mem.cmp_held >> 20,
+            self.fl.len(),
+            self.agave.len(),
+            self.runs.len(),
+            mem.ingest_pending >> 10,
+            mem.banks_held,
+            mem.program_entries,
+            mem.program >> 20,
+            mem.hints >> 10,
+            cap_trips,
         );
         solana_metrics::datapoint_info!(
             "fast_lane",
@@ -902,6 +991,24 @@ impl Comparator {
             ("sysvar_checks_ok", iv.sysvar_checks_ok as i64, i64),
             ("sysvar_check_mismatch", iv.sysvar_check_mismatch as i64, i64),
         );
+        solana_metrics::datapoint_info!(
+            "fast_lane_mem",
+            ("total_bytes", mem.total_bytes(), i64),
+            ("overlay_bytes", mem.overlay, i64),
+            ("live_runs", mem.live_runs, i64),
+            ("frame_queue_bytes", mem.frame_queue, i64),
+            ("cmp_queue_bytes", mem.cmp_queue, i64),
+            ("cmp_held_bytes", mem.cmp_held, i64),
+            ("cmp_fl", self.fl.len() as i64, i64),
+            ("cmp_agave", self.agave.len() as i64, i64),
+            ("cmp_runs", self.runs.len() as i64, i64),
+            ("ingest_pending_bytes", mem.ingest_pending, i64),
+            ("banks_held", mem.banks_held, i64),
+            ("program_entries", mem.program_entries, i64),
+            ("program_bytes", mem.program, i64),
+            ("hint_bytes", mem.hints, i64),
+            ("cap_trips", cap_trips as i64, i64),
+        );
         if let Some(w) = self.summaries.as_mut() {
             let line = format!(
                 "{{\"unix_ns\":{},\"secs\":{secs:.3},\"match\":{},\"mismatch\":{},\"noframe\":{},\
@@ -913,7 +1020,10 @@ impl Comparator {
                  \"slot_checks_ok\":{},\"slot_check_bad_keys\":{},\"exec_us\":{},\
                  \"tap_drops\":{tap_drops},\"frame_drops\":{frame_drops},\"runs_chained\":{},\
                  \"chained_match\":{},\"chained_mismatch\":{},\"chained_lead_us\":[{},{},{},{}],\
-                 \"sysvar_checks_ok\":{},\"sysvar_check_mismatch\":{}}}",
+                 \"sysvar_checks_ok\":{},\"sysvar_check_mismatch\":{},\"mem\":{{\"total\":{},\
+                 \"overlay\":{},\"live_runs\":{},\"frame_queue\":{},\"cmp_queue\":{},\"cmp_held\":{},\
+                 \"ingest_pending\":{},\"banks_held\":{},\"program_entries\":{},\"program\":{},\
+                 \"hints\":{},\"cap_trips\":{}}}}}",
                 unix_ns(),
                 iv.matched,
                 iv.mismatched,
@@ -955,6 +1065,18 @@ impl Comparator {
                 iv.chained_lead_us.len(),
                 iv.sysvar_checks_ok,
                 iv.sysvar_check_mismatch,
+                mem.total_bytes(),
+                mem.overlay,
+                mem.live_runs,
+                mem.frame_queue,
+                mem.cmp_queue,
+                mem.cmp_held,
+                mem.ingest_pending,
+                mem.banks_held,
+                mem.program_entries,
+                mem.program,
+                mem.hints,
+                cap_trips,
             );
             w.write_line(&line);
         }

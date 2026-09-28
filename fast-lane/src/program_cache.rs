@@ -150,6 +150,35 @@ impl ProgramCaches {
         }
     }
 
+    /// Drop the private program cache (the fast lane was disabled).
+    pub fn reset(&mut self) {
+        self.master = None;
+        if let Ok(mut graph) = self.fork_graph.write() {
+            graph.clear();
+        }
+    }
+
+    /// Loaded (compiled) entries and their memory (ELF, sections, JIT code).
+    pub fn loaded_stats(&self) -> (usize, usize) {
+        let Some(master) = &self.master else {
+            return (0, 0);
+        };
+        let Ok(cache) = master.processor.global_program_cache.read() else {
+            return (0, 0);
+        };
+        let entries = cache.get_flattened_entries();
+        let bytes = entries
+            .iter()
+            .map(|(_, _, entry)| match &entry.program {
+                solana_program_runtime::program_cache_entry::ProgramCacheEntryType::Loaded(
+                    executable,
+                ) => executable.mem_size(),
+                _ => 0,
+            })
+            .sum();
+        (entries.len(), bytes)
+    }
+
     pub fn master_env(&self) -> Option<&ProgramRuntimeEnvironment> {
         self.master.as_ref().map(|m| &m.env)
     }

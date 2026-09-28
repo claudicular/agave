@@ -144,7 +144,10 @@ impl AccountsUpdateNotifierInterface for TeeAccountsUpdateNotifier {
             t_unix_ns: unix_ns(),
         };
         TapStats::inc(&self.shared.tap_stats.agave_frames);
+        let bytes = crate::compare::agave_frame_bytes(&frame);
+        crate::mem::FRAME_QUEUE_BYTES.add(bytes);
         if self.shared.frame_tx.try_send(frame).is_err() {
+            crate::mem::FRAME_QUEUE_BYTES.sub(bytes);
             TapStats::inc(&self.shared.tap_stats.agave_frame_drops);
         }
     }

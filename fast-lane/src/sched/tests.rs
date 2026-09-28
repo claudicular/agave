@@ -440,3 +440,45 @@ fn test_hints_ewma() {
     hints.observe(&key, true);
     assert_eq!(hints.get(&key), 0.625);
 }
+
+/// With the fast lane off (the default in tests), the coordinator's tick aborts every run
+/// (releasing it) and forgets the hints.
+#[test]
+fn test_tick_releases_runs_when_disabled() {
+    assert!(!crate::control::is_active());
+    let key = Pubkey::new_unique();
+    let run = Arc::new(MockRun {
+        overlay: Overlay::new(2, Arc::new(MapBase(HashMap::new()))),
+        txs: vec![MockTx { locks: vec![(key, true)] }; 3],
+        max_delay_us: 0,
+        seed: 1,
+    });
+    let (task_tx, _task_rx) = crossbeam_channel::unbounded();
+    let sink = Arc::new(StdMutex::new(CollectSink::default()));
+    let tunables = Arc::new(Tunables::new(true, true, 0.2, 3));
+    let mut coord = Coordinator::new(2, task_tx, tunables, 0.25, Arc::clone(&sink));
+    coord.handle(CoordMsg::NewRun { run_id: 9, run: run.clone() });
+    coord.handle(CoordMsg::Txs {
+        run_id: 9,
+        first: 0,
+        metas: (0..3)
+            .map(|_| TxMeta {
+                locks: vec![(key, true)],
+                certain_writes: vec![key],
+                is_vote: false,
+                external: false,
+            })
+            .collect(),
+        t_ingest: Instant::now(),
+    });
+    coord.hints.observe(&key, true);
+    assert!(coord.run_state_counts(9).is_some());
+    coord.tick();
+    assert!(coord.run_state_counts(9).is_none(), "run released");
+    assert_eq!(coord.hints.len(), 0);
+    let sink = sink.lock().unwrap();
+    assert_eq!(sink.ended.len(), 1);
+    assert_eq!(sink.ended[0].1.aborted, Some("disabled"));
+    drop(coord);
+    assert_eq!(Arc::strong_count(&run), 1, "the coordinator dropped the run");
+}

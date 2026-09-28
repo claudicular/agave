@@ -65,6 +65,25 @@ impl FrozenBanks {
         }
     }
 
+    /// Keep only banks agave still has (same bank id, not pruned), at or above `root`, and at
+    /// most `max` (the newest). A held `Arc<Bank>` keeps the bank's memory alive in agave.
+    pub fn retain_live(&mut self, bank_forks: &RwLock<BankForks>, root: Slot, max: usize) {
+        self.banks = self.banks.split_off(&root);
+        if let Ok(forks) = bank_forks.read() {
+            self.banks.retain(|slot, bank| {
+                forks
+                    .get(*slot)
+                    .is_some_and(|live| live.bank_id() == bank.bank_id())
+            });
+        }
+        while self.banks.len() > max {
+            let Some((&first, _)) = self.banks.iter().next() else {
+                break;
+            };
+            self.banks.remove(&first);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.banks.len()
     }
@@ -102,6 +121,10 @@ impl FlForkGraph {
 
     pub fn root(&self) -> Slot {
         self.root
+    }
+
+    pub fn clear(&mut self) {
+        self.parents.clear();
     }
 
     fn is_ancestor(&self, a: Slot, b: Slot) -> Option<bool> {

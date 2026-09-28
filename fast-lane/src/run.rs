@@ -300,6 +300,7 @@ impl Run {
             graph.set_parent(slot, parent.slot());
         }
         let env = ctx.processing_environment();
+        crate::mem::LIVE_RUNS.add(1);
         Ok(Self {
             id,
             slot,
@@ -376,6 +377,7 @@ impl Run {
             solana_sdk_ids::sysvar::slot_hashes::id(),
         ];
         let slot_hashes_account = ctx.slot_hashes_account.clone();
+        crate::mem::LIVE_RUNS.add(1);
         Ok(Self {
             id,
             slot,
@@ -571,6 +573,12 @@ fn processing_config() -> TransactionProcessingConfig<'static> {
         all_or_nothing: false,
         strict_nonce_size_check: false,
         drop_noop_transactions: false,
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        crate::mem::LIVE_RUNS.sub(1);
     }
 }
 

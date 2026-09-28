@@ -241,6 +241,9 @@ impl Hints {
     pub fn len(&self) -> usize {
         self.phat.len()
     }
+    pub fn alpha(&self) -> f32 {
+        self.alpha
+    }
     pub fn is_empty(&self) -> bool {
         self.phat.is_empty()
     }
@@ -381,7 +384,7 @@ impl<S: FinalSink> Coordinator<S> {
         let mut last_tick = Instant::now();
         loop {
             let msg = if spin >= SPIN_FOREVER {
-                // Busy-poll inline so the sink can tick while idle.
+                // Busy-poll inline so the coordinator can tick while idle.
                 let mut polls = 0u32;
                 loop {
                     match rx.try_recv() {
@@ -395,20 +398,51 @@ impl<S: FinalSink> Coordinator<S> {
                             break None;
                         }
                         if last_tick.elapsed() >= TICK {
-                            self.sink.tick();
+                            self.tick();
                             last_tick = Instant::now();
                         }
                     }
                     std::hint::spin_loop();
                 }
             } else {
-                recv_spin(&rx, spin, &exit)
+                // Spin for `spin`, then block in short slices so the coordinator still ticks.
+                let start = Instant::now();
+                let mut got = None;
+                let mut disconnected = false;
+                while start.elapsed() < spin {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            got = Some(msg);
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                    }
+                }
+                while got.is_none() && !disconnected {
+                    match rx.recv_timeout(Duration::from_millis(20)) {
+                        Ok(msg) => got = Some(msg),
+                        Err(RecvTimeoutError::Disconnected) => disconnected = true,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if exit.load(Ordering::Relaxed) {
+                                disconnected = true;
+                            } else if last_tick.elapsed() >= TICK {
+                                self.tick();
+                                last_tick = Instant::now();
+                            }
+                        }
+                    }
+                }
+                got
             };
             let Some(msg) = msg else {
                 return;
             };
             if last_tick.elapsed() >= TICK {
-                self.sink.tick();
+                self.tick();
                 last_tick = Instant::now();
             }
             if !self.handle(msg) {
@@ -427,6 +461,25 @@ impl<S: FinalSink> Coordinator<S> {
             }
             self.dispatch();
         }
+    }
+
+    /// About every millisecond: the sink's tick; with the fast lane off, abort every run
+    /// (releasing its memory) and forget the hints.
+    pub fn tick(&mut self) {
+        self.sink.tick();
+        if !crate::control::is_active() {
+            let run_ids: Vec<RunId> = self.runs.keys().copied().collect();
+            for run_id in run_ids {
+                self.handle(CoordMsg::AbortRun {
+                    run_id,
+                    reason: "disabled",
+                });
+            }
+            if !self.hints.is_empty() {
+                self.hints = Hints::new(self.hints.alpha());
+            }
+        }
+        crate::mem::HINT_BYTES.set(self.hints.len() as i64 * 64);
     }
 
     /// Handle one message. Returns false on shutdown.
