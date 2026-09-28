@@ -233,6 +233,7 @@ pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
+pub mod fast_lane;
 mod fee_distribution;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
@@ -3037,12 +3038,42 @@ impl Bank {
         epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
     ) -> Option<UnixTimestamp> {
         let mut get_timestamp_estimate_time = Measure::start("get_timestamp_estimate");
+        // Preserve the historical early return (no datapoint) when the epoch has no stakes.
+        self.epoch_vote_accounts(self.epoch_schedule().get_epoch(self.slot()))?;
+        let stake_weighted_timestamp = self.get_timestamp_estimate_for_slot(
+            self.slot(),
+            max_allowable_drift,
+            epoch_start_timestamp,
+        );
+        get_timestamp_estimate_time.stop();
+        datapoint_info!(
+            "bank-timestamp",
+            (
+                "get_timestamp_estimate_us",
+                get_timestamp_estimate_time.as_us(),
+                i64
+            ),
+        );
+        stake_weighted_timestamp
+    }
+
+    /// The stake-weighted timestamp estimate for `slot`, computed from this bank's
+    /// vote accounts (stakes cache), epoch stakes and slot params. With `slot ==
+    /// self.slot()` this is exactly what `update_clock` uses; the fast lane calls it on a
+    /// frozen parent with the child's slot (the child clones the parent's stakes cache and
+    /// epoch stakes, so the inputs are identical). Pure: no datapoints, no state changes.
+    pub(crate) fn get_timestamp_estimate_for_slot(
+        &self,
+        slot: Slot,
+        max_allowable_drift: MaxAllowableDrift,
+        epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
+    ) -> Option<UnixTimestamp> {
         let slots_per_epoch = self.epoch_schedule().slots_per_epoch;
         let vote_accounts = self.vote_accounts();
         let recent_timestamps = vote_accounts.iter().filter_map(|(pubkey, (_, account))| {
             let vote_state = account.vote_state_view();
             let last_timestamp = vote_state.last_timestamp();
-            let slot_delta = self.slot().checked_sub(last_timestamp.slot)?;
+            let slot_delta = slot.checked_sub(last_timestamp.slot)?;
             (slot_delta <= slots_per_epoch)
                 .then_some((*pubkey, (last_timestamp.slot, last_timestamp.timestamp)))
         });
@@ -3055,26 +3086,16 @@ impl Bank {
                 )
             }
         };
-        let epoch = self.epoch_schedule().get_epoch(self.slot());
+        let epoch = self.epoch_schedule().get_epoch(slot);
         let stakes = self.epoch_vote_accounts(epoch)?;
-        let stake_weighted_timestamp = calculate_stake_weighted_timestamp(
+        calculate_stake_weighted_timestamp(
             recent_timestamps,
             stakes,
-            self.slot(),
+            slot,
             elapsed_slot_duration,
             epoch_start_timestamp,
             max_allowable_drift,
-        );
-        get_timestamp_estimate_time.stop();
-        datapoint_info!(
-            "bank-timestamp",
-            (
-                "get_timestamp_estimate_us",
-                get_timestamp_estimate_time.as_us(),
-                i64
-            ),
-        );
-        stake_weighted_timestamp
+        )
     }
 
     /// Recalculates the bank hash
