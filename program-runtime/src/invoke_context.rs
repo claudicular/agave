@@ -750,6 +750,12 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         &self.compute_budget
     }
 
+    /// Set the VM heap size (as requested via `RequestHeapFrame`) for tests.
+    #[cfg(test)]
+    pub(crate) fn set_heap_size_for_tests(&mut self, heap_size: u32) {
+        self.compute_budget.heap_size = heap_size;
+    }
+
     /// Get this invocation's compute budget
     pub fn get_execution_cost(&self) -> &SVMTransactionExecutionCost {
         &self.execution_cost

@@ -9,7 +9,7 @@ use {
         mem_pool::VmMemoryPool,
         memory_context::{MemoryContext, SerializedAccountMetadata},
         program_cache_entry::ProgramCacheEntry,
-        serialization, stable_log,
+        serialization, stable_log, vm_opts,
     },
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
@@ -286,6 +286,9 @@ pub fn execute<'a, 'b: 'a>(
         }
 
         let compute_meter_prev = invoke_context.get_remaining();
+        // `create_vm!` maps exactly `heap[..heap_size]` into the VM, with `heap_size` read from
+        // the same (immutable for the lifetime of the InvokeContext) compute budget.
+        let mapped_heap_len = invoke_context.get_compute_budget().heap_size as usize;
         let (mut vm, stack, heap) = unsafe {
             // SAFETY: The `stack`, `heap` and `executable` live past the lifetime of
             // `invoke_context`.
@@ -318,7 +321,11 @@ pub fn execute<'a, 'b: 'a>(
         let register_trace = std::mem::take(&mut vm.register_trace);
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);
-            memory_pool.put_heap(heap);
+            if vm_opts::HEAP_ZERO_OPT.enabled() {
+                memory_pool.put_heap_mapped_prefix(heap, mapped_heap_len);
+            } else {
+                memory_pool.put_heap(heap);
+            }
             memory_pool.put_call_frames(call_frames);
             debug_assert!(memory_pool.stack_len() <= MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268);
             debug_assert!(memory_pool.heap_len() <= MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268);
@@ -492,4 +499,210 @@ pub fn execute<'a, 'b: 'a>(
     invoke_context.timings.deserialize_us += deserialize_time.as_us();
 
     execute_or_deserialize_result
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+pub(crate) mod tests {
+    use {
+        super::*,
+        crate::{
+            execution_budget::{MAX_HEAP_FRAME_BYTES, MIN_HEAP_FRAME_BYTES},
+            program_cache_entry::{ProgramCacheEntryOwner, ProgramCacheEntryType},
+            with_mock_invoke_context,
+        },
+        solana_account::{AccountSharedData, WritableAccount},
+        solana_pubkey::Pubkey,
+        solana_sbpf::{
+            assembler::assemble,
+            program::{BuiltinProgram, SBPFVersion},
+            vm::Config,
+        },
+        solana_sdk_ids::bpf_loader,
+        std::sync::{Arc, atomic::AtomicU64},
+    };
+
+    /// Assembles an SBPFv0 program (the version of every hot mainnet program) without syscalls.
+    pub(crate) fn assemble_v0(src: &str) -> Executable<InvokeContext<'static, 'static>> {
+        let config = Config {
+            enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+            ..Config::default()
+        };
+        let loader = Arc::new(BuiltinProgram::new_loader(config));
+        let executable = assemble::<InvokeContext<'static, 'static>>(src, loader).unwrap();
+        #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+        executable.jit_compile().unwrap();
+        executable
+    }
+
+    pub(crate) fn dummy_cache_entry() -> ProgramCacheEntry {
+        ProgramCacheEntry {
+            program: ProgramCacheEntryType::Closed,
+            account_owner: ProgramCacheEntryOwner::LoaderV2,
+            deployment_slot: 0,
+            stats: Arc::default(),
+            latest_access_slot: AtomicU64::new(0),
+        }
+    }
+
+    /// Outcome of one top-level invocation that a program or the cluster could observe.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) struct Observed {
+        pub result: Result<(), String>,
+        pub remaining_cu: u64,
+        pub logs: Vec<String>,
+    }
+
+    /// Runs `executable` as a loader-v2 program in a fresh invoke context with `heap_size`.
+    pub(crate) fn run_program(
+        executable: &Executable<InvokeContext<'static, 'static>>,
+        heap_size: u32,
+        instruction_data: &[u8],
+    ) -> Observed {
+        // Fixed, so that logs of repeated runs are comparable.
+        let program_id = Pubkey::new_from_array([7; 32]);
+        let mut program_account = AccountSharedData::new(1, 0, &bpf_loader::id());
+        program_account.set_executable(true);
+        let transaction_accounts = vec![(program_id, program_account)];
+        with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
+        invoke_context.set_heap_size_for_tests(heap_size);
+        invoke_context
+            .transaction_context
+            .configure_top_level_instruction_for_tests(0, vec![], instruction_data.to_vec())
+            .unwrap();
+        invoke_context.push().unwrap();
+        let result = execute(executable, &mut invoke_context, &dummy_cache_entry())
+            .map_err(|err| err.to_string());
+        let remaining_cu = invoke_context.get_remaining();
+        let logs = invoke_context
+            .get_log_collector()
+            .unwrap()
+            .borrow()
+            .get_recorded_content()
+            .to_vec();
+        Observed {
+            result,
+            remaining_cu,
+            logs,
+        }
+    }
+
+    /// Writes 0xff to every byte of `[MM_HEAP_START, MM_HEAP_START + len)`, 8 bytes at a time.
+    fn heap_fill_program(len: u32) -> Executable<InvokeContext<'static, 'static>> {
+        assemble_v0(&format!(
+            "
+            lddw r2, {start:#x}
+            lddw r3, {end:#x}
+            mov64 r4, -1
+            stxdw [r2+0], r4
+            add64 r2, 8
+            jlt r2, r3, -3
+            mov64 r0, 0
+            exit",
+            start = MM_HEAP_START,
+            end = MM_HEAP_START + u64::from(len),
+        ))
+    }
+
+    /// ORs every 8-byte word of `[MM_HEAP_START, MM_HEAP_START + len)` into r0 and returns it, so
+    /// the invocation fails unless the whole range is zero.
+    fn heap_check_program(len: u32) -> Executable<InvokeContext<'static, 'static>> {
+        assemble_v0(&format!(
+            "
+            lddw r2, {start:#x}
+            lddw r3, {end:#x}
+            mov64 r0, 0
+            ldxdw r4, [r2+0]
+            or64 r0, r4
+            add64 r2, 8
+            jlt r2, r3, -4
+            exit",
+            start = MM_HEAP_START,
+            end = MM_HEAP_START + u64::from(len),
+        ))
+    }
+
+    /// Dirty heaps of several sizes through the VM and read them back from later invocations
+    /// with larger heaps, on the same thread (so the same pooled buffer is reused).
+    fn heap_reuse_sequence() -> Vec<Observed> {
+        let max = MAX_HEAP_FRAME_BYTES;
+        let min = MIN_HEAP_FRAME_BYTES;
+        let odd = 40 * 1024;
+        let steps: [(bool, u32, u32); 9] = [
+            // (fill?, program range, heap_size)
+            (false, max, max),
+            (true, max, max),
+            (false, min, min),
+            (false, max, max),
+            (true, min, min),
+            (false, max, max),
+            (true, odd, odd),
+            (false, max, max),
+            // Out of range for the mapped heap: must fault identically in both modes.
+            (true, max, min),
+        ];
+        steps
+            .iter()
+            .map(|(fill, range, heap_size)| {
+                let program = if *fill {
+                    heap_fill_program(*range)
+                } else {
+                    heap_check_program(*range)
+                };
+                run_program(&program, *heap_size, &[])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_heap_zero_opt_is_unobservable() {
+        let stock = {
+            vm_opts::HEAP_ZERO_OPT.set(false);
+            heap_reuse_sequence()
+        };
+        let optimized = {
+            vm_opts::HEAP_ZERO_OPT.set(true);
+            heap_reuse_sequence()
+        };
+        vm_opts::HEAP_ZERO_OPT.set(false);
+
+        // Every read-back of a previously dirtied heap sees zeros...
+        for (index, observed) in stock.iter().enumerate() {
+            if index == stock.len() - 1 {
+                assert!(observed.result.is_err(), "{observed:?}");
+            } else {
+                assert_eq!(observed.result, Ok(()), "step {index}: {observed:?}");
+            }
+        }
+        // ...and results, compute units and logs are identical with the switch on.
+        assert_eq!(stock, optimized);
+    }
+
+    #[test]
+    fn test_heap_check_program_detects_dirty_heap() {
+        // Negative control: if a pooled heap were returned with a too-short reset, the check
+        // program would see it. Simulate that bug directly on the pool.
+        let fill = heap_fill_program(MAX_HEAP_FRAME_BYTES);
+        let check = heap_check_program(MAX_HEAP_FRAME_BYTES);
+        assert_eq!(run_program(&fill, MAX_HEAP_FRAME_BYTES, &[]).result, Ok(()));
+        MEMORY_POOL.with_borrow_mut(|pool| {
+            let mut heap = pool.get_heap(MAX_HEAP_FRAME_BYTES);
+            heap.as_slice_mut().fill(0x5a);
+            assert!(pool.put_heap_mapped_prefix(heap, 0));
+        });
+        assert!(
+            run_program(&check, MAX_HEAP_FRAME_BYTES, &[])
+                .result
+                .is_err()
+        );
+        // Restore a clean pool for other tests on this thread.
+        MEMORY_POOL.with_borrow_mut(|pool| {
+            let heap = pool.get_heap(MAX_HEAP_FRAME_BYTES);
+            assert!(pool.put_heap(heap));
+        });
+        assert_eq!(
+            run_program(&check, MAX_HEAP_FRAME_BYTES, &[]).result,
+            Ok(())
+        );
+    }
 }
