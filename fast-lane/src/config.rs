@@ -76,6 +76,13 @@ pub struct Config {
     pub control_file: Option<PathBuf>,
     /// Allow the `panic` control command (panic-containment drills).
     pub allow_panic_command: bool,
+    /// Input: `blockstore` (agave's completed data sets) or `dual` (also the proxy ring v2).
+    pub input_dual: bool,
+    /// Path of the proxy's ring v2 (`SHMEM_RING_V2_PATH` of the proxy).
+    pub ring_path: Option<PathBuf>,
+    /// With dual input, also read and cross-check blockstore batches the ring already
+    /// delivered (costs a blockstore read per batch on the ingest thread).
+    pub ring_blockstore_check: bool,
 }
 
 impl Default for Config {
@@ -109,6 +116,9 @@ impl Default for Config {
             summary_interval_s: 10,
             control_file: None,
             allow_panic_command: false,
+            input_dual: false,
+            ring_path: None,
+            ring_blockstore_check: false,
         }
     }
 }
@@ -227,12 +237,20 @@ impl Config {
             "summary_interval_s" => self.summary_interval_s = parse_scalar(key, value)?,
             "control_file" => self.control_file = Some(PathBuf::from(value)),
             "allow_panic_command" => self.allow_panic_command = parse_bool(key, value)?,
-            // Reserved for later phases; accepted so configs can be written ahead.
-            "mode" | "input" | "ring_path" => {
-                if !matches!(value, "shadow" | "blockstore") && key != "ring_path" {
-                    return Err(ConfigError(format!("{key}={value} not supported in phase 1")));
+            "mode" => {
+                if value != "shadow" {
+                    return Err(ConfigError(format!("mode={value} not supported")));
                 }
             }
+            "input" => {
+                self.input_dual = match value {
+                    "blockstore" => false,
+                    "dual" => true,
+                    _ => return Err(ConfigError(format!("input={value} not supported"))),
+                }
+            }
+            "ring_path" => self.ring_path = Some(PathBuf::from(value)),
+            "ring_blockstore_check" => self.ring_blockstore_check = parse_bool(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())
@@ -253,6 +271,14 @@ impl Config {
         }
         if self.export_files == 0 {
             return Err(ConfigError("export_files must be >= 1".into()));
+        }
+        if self.input_dual && self.ring_path.is_none() {
+            return Err(ConfigError("input = dual needs ring_path".into()));
+        }
+        if self.input_dual && self.ingest_spin_us < 1_000_000 {
+            return Err(ConfigError(
+                "input = dual needs ingest_spin_us >= 1000000 (the ring is polled)".into(),
+            ));
         }
         Ok(())
     }
@@ -304,6 +330,12 @@ mod tests {
         assert!(Config::parse("enabled = maybe").is_err());
         assert!(Config::parse("worker_cores = 1,2").is_err());
         assert!(Config::parse("input = ring").is_err());
+        assert!(Config::parse("input = dual\nring_path = /dev/shm/x").is_err());
+        assert!(
+            Config::parse("input = dual\nring_path = /dev/shm/x\ningest_spin_us = 1000000")
+                .unwrap()
+                .input_dual
+        );
         assert!(Config::parse("").unwrap().enabled.eq(&false));
     }
 }

@@ -186,6 +186,7 @@ dependencies = [
  "solana-transaction-error",
  "tempfile",
  "test-case",
+ "wincode",
 ]
 
 [[package]]

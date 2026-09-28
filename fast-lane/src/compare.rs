@@ -205,7 +205,7 @@ impl Comparator {
                 "slot,ordinal,signature,vote,token,outcome,class,fl_final_unix_ns,\
                  agave_unix_ns,tap_unix_ns,lead_us,fl_latency_us,agave_latency_us,\
                  incarnations,spec,exec_us,n_preds,kind,ok,parent_slot,ingest_us,\
-                 first_dispatch_us,exec_start_us,exec_end_us",
+                 first_dispatch_us,exec_start_us,exec_end_us,src",
             ),
             mb,
             config.export_files,
@@ -502,7 +502,7 @@ impl Comparator {
                 .as_micros();
             let since_tap = |t: Instant| t.saturating_duration_since(outcome.t_tap).as_micros();
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{},{}",
                 outcome.slot,
                 outcome.ordinal,
                 outcome.signature,
@@ -527,6 +527,7 @@ impl Comparator {
                 since_tap(record.t_first_dispatch),
                 since_tap(record.t_exec_start),
                 since_tap(record.t_exec_end),
+                if outcome.from_ring { "ring" } else { "blockstore" },
             );
             export.write_line(&line);
         }

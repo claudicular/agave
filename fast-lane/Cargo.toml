@@ -58,6 +58,7 @@ solana-svm-callback = { workspace = true }
 solana-svm-transaction = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-error = { workspace = true }
+wincode = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 agave-cpu-utils = { workspace = true }

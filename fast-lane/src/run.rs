@@ -57,6 +57,8 @@ pub struct TxEntry {
     pub programs: Vec<Pubkey>,
     pub t_tap: Instant,
     pub t_tap_unix_ns: u64,
+    /// Delivered by the proxy ring (tap time = ring publish time) rather than the blockstore.
+    pub from_ring: bool,
 }
 
 /// What happened to a transaction, as agave would commit it.
@@ -86,6 +88,7 @@ pub struct TxOutcome {
     pub fee: u64,
     pub t_tap: Instant,
     pub t_tap_unix_ns: u64,
+    pub from_ring: bool,
 }
 
 pub struct Run {
@@ -250,6 +253,7 @@ impl Run {
         entries: Vec<Entry>,
         t_tap: Instant,
         t_tap_unix_ns: u64,
+        from_ring: bool,
     ) -> (Vec<TxMeta>, Option<&'static str>) {
         let mut metas = Vec::new();
         let mut appended = Vec::new();
@@ -309,6 +313,7 @@ impl Run {
                     programs,
                     t_tap,
                     t_tap_unix_ns,
+                    from_ring,
                 }));
             }
         }
@@ -397,6 +402,7 @@ impl SchedRun for Run {
             fee: 0,
             t_tap: entry.t_tap,
             t_tap_unix_ns: entry.t_tap_unix_ns,
+            from_ring: entry.from_ring,
         };
         let mut writes = Vec::new();
         let mut unprocessable = false;

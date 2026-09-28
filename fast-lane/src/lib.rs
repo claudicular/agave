@@ -21,6 +21,7 @@ pub mod config;
 pub mod control;
 pub mod export;
 pub mod forks;
+pub mod gate;
 pub mod ingest;
 pub mod mv;
 pub mod program_cache;

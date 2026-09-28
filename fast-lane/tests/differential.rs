@@ -326,8 +326,8 @@ fn run_fast_lane(
         })
         .collect();
     let half = entries.len() / 2;
-    let (metas_a, fail_a) = run.push_entries(entries[..half].to_vec(), Instant::now(), 0);
-    let (metas_b, fail_b) = run.push_entries(entries[half..].to_vec(), Instant::now(), 0);
+    let (metas_a, fail_a) = run.push_entries(entries[..half].to_vec(), Instant::now(), 0, false);
+    let (metas_b, fail_b) = run.push_entries(entries[half..].to_vec(), Instant::now(), 0, false);
     assert!(fail_a.is_none() && fail_b.is_none());
 
     let (task_tx, task_rx) = crossbeam_channel::unbounded();
