@@ -1,12 +1,12 @@
-use std::{
-    fmt,
-    time::{Duration, Instant},
+use {
+    crate::clock::Timestamp,
+    std::{fmt, time::Duration},
 };
 
 #[derive(Debug)]
 pub struct Measure {
     name: &'static str,
-    start: Instant,
+    start: Timestamp,
     duration: u64,
 }
 
@@ -14,7 +14,7 @@ impl Measure {
     pub fn start(name: &'static str) -> Self {
         Self {
             name,
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: 0,
         }
     }
@@ -94,11 +94,32 @@ mod tests {
     }
 
     #[test]
+    fn test_measure_with_cheap_timers() {
+        // Same semantics with the cycle-counter clock (when this machine has one).
+        let test_duration = Duration::from_millis(20);
+        crate::clock::set_cheap_timers(true);
+        let mut measure = Measure::start("test");
+        crate::clock::set_cheap_timers(false);
+        sleep(test_duration);
+        measure.stop();
+        let ns = measure.as_ns();
+        assert!(ns >= test_duration.as_nanos() as u64 * 97 / 100, "{ns}");
+        assert_eq!(measure.as_us(), ns / 1000);
+        assert_eq!(measure.as_duration(), Duration::from_nanos(ns));
+        crate::clock::set_cheap_timers(true);
+        let (_, us) = crate::measure_us!(sleep(test_duration));
+        let (_, duration) = crate::meas_dur!(sleep(test_duration));
+        crate::clock::set_cheap_timers(false);
+        assert!(us >= 19_000, "{us}");
+        assert!(duration >= Duration::from_millis(19), "{duration:?}");
+    }
+
+    #[test]
     fn test_measure_as() {
         let test_duration = Duration::from_millis(100);
         let measure = Measure {
             name: "test",
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: test_duration.as_nanos() as u64,
         };
 
@@ -113,28 +134,28 @@ mod tests {
     fn test_measure_display() {
         let measure = Measure {
             name: "test_ns",
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: 1,
         };
         assert_eq!(format!("{measure}"), "test_ns took 1ns");
 
         let measure = Measure {
             name: "test_us",
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: 1000,
         };
         assert_eq!(format!("{measure}"), "test_us took 1us");
 
         let measure = Measure {
             name: "test_ms",
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: 1000 * 1000,
         };
         assert_eq!(format!("{measure}"), "test_ms took 1ms");
 
         let measure = Measure {
             name: "test_s",
-            start: Instant::now(),
+            start: Timestamp::now(),
             duration: 1000 * 1000 * 1000,
         };
         assert_eq!(format!("{measure}"), "test_s took 1.0s");

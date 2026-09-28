@@ -108,7 +108,7 @@ macro_rules! measure_us {
 #[macro_export]
 macro_rules! meas_dur {
     ($expr:expr) => {{
-        let start = std::time::Instant::now();
+        let start = $crate::clock::Timestamp::now();
         let result = $expr;
         (result, start.elapsed())
     }};
