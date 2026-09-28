@@ -26,6 +26,24 @@ impl ::solana_frozen_abi::abi_example::AbiExample for SysvarCache {
     }
 }
 
+thread_local! {
+    /// Number of SlotHashes reads through any sysvar cache on this thread.
+    static SLOT_HASHES_ACCESSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// SlotHashes reads through a sysvar cache on the calling thread so far. The fast lane
+/// executes a slot whose parent is not frozen yet with a provisional SlotHashes (the
+/// parent's bank hash is unknown); comparing this counter before and after an execution
+/// tells it whether the result depends on that value. Monotonic; never reset.
+pub fn slot_hashes_access_count() -> u64 {
+    SLOT_HASHES_ACCESSES.with(|c| c.get())
+}
+
+#[inline]
+fn note_slot_hashes_access() {
+    SLOT_HASHES_ACCESSES.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct SysvarCache {
     // full account data as provided by bank, including any trailing zero bytes
@@ -115,6 +133,7 @@ impl SysvarCache {
         } else if Rent::check_id(sysvar_id) {
             &self.rent
         } else if SlotHashes::check_id(sysvar_id) {
+            note_slot_hashes_access();
             &self.slot_hashes
         } else if StakeHistory::check_id(sysvar_id) {
             &self.stake_history
@@ -167,6 +186,7 @@ impl SysvarCache {
     }
 
     pub fn get_slot_hashes(&self) -> Result<Arc<SlotHashes>, InstructionError> {
+        note_slot_hashes_access();
         self.slot_hashes_obj
             .clone()
             .ok_or(InstructionError::UnsupportedSysvar)

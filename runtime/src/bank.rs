@@ -3068,15 +3068,44 @@ impl Bank {
         max_allowable_drift: MaxAllowableDrift,
         epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
     ) -> Option<UnixTimestamp> {
+        self.get_timestamp_estimate_for_slot_with(
+            slot,
+            max_allowable_drift,
+            epoch_start_timestamp,
+            &HashMap::new(),
+        )
+    }
+
+    /// [`Self::get_timestamp_estimate_for_slot`] with this bank's vote accounts overridden:
+    /// `Some((slot, timestamp))` replaces (or adds) a vote account's last timestamp, `None`
+    /// removes the vote account (as the stakes cache would after the account was closed or
+    /// became invalid). The fast lane uses it for a child of an unfrozen parent P, passing
+    /// the vote accounts FL's own execution of P wrote.
+    pub(crate) fn get_timestamp_estimate_for_slot_with(
+        &self,
+        slot: Slot,
+        max_allowable_drift: MaxAllowableDrift,
+        epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
+        vote_overrides: &HashMap<Pubkey, Option<(Slot, UnixTimestamp)>>,
+    ) -> Option<UnixTimestamp> {
         let slots_per_epoch = self.epoch_schedule().slots_per_epoch;
         let vote_accounts = self.vote_accounts();
-        let recent_timestamps = vote_accounts.iter().filter_map(|(pubkey, (_, account))| {
-            let vote_state = account.vote_state_view();
-            let last_timestamp = vote_state.last_timestamp();
-            let slot_delta = slot.checked_sub(last_timestamp.slot)?;
-            (slot_delta <= slots_per_epoch)
-                .then_some((*pubkey, (last_timestamp.slot, last_timestamp.timestamp)))
-        });
+        let within_epoch = |(timestamp_slot, timestamp): (Slot, UnixTimestamp)| {
+            let slot_delta = slot.checked_sub(timestamp_slot)?;
+            (slot_delta <= slots_per_epoch).then_some((timestamp_slot, timestamp))
+        };
+        let recent_timestamps = vote_accounts
+            .iter()
+            .filter(|(pubkey, _)| !vote_overrides.contains_key(*pubkey))
+            .filter_map(|(pubkey, (_, account))| {
+                let vote_state = account.vote_state_view();
+                let last_timestamp = vote_state.last_timestamp();
+                within_epoch((last_timestamp.slot, last_timestamp.timestamp))
+                    .map(|ts| (*pubkey, ts))
+            })
+            .chain(vote_overrides.iter().filter_map(|(pubkey, ts)| {
+                ts.and_then(within_epoch).map(|ts| (*pubkey, ts))
+            }));
         let elapsed_slot_duration = |from_slot: Slot, to_slot: Slot| {
             if from_slot >= to_slot {
                 Duration::ZERO

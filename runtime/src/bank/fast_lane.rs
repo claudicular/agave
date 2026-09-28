@@ -56,7 +56,10 @@ use {
         versioned::{TransactionVersion, VersionedTransaction},
     },
     solana_transaction_error::{AddressLoaderError, TransactionError, TransactionResult},
-    std::{collections::HashSet, sync::Arc},
+    std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    },
 };
 
 /// Why the fast lane cannot execute a given child of this bank.
@@ -64,6 +67,8 @@ use {
 pub enum FastLaneUnsupported {
     /// The parent bank has not been frozen yet.
     ParentNotFrozen,
+    /// The unfrozen parent's fee collector is unknown.
+    UnknownFeeCollector,
     /// The child slot is not greater than the parent slot.
     ChildNotAfterParent,
     /// Alpenglow is active on the parent (footer clock, markers, migration): paused.
@@ -100,11 +105,19 @@ pub struct FastLaneChildContext {
     /// The child's Clock sysvar value and account.
     pub clock: Clock,
     pub clock_account: AccountSharedData,
-    /// The child's SlotHashes sysvar value and account.
+    /// The child's SlotHashes sysvar value and account. For a chained context (parent not
+    /// frozen yet) the parent's entry carries a placeholder hash: see
+    /// [`Bank::fast_lane_resolve_slot_hashes`].
     pub slot_hashes: Arc<SlotHashes>,
     pub slot_hashes_account: AccountSharedData,
+    /// Chained contexts only: the parent's own SlotHashes (value and account), from which
+    /// the child's is derived once the parent's bank hash is known.
+    parent_slot_hashes: Option<(Arc<SlotHashes>, AccountSharedData)>,
+    /// Chained contexts only: the child's RecentBlockhashes account (the parent registers
+    /// its last blockhash at its last tick, after FL finished it but before agave freezes).
+    recent_blockhashes_account: Option<AccountSharedData>,
     /// The parent's blockhash queue (the child's until its last tick).
-    blockhash_queue: BlockhashQueue,
+    pub(crate) blockhash_queue: BlockhashQueue,
     next_durable_nonce: DurableNonce,
     pub blockhash: Hash,
     pub blockhash_lamports_per_signature: u64,
@@ -148,8 +161,20 @@ impl FastLaneChildContext {
         } else if *key == sysvar::slot_hashes::id() {
             Some(&self.slot_hashes_account)
         } else {
-            None
+            #[allow(deprecated)]
+            let recent_blockhashes = sysvar::recent_blockhashes::id();
+            if *key == recent_blockhashes {
+                self.recent_blockhashes_account.as_ref()
+            } else {
+                None
+            }
         }
+    }
+
+    /// Whether this context was built for a child of an unfrozen parent (its SlotHashes
+    /// holds a placeholder for the parent's bank hash).
+    pub fn is_chained(&self) -> bool {
+        self.parent_slot_hashes.is_some()
     }
 
     /// `durable nonce` the child's nonce advances would store (from the parent's last
@@ -183,6 +208,44 @@ pub struct FastLaneProgramSetup {
     pub builtins: Vec<(Pubkey, ProgramCacheEntry)>,
 }
 
+/// What the fast lane knows about an **unfrozen** parent P when it has executed all of P's
+/// transactions itself, for building P's child's context on top of FL's own results.
+pub struct FastLaneChainedParent {
+    /// P's own context (built over P's frozen parent, which is the bank the chained context
+    /// is computed on).
+    pub ctx: Arc<FastLaneChildContext>,
+    /// The hash of P's last tick entry: the blockhash P registers at its block boundary.
+    pub last_blockhash: Hash,
+    /// P's `fee_rate_governor.lamports_per_signature` (from agave's unfrozen bank P).
+    pub lamports_per_signature: u64,
+    /// Final values of the vote-program accounts P's transactions wrote.
+    pub vote_accounts: Vec<(Pubkey, AccountSharedData)>,
+}
+
+/// How a written vote-program account changes the stakes cache's vote accounts (mirrors
+/// `StakesCache::check_and_store`): `None` = no change, `Some(None)` = removed,
+/// `Some(Some(ts))` = present with last timestamp `ts`.
+fn vote_timestamp_after(account: &AccountSharedData) -> Option<Option<(Slot, i64)>> {
+    if !solana_vote_program::check_id(account.owner()) {
+        return None;
+    }
+    if account.lamports() == 0 {
+        return Some(None);
+    }
+    if !solana_vote_interface::state::VoteStateVersions::is_correct_size_and_initialized(
+        account.data(),
+    ) {
+        return Some(None);
+    }
+    match solana_vote::vote_account::VoteAccount::try_from(account.clone()) {
+        Ok(vote_account) => {
+            let ts = vote_account.vote_state_view().last_timestamp();
+            Some(Some((ts.slot, ts.timestamp)))
+        }
+        Err(_) => Some(None),
+    }
+}
+
 /// An `AddressLoader` resolving a child slot's lookups against the frozen parent's state,
 /// with `current_slot = child` and the child's SlotHashes (see
 /// `Accounts::lookup_table_addresses_into`). Table changes made inside the child slot can
@@ -191,7 +254,7 @@ pub struct FastLaneProgramSetup {
 /// empty), so this equals the child bank's own resolution at any point of its execution.
 #[derive(Clone, Copy)]
 pub struct FastLaneAddressLoader<'a> {
-    parent: &'a Bank,
+    load_table: &'a dyn Fn(&Pubkey) -> Option<AccountSharedData>,
     ctx: &'a FastLaneChildContext,
 }
 
@@ -200,12 +263,12 @@ impl AddressLoader for FastLaneAddressLoader<'_> {
         self,
         lookups: &[MessageAddressTableLookup],
     ) -> Result<LoadedAddresses, AddressLoaderError> {
-        self.parent
-            .fast_lane_load_addresses(
-                self.ctx,
-                lookups.iter().map(SVMMessageAddressTableLookup::from),
-            )
-            .map(|(loaded_addresses, _deactivation_slot)| loaded_addresses)
+        Bank::fast_lane_load_addresses_with(
+            self.ctx,
+            lookups.iter().map(SVMMessageAddressTableLookup::from),
+            self.load_table,
+        )
+        .map(|(loaded_addresses, _deactivation_slot)| loaded_addresses)
     }
 }
 
@@ -371,6 +434,8 @@ impl Bank {
             clock_account,
             slot_hashes: Arc::new(slot_hashes),
             slot_hashes_account,
+            parent_slot_hashes: None,
+            recent_blockhashes_account: None,
             blockhash_queue,
             next_durable_nonce,
             blockhash,
@@ -385,6 +450,159 @@ impl Bank {
         })
     }
 
+    /// The context of `child_slot` whose parent P is **not frozen yet**, on top of FL's own
+    /// execution of all of P. `self` is P's frozen parent (the bank P's own context was built
+    /// on). Identical to what `Bank::new_from_parent(P, _, child_slot)` would build, except
+    /// that SlotHashes carries `Hash::default()` for P (P's bank hash is unknown until agave
+    /// freezes it); readers of SlotHashes must be treated as provisional and validated with
+    /// [`Self::fast_lane_resolve_slot_hashes`].
+    ///
+    /// P's freeze-time writes (fee deposit to P's leader, SlotHistory, the incinerator) are
+    /// not applied here either; the caller treats reads of those accounts as provisional.
+    pub fn fast_lane_chained_child_context(
+        &self,
+        parent: &FastLaneChainedParent,
+        child_slot: Slot,
+    ) -> Result<FastLaneChildContext, FastLaneUnsupported> {
+        let p = &parent.ctx;
+        if !self.is_frozen() {
+            return Err(FastLaneUnsupported::ParentNotFrozen);
+        }
+        if p.parent_slot != self.slot() || child_slot <= p.child_slot {
+            return Err(FastLaneUnsupported::ChildNotAfterParent);
+        }
+        // The child must itself be supported relative to P: same epoch, not the epoch's last
+        // slot, no rewards (P's reward status equals self's within an epoch), not Alpenglow,
+        // no LastRestartSlot change.
+        self.fast_lane_support(child_slot)?;
+
+        let overrides: HashMap<Pubkey, Option<(Slot, i64)>> = parent
+            .vote_accounts
+            .iter()
+            .filter_map(|(key, account)| vote_timestamp_after(account).map(|ts| (*key, ts)))
+            .collect();
+        let parent_clock = &p.clock;
+        let epoch_schedule = self.epoch_schedule();
+        let epoch_start_timestamp = Some((
+            epoch_schedule.get_first_slot_in_epoch(self.epoch()),
+            parent_clock.epoch_start_timestamp,
+        ));
+        let max_allowable_drift = super::MaxAllowableDrift {
+            fast: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST,
+            slow: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
+        };
+        let ancestor_timestamp = parent_clock.unix_timestamp;
+        let mut unix_timestamp = parent_clock.unix_timestamp;
+        if let Some(estimate) = self.get_timestamp_estimate_for_slot_with(
+            child_slot,
+            max_allowable_drift,
+            epoch_start_timestamp,
+            &overrides,
+        ) {
+            unix_timestamp = estimate;
+            if estimate < ancestor_timestamp {
+                unix_timestamp = ancestor_timestamp;
+            }
+        }
+        let clock = Clock {
+            slot: child_slot,
+            epoch_start_timestamp: parent_clock.epoch_start_timestamp,
+            epoch: epoch_schedule.get_epoch(child_slot),
+            leader_schedule_epoch: epoch_schedule.get_leader_schedule_epoch(child_slot),
+            unix_timestamp,
+        };
+        let mut clock_account = create_account(
+            &clock,
+            self.inherit_specially_retained_account_fields(&Some(p.clock_account.clone())),
+        );
+        self.adjust_sysvar_balance_for_rent(&mut clock_account);
+
+        let (slot_hashes, slot_hashes_account) =
+            self.child_slot_hashes_of(&p.slot_hashes, &p.slot_hashes_account, p.child_slot, Hash::default());
+
+        let mut blockhash_queue = p.blockhash_queue.clone();
+        blockhash_queue.register_hash(&parent.last_blockhash, parent.lamports_per_signature);
+        #[allow(deprecated)]
+        let recent_blockhashes_id = sysvar::recent_blockhashes::id();
+        let old_recent_blockhashes = p
+            .recent_blockhashes_account
+            .clone()
+            .or_else(|| self.get_account(&recent_blockhashes_id));
+        #[allow(deprecated)]
+        let recent_blockhash_iter = blockhash_queue.get_recent_blockhashes();
+        let mut recent_blockhashes_account =
+            super::recent_blockhashes_account::create_account_with_data_and_fields(
+                recent_blockhash_iter,
+                self.inherit_specially_retained_account_fields(&old_recent_blockhashes),
+            );
+        self.adjust_sysvar_balance_for_rent(&mut recent_blockhashes_account);
+        let next_durable_nonce = blockhash_queue.next_durable_nonce();
+        let effective_epoch_of_deployments = epoch_schedule
+            .get_epoch(child_slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET));
+        Ok(FastLaneChildContext {
+            parent_slot: p.child_slot,
+            parent_bank_id: 0,
+            parent_hash: Hash::default(),
+            child_slot,
+            epoch: self.epoch(),
+            clock,
+            clock_account,
+            slot_hashes: Arc::new(slot_hashes),
+            slot_hashes_account,
+            parent_slot_hashes: Some((Arc::clone(&p.slot_hashes), p.slot_hashes_account.clone())),
+            recent_blockhashes_account: Some(recent_blockhashes_account),
+            blockhash_queue,
+            next_durable_nonce,
+            blockhash: parent.last_blockhash,
+            blockhash_lamports_per_signature: parent.lamports_per_signature,
+            max_processing_age: p.max_processing_age,
+            feature_set: Arc::clone(&p.feature_set),
+            transaction_account_lock_limit: p.transaction_account_lock_limit,
+            epoch_total_stake: p.epoch_total_stake,
+            execution_environment: p.execution_environment.clone(),
+            deployment_environment: self
+                .transaction_processor
+                .program_runtime_environment_for_epoch(effective_epoch_of_deployments),
+            rent: p.rent.clone(),
+        })
+    }
+
+    /// `parent_slot_hashes` plus `(parent_slot, parent_hash)`, as `update_slot_hashes` builds
+    /// it in the child (account fields inherited from `parent_account`).
+    fn child_slot_hashes_of(
+        &self,
+        parent_slot_hashes: &SlotHashes,
+        parent_account: &AccountSharedData,
+        parent_slot: Slot,
+        parent_hash: Hash,
+    ) -> (SlotHashes, AccountSharedData) {
+        let mut slot_hashes = SlotHashes::new(parent_slot_hashes.slot_hashes());
+        slot_hashes.add(parent_slot, parent_hash);
+        let mut account = create_account(
+            &slot_hashes,
+            self.inherit_specially_retained_account_fields(&Some(parent_account.clone())),
+        );
+        self.adjust_sysvar_balance_for_rent(&mut account);
+        (slot_hashes, account)
+    }
+
+    /// The true SlotHashes of a chained context's child once its parent's bank hash is known.
+    pub fn fast_lane_resolve_slot_hashes(
+        &self,
+        ctx: &FastLaneChildContext,
+        parent_hash: Hash,
+    ) -> Option<(Arc<SlotHashes>, AccountSharedData)> {
+        let (parent_slot_hashes, parent_account) = ctx.parent_slot_hashes.as_ref()?;
+        let (slot_hashes, account) =
+            self.child_slot_hashes_of(parent_slot_hashes, parent_account, ctx.parent_slot, parent_hash);
+        Some((Arc::new(slot_hashes), account))
+    }
+
+    /// `fee_rate_governor.lamports_per_signature` of this (possibly unfrozen) bank.
+    pub fn fast_lane_lamports_per_signature(&self) -> u64 {
+        self.fee_rate_governor.lamports_per_signature
+    }
+
     /// The reserved account keys the child uses for sanitization (the parent's; they only
     /// change at an epoch boundary).
     pub fn fast_lane_reserved_account_keys(&self) -> &HashSet<Pubkey> {
@@ -397,12 +615,23 @@ impl Bank {
         ctx: &FastLaneChildContext,
         address_table_lookups: impl Iterator<Item = SVMMessageAddressTableLookup<'a>>,
     ) -> Result<(LoadedAddresses, Slot), AddressLoaderError> {
+        Self::fast_lane_load_addresses_with(ctx, address_table_lookups, &|key: &Pubkey| {
+            self.get_account_modified_slot(key)
+                .map(|(account, _slot)| account)
+        })
+    }
+
+    /// [`Self::fast_lane_load_addresses`] with table accounts read by `load_table` (a chained
+    /// child reads tables as FL's execution of its unfrozen parent left them).
+    pub fn fast_lane_load_addresses_with<'a>(
+        ctx: &FastLaneChildContext,
+        address_table_lookups: impl Iterator<Item = SVMMessageAddressTableLookup<'a>>,
+        load_table: &dyn Fn(&Pubkey) -> Option<AccountSharedData>,
+    ) -> Result<(LoadedAddresses, Slot), AddressLoaderError> {
         let mut deactivation_slot = u64::MAX;
         let mut loaded_addresses = LoadedAddresses::default();
         for address_table_lookup in address_table_lookups {
-            let table_account = self
-                .get_account_modified_slot(address_table_lookup.account_key)
-                .map(|(account, _slot)| account)
+            let table_account = load_table(address_table_lookup.account_key)
                 .ok_or(AddressLoaderError::LookupTableAccountNotFound)?;
             deactivation_slot = deactivation_slot.min(
                 Accounts::lookup_table_addresses_into(
@@ -428,6 +657,21 @@ impl Bank {
         tx: VersionedTransaction,
         serialized_message: &[u8],
     ) -> TransactionResult<RuntimeTransaction<SanitizedTransaction>> {
+        self.fast_lane_verify_transaction_with(ctx, tx, serialized_message, &|key: &Pubkey| {
+            self.get_account_modified_slot(key)
+                .map(|(account, _slot)| account)
+        })
+    }
+
+    /// [`Self::fast_lane_verify_transaction`] with lookup-table accounts read by
+    /// `load_table`.
+    pub fn fast_lane_verify_transaction_with(
+        &self,
+        ctx: &FastLaneChildContext,
+        tx: VersionedTransaction,
+        serialized_message: &[u8],
+        load_table: &dyn Fn(&Pubkey) -> Option<AccountSharedData>,
+    ) -> TransactionResult<RuntimeTransaction<SanitizedTransaction>> {
         let enable_tx_v1 = ctx.feature_set.snapshot().enable_tx_v1;
         if !enable_tx_v1 && tx.version() == TransactionVersion::Number(1) {
             return Err(TransactionError::UnsupportedVersion);
@@ -452,7 +696,7 @@ impl Bank {
             tx,
             MessageHash::Precomputed(message_hash),
             None,
-            FastLaneAddressLoader { parent: self, ctx },
+            FastLaneAddressLoader { load_table, ctx },
             self.get_reserved_account_keys(),
         )
     }
@@ -585,9 +829,11 @@ impl Bank {
             .clone()
     }
 
-    /// The fee collector (slot leader) this bank deposits fees to at freeze.
-    pub fn fast_lane_collector_id(&self) -> Pubkey {
-        *self.leader_id()
+    /// The account this bank deposits the slot's fees into at freeze (the leader's identity,
+    /// or with SIMD-0232 its vote account's block-revenue collector); `None` if agave could
+    /// not determine it either.
+    pub fn fast_lane_collector_id(&self) -> Option<Pubkey> {
+        self.fee_collector_id()
     }
 
     /// The compute budget configured for this bank, if any (test/diagnostic accessor).
@@ -718,6 +964,112 @@ mod tests {
             assert_eq!(
                 cache.sysvar_id_to_buffer(&sysvar::slot_hashes::id()).as_deref(),
                 Some(ctx.slot_hashes_account.data())
+            );
+        }
+    }
+
+    /// A child of an unfrozen parent P, built from FL's knowledge of P (P's own context over
+    /// its frozen parent, P's last tick hash, P's lamports per signature and the vote
+    /// accounts P wrote), equals the real child once agave finishes and freezes P.
+    #[test_case(None; "no vote update in P")]
+    #[test_case(Some(1_000_000); "vote timestamp far ahead updated in P")]
+    #[test_case(Some(-3); "vote timestamp slightly behind updated in P")]
+    fn test_chained_child_context_matches_new_from_parent(ts_offset_in_p: Option<i64>) {
+        let leader = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            genesis_config,
+            voting_keypair,
+            ..
+        } = create_genesis_config_with_leader(5_000_000_000, &leader, 1_000_000_000);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        let mut grandparent = bank0;
+        for slot in 1..=3 {
+            grandparent = Bank::new_from_parent_with_bank_forks(
+                &bank_forks,
+                grandparent,
+                SlotLeader::default(),
+                slot,
+            );
+        }
+        grandparent.freeze();
+        // P = slot 4, not frozen; FL computes P's own context from its frozen parent.
+        let p_ctx = Arc::new(grandparent.fast_lane_child_context(4).unwrap());
+        let parent = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            Arc::clone(&grandparent),
+            SlotLeader::default(),
+            4,
+        );
+        let mut vote_accounts = Vec::new();
+        if let Some(offset) = ts_offset_in_p {
+            let vote_pubkey = voting_keypair.pubkey();
+            update_vote_account_timestamp(
+                BlockTimestamp {
+                    slot: 4,
+                    timestamp: parent.unix_timestamp_from_genesis().saturating_add(offset),
+                },
+                &parent,
+                &vote_pubkey,
+            );
+            vote_accounts.push((vote_pubkey, parent.get_account(&vote_pubkey).unwrap()));
+        }
+        // P reaches its last tick (registers its blockhash), but is not frozen.
+        let mut tick_hash = parent.last_blockhash();
+        loop {
+            tick_hash = solana_sha256_hasher::hashv(&[tick_hash.as_ref(), &[7]]);
+            parent.register_tick_for_test(&tick_hash);
+            if parent.last_blockhash() == tick_hash {
+                break;
+            }
+        }
+        let chained = FastLaneChainedParent {
+            ctx: Arc::clone(&p_ctx),
+            last_blockhash: tick_hash,
+            lamports_per_signature: parent.fast_lane_lamports_per_signature(),
+            vote_accounts,
+        };
+        for child_slot in [5, 7] {
+            let ctx = grandparent
+                .fast_lane_chained_child_context(&chained, child_slot)
+                .unwrap();
+            assert!(ctx.is_chained());
+            parent.freeze();
+            let child =
+                Bank::new_from_parent(Arc::clone(&parent), SlotLeader::default(), child_slot);
+            assert_same_account(
+                &ctx.clock_account,
+                &child.get_account(&sysvar::clock::id()).unwrap(),
+                "clock",
+            );
+            #[allow(deprecated)]
+            let rb_id = sysvar::recent_blockhashes::id();
+            assert_same_account(
+                ctx.sysvar_override(&rb_id).unwrap(),
+                &child.get_account(&rb_id).unwrap(),
+                "recent blockhashes",
+            );
+            let (_, resolved) = grandparent
+                .fast_lane_resolve_slot_hashes(&ctx, parent.hash())
+                .unwrap();
+            assert_same_account(
+                &resolved,
+                &child.get_account(&sysvar::slot_hashes::id()).unwrap(),
+                "resolved slot hashes",
+            );
+            let env = ctx.processing_environment();
+            let (blockhash, lps) = child.last_blockhash_and_lamports_per_signature();
+            assert_eq!(env.blockhash, blockhash);
+            assert_eq!(env.blockhash_lamports_per_signature, lps);
+            assert_eq!(
+                *ctx.next_durable_nonce(),
+                child.blockhash_queue.read().unwrap().next_durable_nonce()
+            );
+            // Age checks see the same queue.
+            assert!(
+                ctx.blockhash_queue
+                    .get_hash_info_if_valid(&tick_hash, ctx.max_processing_age)
+                    .is_some()
             );
         }
     }

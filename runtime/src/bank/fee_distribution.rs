@@ -122,33 +122,9 @@ impl Bank {
             return 0;
         }
 
-        // Per SIMD-0232: the commission collector address should be fetched
-        // from the state of the vote account at the beginning of the previous
-        // epoch. This is the vote account state used to build the leader
-        // schedule for the current epoch, which *DOES NOT* correspond to
-        // `Bank::current_epoch_stakes()`.
-        let feature_snapshot = self.feature_set.snapshot();
-        let collector_id = if feature_snapshot.custom_commission_collector {
-            let vote_account = self
-                .epoch_stakes
-                .get(&self.epoch)
-                .and_then(|stakes| {
-                    stakes
-                        .stakes()
-                        .vote_accounts()
-                        .get(&self.leader.vote_address)
-                })
-                .expect("The vote account for the leader must exist");
-            // Protection in case the leader is on a vote state without a
-            // collector id, which can happen if a dormant pre-v4 vote state
-            // accrues stake.
-            vote_account
-                .vote_state_view()
-                .block_revenue_collector()
-                .unwrap_or(&self.leader.id)
-        } else {
-            &self.leader.id
-        };
+        let collector_id = &self
+            .fee_collector_id()
+            .expect("The vote account for the leader must exist");
 
         match self.deposit_fees(collector_id, deposit) {
             Ok(post_balance) => {
@@ -177,6 +153,35 @@ impl Bank {
                 deposit
             }
         }
+    }
+
+    /// The account the slot's fees are deposited into at freeze. `None` when SIMD-0232 is
+    /// active and the leader's vote account is missing from the epoch stakes.
+    pub(super) fn fee_collector_id(&self) -> Option<Pubkey> {
+        // Per SIMD-0232: the commission collector address should be fetched
+        // from the state of the vote account at the beginning of the previous
+        // epoch. This is the vote account state used to build the leader
+        // schedule for the current epoch, which *DOES NOT* correspond to
+        // `Bank::current_epoch_stakes()`.
+        let feature_snapshot = self.feature_set.snapshot();
+        if !feature_snapshot.custom_commission_collector {
+            return Some(self.leader.id);
+        }
+        let vote_account = self.epoch_stakes.get(&self.epoch).and_then(|stakes| {
+            stakes
+                .stakes()
+                .vote_accounts()
+                .get(&self.leader.vote_address)
+        })?;
+        // Protection in case the leader is on a vote state without a
+        // collector id, which can happen if a dormant pre-v4 vote state
+        // accrues stake.
+        Some(
+            *vote_account
+                .vote_state_view()
+                .block_revenue_collector()
+                .unwrap_or(&self.leader.id),
+        )
     }
 
     // Deposits fees into a specified account and if successful, returns the new balance of that account
