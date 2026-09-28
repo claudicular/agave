@@ -274,6 +274,7 @@ fn run_case(case: &Case) -> RunSummary {
                         locks: tx.locks.clone(),
                         certain_writes: vec![tx.locks[0].0],
                         is_vote: false,
+                        external: false,
                     })
                     .collect();
                 coord_tx

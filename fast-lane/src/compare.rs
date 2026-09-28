@@ -160,6 +160,13 @@ struct Interval {
     eager_reexecs: u64,
     spec_dispatches: u64,
     nonspec_dispatches: u64,
+    runs_chained: u64,
+    chained_matched: u64,
+    chained_mismatched: u64,
+    /// Chained transactions matched and exported with a lead (non-vote).
+    chained_lead_us: Vec<i64>,
+    sysvar_checks_ok: u64,
+    sysvar_check_mismatch: u64,
 }
 
 struct RunInfo {
@@ -205,7 +212,7 @@ impl Comparator {
                 "slot,ordinal,signature,vote,token,outcome,class,fl_final_unix_ns,\
                  agave_unix_ns,tap_unix_ns,lead_us,fl_latency_us,agave_latency_us,\
                  incarnations,spec,exec_us,n_preds,kind,ok,parent_slot,ingest_us,\
-                 first_dispatch_us,exec_start_us,exec_end_us,src",
+                 first_dispatch_us,exec_start_us,exec_end_us,src,chained",
             ),
             mb,
             config.export_files,
@@ -297,6 +304,9 @@ impl Comparator {
                 ctx_build_us: _,
             } => {
                 self.interval.runs_started += 1;
+                if run.chain.is_some() {
+                    self.interval.runs_chained += 1;
+                }
                 if parent_frozen_at_first_set {
                     self.interval.parent_frozen_at_first_set += 1;
                 } else {
@@ -469,6 +479,16 @@ impl Comparator {
             "noframe" => interval.noframe += 1,
             _ => interval.fl_only += 1,
         }
+        if outcome.chained {
+            match outcome_label {
+                "match" => interval.chained_matched += 1,
+                "mismatch" => interval.chained_mismatched += 1,
+                _ => {}
+            }
+            if let (false, "match", Some(lead)) = (outcome.is_vote, outcome_label, lead_us) {
+                interval.chained_lead_us.push(lead);
+            }
+        }
         if let Some(class) = class {
             *interval.mismatch_classes.entry(class).or_default() += 1;
             for program in &outcome.programs {
@@ -502,7 +522,7 @@ impl Comparator {
                 .as_micros();
             let since_tap = |t: Instant| t.saturating_duration_since(outcome.t_tap).as_micros();
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{},{},{}",
                 outcome.slot,
                 outcome.ordinal,
                 outcome.signature,
@@ -528,6 +548,7 @@ impl Comparator {
                 since_tap(record.t_exec_start),
                 since_tap(record.t_exec_end),
                 if outcome.from_ring { "ring" } else { "blockstore" },
+                u8::from(outcome.chained),
             );
             export.write_line(&line);
         }
@@ -619,8 +640,9 @@ impl Comparator {
     }
 
     /// Slot-level check: once FL's run is complete and agave froze the slot, every account
-    /// FL wrote must equal the frozen bank's value (fee collector and incinerator excepted:
-    /// agave writes them at freeze).
+    /// FL wrote must equal the frozen bank's value (fee collector, incinerator and
+    /// SlotHistory excepted: agave writes them at freeze). The run's Clock and SlotHashes
+    /// (for a chained run: resolved when the parent froze) must equal the bank's.
     fn maybe_slot_check(&mut self, run_id: RunId) {
         let Some(info) = self.runs.get(&run_id) else {
             return;
@@ -640,9 +662,32 @@ impl Comparator {
             return;
         };
         let collector = bank.fast_lane_collector_id();
+        let clock_id = solana_sdk_ids::sysvar::clock::id();
+        let slot_hashes_id = solana_sdk_ids::sysvar::slot_hashes::id();
+        let run_slot_hashes = match &info.run.chain {
+            Some(_) => info.run.overlay.latest(&slot_hashes_id).value,
+            None => Some(info.run.ctx.slot_hashes_account.clone()),
+        };
+        let sysvars_ok = same_value(
+            &Some(info.run.ctx.clock_account.clone()),
+            &bank.get_account(&clock_id),
+        ) && same_value(&run_slot_hashes, &bank.get_account(&slot_hashes_id));
+        if sysvars_ok {
+            self.interval.sysvar_checks_ok += 1;
+        } else {
+            self.interval.sysvar_check_mismatch += 1;
+            warn!(
+                "fast lane: slot {} sysvar check failed (chained {})",
+                info.run.slot,
+                info.run.chain.is_some()
+            );
+        }
         let mut bad = 0u64;
         for key in info.run.overlay.written_keys().into_iter().take(10_000) {
-            if key == collector || key == incinerator::id() {
+            if Some(key) == collector
+                || key == incinerator::id()
+                || key == solana_sdk_ids::sysvar::slot_history::id()
+            {
                 continue;
             }
             let fl = info.run.overlay.latest(&key).value;
@@ -721,6 +766,7 @@ impl Comparator {
             &mut iv.agave_latency_us,
             &mut iv.agave_latency_us_token,
             &mut iv.parent_wait_us,
+            &mut iv.chained_lead_us,
         ] {
             v.sort_unstable();
         }
@@ -753,7 +799,8 @@ impl Comparator {
              aborted={aborted:?} skipped={skipped:?} parent_frozen={} parent_waited={} \
              parent_wait_us_p50={} slot_checks_ok={} slot_check_bad_keys={} classes={classes:?} \
              top_programs={programs:?} tap_drops={tap_drops} frame_drops={frame_drops} \
-             cmp_drops={}",
+             cmp_drops={} chained_runs={} chained_match={} chained_mismatch={} \
+             chained_lead_us_p50={} p90={} sysvar_ok={} sysvar_bad={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -786,6 +833,13 @@ impl Comparator {
             iv.slot_checks_ok,
             iv.slot_check_mismatch_keys,
             self.sink_drops.load(Ordering::Relaxed),
+            iv.runs_chained,
+            iv.chained_matched,
+            iv.chained_mismatched,
+            pct(&iv.chained_lead_us, 0.5),
+            pct(&iv.chained_lead_us, 0.9),
+            iv.sysvar_checks_ok,
+            iv.sysvar_check_mismatch,
         );
         solana_metrics::datapoint_info!(
             "fast_lane",
@@ -817,6 +871,11 @@ impl Comparator {
             ("exec_us", iv.exec_us as i64, i64),
             ("tap_drops", tap_drops as i64, i64),
             ("frame_drops", frame_drops as i64, i64),
+            ("runs_chained", iv.runs_chained as i64, i64),
+            ("chained_match", iv.chained_matched as i64, i64),
+            ("chained_mismatch", iv.chained_mismatched as i64, i64),
+            ("sysvar_checks_ok", iv.sysvar_checks_ok as i64, i64),
+            ("sysvar_check_mismatch", iv.sysvar_check_mismatch as i64, i64),
         );
         if let Some(w) = self.summaries.as_mut() {
             let line = format!(
@@ -827,7 +886,9 @@ impl Comparator {
                  \"incarnations\":{},\"validation_failures\":{},\"eager_reexecs\":{},\
                  \"runs_started\":{},\"runs_completed\":{},\"parent_frozen\":{},\"parent_waited\":{},\
                  \"slot_checks_ok\":{},\"slot_check_bad_keys\":{},\"exec_us\":{},\
-                 \"tap_drops\":{tap_drops},\"frame_drops\":{frame_drops}}}",
+                 \"tap_drops\":{tap_drops},\"frame_drops\":{frame_drops},\"runs_chained\":{},\
+                 \"chained_match\":{},\"chained_mismatch\":{},\"chained_lead_us\":[{},{},{},{}],\
+                 \"sysvar_checks_ok\":{},\"sysvar_check_mismatch\":{}}}",
                 unix_ns(),
                 iv.matched,
                 iv.mismatched,
@@ -860,6 +921,15 @@ impl Comparator {
                 iv.slot_checks_ok,
                 iv.slot_check_mismatch_keys,
                 iv.exec_us,
+                iv.runs_chained,
+                iv.chained_matched,
+                iv.chained_mismatched,
+                pct(&iv.chained_lead_us, 0.5),
+                pct(&iv.chained_lead_us, 0.9),
+                pct(&iv.chained_lead_us, 0.99),
+                iv.chained_lead_us.len(),
+                iv.sysvar_checks_ok,
+                iv.sysvar_check_mismatch,
             );
             w.write_line(&line);
         }

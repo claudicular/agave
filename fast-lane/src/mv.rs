@@ -328,6 +328,14 @@ impl Overlay {
         self.visible_below(key, TxIdx::MAX)
     }
 
+    /// The raw latest stored value of `key` (zero-lamport accounts included), if any
+    /// version exists.
+    pub fn latest_raw(&self, key: &Pubkey) -> Option<AccountSharedData> {
+        let entry = self.accounts.get(key)?;
+        let versions = entry.value().versions.lock();
+        versions.last().map(|v| v.account.clone())
+    }
+
     /// Keys that have at least one version.
     pub fn written_keys(&self) -> Vec<Pubkey> {
         self.accounts

@@ -8,6 +8,12 @@
 //! replay does (child-slot ALT resolution, lock validation, static checks) and hands them to
 //! the coordinator in ledger order. Transaction ordinals count every transaction of the slot
 //! from shred 0, which equals agave's `transaction_indexes`.
+//!
+//! With `chain = true`, a slot whose parent P is not frozen yet starts on top of FL's own
+//! complete run of P (P's parent frozen, P's entries complete, no unprocessable
+//! transaction, agave's bank P created): see [`Run::new_chained`]. Its transaction 0 is a
+//! pseudo-transaction for P's freeze-time writes (and the child's SlotHashes), completed
+//! here when agave freezes P.
 
 use {
     crate::{
@@ -19,7 +25,7 @@ use {
         program_cache::ProgramCaches,
         ring::{Poll, RingReader},
         run::Run,
-        sched::{CoordMsg, RunId},
+        sched::{CoordMsg, ExecOutput, RunId},
         tap::TapBatch,
         tees::AgaveEvent,
     },
@@ -27,6 +33,7 @@ use {
     log::info,
     solana_clock::Slot,
     solana_entry::entry::Entry,
+    solana_hash::Hash,
     solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -72,6 +79,13 @@ struct SlotIngest {
     status: SlotStatus,
     parent_frozen_at_first_set: bool,
     input_complete: bool,
+    /// Hash of the last released entry (the slot's last tick once input is complete).
+    last_entry_hash: Option<Hash>,
+    /// This slot's complete-input, non-chained run, kept while the slot is unfrozen so a
+    /// child can chain on it.
+    done_run: Option<Arc<Run>>,
+    /// A chained run waiting for its parent's freeze.
+    chain_run: Option<(RunId, Arc<Run>)>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -86,6 +100,8 @@ pub struct IngestStats {
     pub sanitize_us: u64,
     pub txs: u64,
     pub runs_started: u64,
+    pub runs_chained: u64,
+    pub chains_resolved: u64,
     pub slots_skipped: HashMap<&'static str, u64>,
 }
 
@@ -103,6 +119,9 @@ pub struct Ingest {
     root: Slot,
     ring: Option<RingReader>,
     ring_retry_at: Instant,
+    /// Runs report completion here (their slot).
+    complete_tx: Sender<Slot>,
+    complete_rx: Receiver<Slot>,
     pub stats: IngestStats,
 }
 
@@ -115,6 +134,7 @@ impl Ingest {
         readonly_owners: Arc<Vec<Pubkey>>,
     ) -> Self {
         let fork_graph = Arc::new(RwLock::new(crate::forks::FlForkGraph::default()));
+        let (complete_tx, complete_rx) = crossbeam_channel::bounded(1024);
         let mut ingest = Self {
             deps,
             config,
@@ -129,6 +149,8 @@ impl Ingest {
             root: 0,
             ring: None,
             ring_retry_at: Instant::now(),
+            complete_tx,
+            complete_rx,
             stats: IngestStats::default(),
         };
         ingest.seed();
@@ -172,6 +194,12 @@ impl Ingest {
                     self.programs.prune_slot(slot);
                 }
             }
+            if let Some((run_id, _)) = state.chain_run {
+                let _ = self.coord_tx.send(CoordMsg::AbortRun {
+                    run_id,
+                    reason: "below_root",
+                });
+            }
         }
         self.dead = self.dead.split_off(&root.saturating_sub(64));
     }
@@ -201,6 +229,11 @@ impl Ingest {
                         Ok(event) => self.on_event(event),
                         Err(_) => return,
                     },
+                    recv(self.complete_rx) -> msg => {
+                        if let Ok(slot) = msg {
+                            self.on_run_complete(slot);
+                        }
+                    },
                     default(Duration::from_millis(20)) => {},
                 }
                 idle_since = Instant::now();
@@ -222,6 +255,10 @@ impl Ingest {
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => return,
                     Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+                if let Ok(slot) = self.complete_rx.try_recv() {
+                    self.on_run_complete(slot);
+                    worked = true;
                 }
                 if worked {
                     idle_since = Instant::now();
@@ -247,6 +284,8 @@ impl Ingest {
             if matches!(state.status, SlotStatus::Skipped(_)) {
                 return;
             }
+            state.chain_run = None;
+            state.done_run = None;
             if state.status == SlotStatus::Complete {
                 // Input was complete but the coordinator may still be executing it.
                 if let Some(run_id) = state.run_id {
@@ -299,6 +338,16 @@ impl Ingest {
                 self.skip(slot, "parent_timeout");
             }
         }
+        // Chained runs whose parent froze without an event reaching us (tee drop).
+        let pending: Vec<Slot> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.chain_run.is_some())
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in pending {
+            self.resolve_chain(slot);
+        }
         // Forget old slot state (bounded memory even if root stalls).
         let old: Vec<Slot> = self
             .slots
@@ -315,6 +364,12 @@ impl Ingest {
                             reason: "stale",
                         });
                     }
+                }
+                if let Some((run_id, _)) = state.chain_run {
+                    let _ = self.coord_tx.send(CoordMsg::AbortRun {
+                        run_id,
+                        reason: "chain_stale",
+                    });
                 }
             }
         }
@@ -335,10 +390,24 @@ impl Ingest {
                     .frozen
                     .on_frozen(&self.deps.bank_forks, slot, Some(bank_id));
                 let _ = self.cmp_tx.try_send(CmpMsg::SlotFrozen { slot, bank_id, t });
+                if let Some(state) = self.slots.get_mut(&slot) {
+                    state.done_run = None;
+                }
+                let chained: Vec<Slot> = self
+                    .slots
+                    .iter()
+                    .filter(|(_, s)| s.parent == Some(slot) && s.chain_run.is_some())
+                    .map(|(child, _)| *child)
+                    .collect();
+                for child in chained {
+                    self.resolve_chain(child);
+                }
                 let children: Vec<Slot> = self
                     .slots
                     .iter()
-                    .filter(|(_, s)| s.parent == Some(slot) && s.run.is_none())
+                    .filter(|(_, s)| {
+                        s.parent == Some(slot) && s.run.is_none() && s.run_id.is_none()
+                    })
                     .map(|(child, _)| *child)
                     .collect();
                 for child in children {
@@ -397,6 +466,9 @@ impl Ingest {
                     status: SlotStatus::Collecting,
                     parent_frozen_at_first_set: parent_frozen,
                     input_complete: false,
+                    last_entry_hash: None,
+                    done_run: None,
+                    chain_run: None,
                 },
             );
         }
@@ -417,6 +489,9 @@ impl Ingest {
             return true;
         };
         for released in state.gate.push(piece) {
+            if let Some(last) = released.entries.last() {
+                state.last_entry_hash = Some(last.hash);
+            }
             state.released.push(ReleasedSet {
                 entries: released.entries,
                 source: released.source,
@@ -622,8 +697,14 @@ impl Ingest {
             self.skip(slot, "parent_dead");
             return;
         }
-        let Some(parent) = self.frozen.get(parent_slot).cloned() else {
-            return;
+        let frozen_parent = self.frozen.get(parent_slot).cloned();
+        let chain = match frozen_parent {
+            Some(_) => None,
+            None if self.config.chain => match self.chain_parent(parent_slot) {
+                Some(chain) => Some(chain),
+                None => return,
+            },
+            None => return,
         };
         if self.active_runs() >= self.config.max_runs {
             return;
@@ -632,32 +713,174 @@ impl Ingest {
             self.skip(slot, "mem_cap");
             return;
         }
-        match self.create_run(slot, &parent) {
+        let created = match (frozen_parent, chain) {
+            (Some(parent), _) => self.create_run(slot, &parent),
+            (None, Some((parent_run, parent_bank, last_blockhash))) => {
+                self.create_chained_run(slot, &parent_run, &parent_bank, last_blockhash)
+            }
+            (None, None) => return,
+        };
+        match created {
             Ok(()) => self.feed(slot),
             Err(reason) => self.skip(slot, reason),
         }
+    }
+
+    /// FL's run of the unfrozen `parent_slot` a child can chain on, with agave's bank for
+    /// it and its last blockhash; `None` while not (yet) possible.
+    fn chain_parent(&self, parent_slot: Slot) -> Option<(Arc<Run>, Arc<Bank>, Hash)> {
+        let state = self.slots.get(&parent_slot)?;
+        if state.status != SlotStatus::Complete || !state.input_complete {
+            return None;
+        }
+        let parent_run = state.done_run.clone()?;
+        if !parent_run.complete.load(Ordering::SeqCst)
+            || !parent_run.complete_ok.load(Ordering::SeqCst)
+            || parent_run.chain.is_some()
+        {
+            return None;
+        }
+        let last_blockhash = state.last_entry_hash?;
+        let parent_bank = self.deps.bank_forks.read().ok()?.get(parent_slot)?;
+        if parent_bank.is_frozen() {
+            // The freeze event is on its way: run over the frozen bank instead.
+            return None;
+        }
+        // Same fork version of P as FL's run (duplicate-block safety).
+        let grandparent = parent_bank.parent()?;
+        if grandparent.slot() != parent_run.parent_slot
+            || grandparent.bank_id() != parent_run.parent_bank_id
+        {
+            return None;
+        }
+        Some((parent_run, parent_bank, last_blockhash))
+    }
+
+    /// A run of `slot` became complete (every transaction FINAL): children may chain on it.
+    fn on_run_complete(&mut self, slot: Slot) {
+        if !self.config.chain {
+            return;
+        }
+        let children: Vec<Slot> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| {
+                s.parent == Some(slot)
+                    && s.status == SlotStatus::Collecting
+                    && s.run_id.is_none()
+            })
+            .map(|(child, _)| *child)
+            .collect();
+        for child in children {
+            self.try_start_run(child);
+        }
+    }
+
+    /// Complete a chained run's parent-freeze pseudo-transaction once agave froze the
+    /// parent (the same bank the run was built on).
+    fn resolve_chain(&mut self, slot: Slot) {
+        let Some((run_id, run)) = self.slots.get(&slot).and_then(|s| s.chain_run.clone()) else {
+            return;
+        };
+        let Some(chain) = run.chain.as_ref() else {
+            return;
+        };
+        let parent_slot = chain.parent_run.slot;
+        let frozen = self.frozen.get(parent_slot).cloned().or_else(|| {
+            self.deps
+                .bank_forks
+                .read()
+                .ok()?
+                .get(parent_slot)
+                .filter(|bank| bank.is_frozen())
+        });
+        let Some(frozen) = frozen else {
+            return;
+        };
+        if frozen.bank_id() != chain.parent_bank.bank_id() {
+            self.skip(slot, "chain_parent_replaced");
+            return;
+        }
+        let t0 = Instant::now();
+        let Some(writes) = run.resolve_parent_freeze(&frozen) else {
+            self.skip(slot, "chain_resolve");
+            return;
+        };
+        run.overlay.install(0, 0, &writes, &[]);
+        let out = ExecOutput {
+            reads: Vec::new(),
+            writes,
+            payload: Box::new(()),
+            unprocessable: false,
+            exec_start: t0,
+            exec_end: Instant::now(),
+        };
+        if let Some(state) = self.slots.get_mut(&slot) {
+            state.chain_run = None;
+        }
+        self.stats.chains_resolved += 1;
+        let _ = self.coord_tx.send(CoordMsg::ExternalDone { run_id, k: 0, out });
     }
 
     fn create_run(&mut self, slot: Slot, parent: &Arc<Bank>) -> Result<(), &'static str> {
         let t0 = Instant::now();
         let run_id = self.next_run_id;
         self.next_run_id += 1;
-        let run = Arc::new(
-            Run::new(
-                run_id,
-                slot,
-                parent,
-                &mut self.programs,
-                Arc::clone(&self.readonly_owners),
-            )
-            .map_err(unsupported_reason)?,
-        );
+        let mut run = Run::new(
+            run_id,
+            slot,
+            parent,
+            &mut self.programs,
+            Arc::clone(&self.readonly_owners),
+        )
+        .map_err(unsupported_reason)?;
+        if self.config.chain {
+            run.complete_notify = Some(self.complete_tx.clone());
+        }
+        self.start_run(slot, run_id, Arc::new(run), t0)
+    }
+
+    fn create_chained_run(
+        &mut self,
+        slot: Slot,
+        parent_run: &Arc<Run>,
+        parent_bank: &Arc<Bank>,
+        last_blockhash: Hash,
+    ) -> Result<(), &'static str> {
+        let t0 = Instant::now();
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+        let run = Run::new_chained(
+            run_id,
+            slot,
+            parent_run,
+            parent_bank,
+            last_blockhash,
+            &mut self.programs,
+            Arc::clone(&self.readonly_owners),
+        )
+        .map_err(unsupported_reason)?;
+        self.stats.runs_chained += 1;
+        self.start_run(slot, run_id, Arc::new(run), t0)
+    }
+
+    fn start_run(
+        &mut self,
+        slot: Slot,
+        run_id: RunId,
+        run: Arc<Run>,
+        t0: Instant,
+    ) -> Result<(), &'static str> {
         let Some(state) = self.slots.get_mut(&slot) else {
             return Err("gone");
         };
         state.run = Some((run_id, Arc::clone(&run)));
         state.run_id = Some(run_id);
         state.status = SlotStatus::Running;
+        state.next_ordinal = run.ordinal_base;
+        if run.chain.is_some() {
+            state.chain_run = Some((run_id, Arc::clone(&run)));
+        }
         let parent_wait_us = state.first_seen.elapsed().as_micros() as u64;
         let parent_frozen_at_first_set = state.parent_frozen_at_first_set;
         self.stats.runs_started += 1;
@@ -667,6 +890,16 @@ impl Ingest {
                 run: run.clone(),
             })
             .map_err(|_| "coordinator_gone")?;
+        if let Some(meta) = run.provisional_meta() {
+            self.coord_tx
+                .send(CoordMsg::Txs {
+                    run_id,
+                    first: 0,
+                    metas: vec![meta],
+                    t_ingest: Instant::now(),
+                })
+                .map_err(|_| "coordinator_gone")?;
+        }
         let _ = self.cmp_tx.try_send(CmpMsg::RunStart {
             run_id,
             run,
@@ -730,8 +963,12 @@ impl Ingest {
         state.next_ordinal = ordinal;
         if state.input_complete && state.released.is_empty() {
             state.status = SlotStatus::Complete;
-            // The coordinator and comparator hold the run from here on.
+            // The coordinator and comparator hold the run from here on (and, for chaining,
+            // `done_run` until the slot freezes).
             state.run = None;
+            if self.config.chain && run.chain.is_none() {
+                state.done_run = Some(Arc::clone(&run));
+            }
             let _ = self.coord_tx.send(CoordMsg::InputComplete {
                 run_id,
                 total: ordinal,
@@ -744,6 +981,7 @@ fn unsupported_reason(err: solana_runtime::bank::fast_lane::FastLaneUnsupported)
     use solana_runtime::bank::fast_lane::FastLaneUnsupported as U;
     match err {
         U::ParentNotFrozen => "parent_not_frozen",
+        U::UnknownFeeCollector => "unknown_fee_collector",
         U::ChildNotAfterParent => "child_not_after_parent",
         U::Alpenglow => "alpenglow",
         U::AlpenglowMigration => "alpenglow_migration",
@@ -771,7 +1009,7 @@ mod tests {
         solana_message::Message,
         solana_runtime::{
             bank::SlotLeader,
-            genesis_utils::{GenesisConfigInfo, create_genesis_config},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
         },
         solana_signature::Signature,
         solana_signer::Signer,
@@ -786,14 +1024,22 @@ mod tests {
         /// Three batches of entries for slot 2 (parent 1), with their shred ranges.
         batches: Vec<(Vec<Entry>, u32, u32)>,
         sigs: Vec<Signature>,
+        /// The genesis validator (a leader whose vote account is staked).
+        leader: SlotLeader,
+        mint_keypair: Keypair,
     }
 
     fn fixture() -> Fixture {
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
-            ..
-        } = create_genesis_config(1_000_000_000_000);
+            voting_keypair,
+            validator_pubkey,
+        } = create_genesis_config_with_leader(
+            1_000_000_000_000,
+            &Pubkey::new_unique(),
+            1_000_000_000,
+        );
         let (bank0, bank_forks) =
             Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
         let parent =
@@ -863,6 +1109,11 @@ mod tests {
             bank_forks,
             batches,
             sigs,
+            leader: SlotLeader {
+                id: validator_pubkey,
+                vote_address: voting_keypair.pubkey(),
+            },
+            mint_keypair,
         }
     }
 
@@ -1044,5 +1295,125 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn test_chain_on_unfrozen_parent() {
+        use crate::sched::{RunSummary, SchedRun};
+        let f = fixture();
+        // Agave's bank 2: created over the frozen bank 1, not frozen.
+        let bank1 = f.bank_forks.read().unwrap().get(1).unwrap();
+        let bank2 =
+            Bank::new_from_parent_with_bank_forks(&f.bank_forks, bank1.clone(), f.leader, 2);
+        // Slot 3 (parent 2): one batch, last in slot, spending a fresh transfer.
+        let entries = vec![Entry {
+            num_hashes: 1,
+            hash: Hash::default(),
+            transactions: vec![VersionedTransaction::from(Transaction::new(
+                &[&f.mint_keypair],
+                Message::new(
+                    &[system_instruction::transfer(
+                        &f.mint_keypair.pubkey(),
+                        &Pubkey::new_unique(),
+                        3_000_000,
+                    )],
+                    Some(&f.mint_keypair.pubkey()),
+                ),
+                bank1.last_blockhash(),
+            ))],
+        }];
+        let shreds: Vec<Shred> = Shredder::new(3, 2, 0, 0)
+            .unwrap()
+            .make_merkle_shreds_from_entries(
+                &Keypair::new(),
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .filter(Shred::is_data)
+            .collect();
+        let end = shreds.iter().map(|s| s.index()).max().unwrap();
+        f.blockstore.insert_shreds(shreds, true).unwrap();
+
+        let mut config = Config::default();
+        config.chain = true;
+        let (mut ingest, coord_rx, cmp_rx) = ingest(&f, config);
+        // FL runs slot 2 (its parent is frozen).
+        ingest.on_tap(tap(sets(&f)));
+        let (mut run_p, mut next) = (None, 0);
+        let (_, complete) = drain(&coord_rx, &cmp_rx, &mut run_p, &mut next);
+        assert_eq!(complete, Some(f.sigs.len() as u32));
+        let run_p = run_p.unwrap();
+        assert!(ingest.slots[&2].done_run.is_some());
+        // Slot 3's data arrives while FL's run of 2 is still executing: it waits.
+        ingest.on_tap(tap(vec![CompletedDataSetInfo {
+            slot: 3,
+            indices: 0..end + 1,
+        }]));
+        assert!(coord_rx.try_iter().next().is_none(), "no run before 2 completes");
+        // FL's run of 2 completes; the child chains on it.
+        run_p.on_complete(&RunSummary::default());
+        let slot = ingest.complete_rx.try_recv().unwrap();
+        ingest.on_run_complete(slot);
+        assert!(ingest.stats.slots_skipped.is_empty(), "{:?}", ingest.stats.slots_skipped);
+        let msgs: Vec<CoordMsg> = coord_rx.try_iter().collect();
+        let run_c = cmp_rx
+            .try_iter()
+            .find_map(|m| match m {
+                CmpMsg::RunStart { run, .. } => Some(run),
+                _ => None,
+            })
+            .unwrap();
+        let chain = run_c.chain.as_ref().unwrap();
+        assert_eq!(chain.parent_run.slot, 2);
+        assert_eq!(run_c.ordinal_base, 1);
+        assert!(matches!(msgs[0], CoordMsg::NewRun { .. }));
+        match &msgs[1] {
+            CoordMsg::Txs { first: 0, metas, .. } => {
+                assert!(metas.len() == 1 && metas[0].external);
+                assert_eq!(metas[0].locks.len(), 4);
+            }
+            _ => panic!("pseudo-transaction first"),
+        }
+        assert!(matches!(msgs[2], CoordMsg::Txs { first: 1, .. }));
+        assert!(matches!(msgs[3], CoordMsg::InputComplete { total: 2, .. }));
+        assert_eq!(run_c.tx(1).unwrap().signature, entries[0].transactions[0].signatures[0]);
+        assert_eq!(ingest.stats.runs_chained, 1);
+        // Agave freezes 2: the pseudo-transaction completes with the frozen values.
+        bank2.freeze();
+        ingest.on_event(AgaveEvent::Frozen {
+            slot: 2,
+            bank_id: bank2.bank_id(),
+            parent_slot: 1,
+            t: Instant::now(),
+        });
+        let done = coord_rx
+            .try_iter()
+            .find_map(|m| match m {
+                CoordMsg::ExternalDone { k: 0, out, .. } => Some(out),
+                _ => None,
+            })
+            .unwrap();
+        let collector = bank2.fast_lane_collector_id().unwrap();
+        let slot_hashes_id = solana_sdk_ids::sysvar::slot_hashes::id();
+        assert!(done.writes.iter().any(|(k, _)| *k == collector));
+        let (_, slot_hashes) = done
+            .writes
+            .iter()
+            .find(|(k, _)| *k == slot_hashes_id)
+            .unwrap();
+        let expected = solana_account::from_account::<solana_slot_hashes::SlotHashes, _>(
+            slot_hashes,
+        )
+        .unwrap();
+        assert_eq!(expected.get(&2), Some(&bank2.hash()));
+        assert!(chain.resolved.load(Ordering::SeqCst));
+        assert!(ingest.slots[&2].done_run.is_none());
+        assert!(ingest.slots[&3].chain_run.is_none());
+        assert_eq!(ingest.stats.chains_resolved, 1);
     }
 }

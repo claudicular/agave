@@ -83,6 +83,11 @@ pub struct Config {
     /// With dual input, also read and cross-check blockstore batches the ring already
     /// delivered (costs a blockstore read per batch on the ingest thread).
     pub ring_blockstore_check: bool,
+    /// Start a child's run on top of FL's own (complete) run of its parent when agave has
+    /// not frozen the parent yet (phase 2b). The parent's freeze-time writes and the child's
+    /// SlotHashes entry become known when agave freezes the parent; transactions that read
+    /// them re-execute then.
+    pub chain: bool,
 }
 
 impl Default for Config {
@@ -119,6 +124,7 @@ impl Default for Config {
             input_dual: false,
             ring_path: None,
             ring_blockstore_check: false,
+            chain: false,
         }
     }
 }
@@ -251,6 +257,7 @@ impl Config {
             }
             "ring_path" => self.ring_path = Some(PathBuf::from(value)),
             "ring_blockstore_check" => self.ring_blockstore_check = parse_bool(key, value)?,
+            "chain" => self.chain = parse_bool(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())

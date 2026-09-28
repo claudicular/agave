@@ -44,6 +44,8 @@ pub trait SchedRun: Send + Sync + 'static {
     /// Execute incarnation `inc` of transaction `k`, reading through the overlay. Must not
     /// install anything; the executor installs `writes` afterwards.
     fn execute(&self, k: TxIdx, inc: u32) -> ExecOutput;
+    /// Every transaction of the run is FINAL (called once, not for aborted runs).
+    fn on_complete(&self, _summary: &RunSummary) {}
 }
 
 /// Result of one incarnation.
@@ -67,6 +69,9 @@ pub struct TxMeta {
     /// Accounts this transaction always writes (fee payer, nonce, vote account).
     pub certain_writes: Vec<Pubkey>,
     pub is_vote: bool,
+    /// Never dispatched: completed from outside with [`CoordMsg::ExternalDone`] (a chained
+    /// run's "parent freeze" pseudo-transaction).
+    pub external: bool,
 }
 
 pub type RunId = u64;
@@ -96,6 +101,12 @@ pub enum CoordMsg {
         run_id: RunId,
         k: TxIdx,
         inc: u32,
+        out: ExecOutput,
+    },
+    /// Completion of an external transaction; its versions are already installed.
+    ExternalDone {
+        run_id: RunId,
+        k: TxIdx,
         out: ExecOutput,
     },
     Shutdown,
@@ -149,6 +160,7 @@ enum St {
 struct TxS {
     locks: Vec<(u32, bool)>,
     is_vote: bool,
+    external: bool,
     preds: Vec<TxIdx>,
     pending: u32,
     succs: Vec<TxIdx>,
@@ -439,6 +451,24 @@ impl<S: FinalSink> Coordinator<S> {
                 self.drain_worklist();
                 self.maybe_end_run(run_id);
             }
+            CoordMsg::ExternalDone { run_id, k, out } => {
+                let Some(run) = self.runs.get_mut(&run_id) else {
+                    return true;
+                };
+                let Some(tx) = run.txs.get_mut(k as usize) else {
+                    return true;
+                };
+                if !tx.external || tx.state == St::Final || tx.next_inc > 0 {
+                    return true;
+                }
+                tx.state = St::Running;
+                tx.t_first_dispatch.get_or_insert_with(Instant::now);
+                tx.next_inc = 1;
+                run.summary.incarnations += 1;
+                self.on_done(run_id, k, 0, out);
+                self.drain_worklist();
+                self.maybe_end_run(run_id);
+            }
             CoordMsg::Shutdown => return false,
         }
         true
@@ -514,6 +544,7 @@ impl<S: FinalSink> Coordinator<S> {
             run.txs.push(TxS {
                 locks,
                 is_vote: meta.is_vote,
+                external: meta.external,
                 preds,
                 pending,
                 succs: Vec::new(),
@@ -545,7 +576,7 @@ impl<S: FinalSink> Coordinator<S> {
             return;
         };
         let tx = &run.txs[k as usize];
-        if tx.state != St::Waiting {
+        if tx.state != St::Waiting || tx.external {
             return;
         }
         let class = if tx.pending == 0 {
@@ -898,6 +929,7 @@ impl<S: FinalSink> Coordinator<S> {
             if tx.pending == 0 {
                 match tx.state {
                     St::Executed => self.worklist.push((run_id, s)),
+                    St::Waiting if tx.external => {}
                     St::Waiting => {
                         let class = if tx.is_vote { CLASS_VOTE } else { CLASS_NONSPEC };
                         Self::push_ready(&mut self.heap, run, run_id, s, class);
@@ -925,6 +957,7 @@ impl<S: FinalSink> Coordinator<S> {
         if done {
             if let Some(mut run) = self.runs.remove(&run_id) {
                 run.summary.txs = run.txs.len() as u64;
+                run.run.on_complete(&run.summary);
                 self.sink.on_run_end(run_id, run.summary);
             }
         }
