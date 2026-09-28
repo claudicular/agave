@@ -130,6 +130,7 @@ pub struct HandlerContext {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    spin_before_park: Option<Duration>,
 }
 
 impl HandlerContext {
@@ -150,6 +151,7 @@ struct CommonHandlerContext {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    spin_before_park: Option<Duration>,
 }
 
 impl CommonHandlerContext {
@@ -159,6 +161,7 @@ impl CommonHandlerContext {
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            spin_before_park,
         } = self;
 
         HandlerContext {
@@ -167,6 +170,67 @@ impl CommonHandlerContext {
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            spin_before_park,
+        }
+    }
+}
+
+/// Environment variable bounding how long (in microseconds) the scheduler thread and the handler
+/// threads busy-poll their input channels before parking. Unset or `0` keeps the stock behavior
+/// (park immediately). The value is read once per process and capped at
+/// [`MAX_SPIN_BEFORE_PARK`].
+///
+/// Why: every hand-off between the scheduler thread and a handler thread is a crossbeam channel
+/// message. When the receiver is parked, the sender pays a `futex` wake syscall and the receiver
+/// pays the wake-up latency (IPI, idle-state exit, context switch) before it can act. A chain of
+/// conflicting transactions pays two such hand-offs per link (handler -> scheduler to release the
+/// finished task's locks, scheduler -> handler to dispatch the next one), and every task pays one
+/// on submission. Busy-polling for a short window after the last activity keeps both sides awake
+/// through a burst, so the next message is picked up within a cache-line transfer. Only timing and
+/// CPU usage change: the blocking `select_biased!` that follows the poll is unchanged, so message
+/// priority, ordering and all scheduling decisions are exactly as before.
+pub const UNIFIED_SCHEDULER_SPIN_US_ENV: &str = "SOLANA_UNIFIED_SCHEDULER_SPIN_US";
+/// Upper bound for [`UNIFIED_SCHEDULER_SPIN_US_ENV`].
+pub const MAX_SPIN_BEFORE_PARK: Duration = Duration::from_millis(10);
+
+fn parse_spin_before_park(value: &str) -> Option<Duration> {
+    let micros = value.trim().parse::<u64>().ok()?;
+    (micros > 0).then(|| Duration::from_micros(micros).min(MAX_SPIN_BEFORE_PARK))
+}
+
+fn spin_before_park_from_env() -> Option<Duration> {
+    static SPIN_BEFORE_PARK: OnceLock<Option<Duration>> = OnceLock::new();
+    *SPIN_BEFORE_PARK.get_or_init(|| {
+        let spin = std::env::var(UNIFIED_SCHEDULER_SPIN_US_ENV)
+            .ok()
+            .and_then(|value| parse_spin_before_park(&value));
+        info!("unified scheduler spin before park: {spin:?} ({UNIFIED_SCHEDULER_SPIN_US_ENV})");
+        spin
+    })
+}
+
+/// Busy-polls `is_ready` for at most `budget` and returns as soon as it holds.
+///
+/// Callers follow this with their normal blocking `select_biased!`, which then finds the ready
+/// channel without parking. `is_ready` must be side-effect free (e.g. `Receiver::is_empty`).
+#[inline]
+fn spin_until_ready(budget: Duration, mut is_ready: impl FnMut() -> bool) {
+    // Checks between clock reads; keeps `Instant::now()` off the per-iteration path.
+    const POLLS_PER_CLOCK_READ: usize = 64;
+
+    if is_ready() {
+        return;
+    }
+    let started = Instant::now();
+    loop {
+        for _ in 0..POLLS_PER_CLOCK_READ {
+            std::hint::spin_loop();
+            if is_ready() {
+                return;
+            }
+        }
+        if started.elapsed() >= budget {
+            return;
         }
     }
 }
@@ -215,6 +279,7 @@ where
             DEFAULT_MAX_POOLING_DURATION,
             DEFAULT_MAX_USAGE_QUEUE_COUNT,
             DEFAULT_TIMEOUT_DURATION,
+            spin_before_park_from_env(),
         )
     }
 
@@ -246,6 +311,7 @@ where
         max_pooling_duration: Duration,
         max_usage_queue_count: usize,
         timeout_duration: Duration,
+        spin_before_park: Option<Duration>,
     ) -> Arc<Self> {
         let (scheduler_pool_sender, scheduler_pool_receiver) = crossbeam_channel::bounded(1);
 
@@ -350,6 +416,7 @@ where
                 transaction_status_sender,
                 replay_vote_sender,
                 prioritization_fee_cache,
+                spin_before_park,
             },
             block_verification_handler_count,
             weak_self: weak_self.clone(),
@@ -1292,12 +1359,27 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                 //    the new_task_receiver.recv() invocation located at the end of loop.
                 'nonaborted_main_loop: loop {
                     while !is_finished {
+                        let can_receive_unblocked_task =
+                            Self::can_receive_unblocked_task(&state_machine);
+                        // Optionally stay awake for a short while before `select_biased!` parks
+                        // this thread, so that finished tasks (which release locks of chained
+                        // conflicting tasks) and newly-submitted tasks are picked up without a
+                        // futex wake-up. See UNIFIED_SCHEDULER_SPIN_US_ENV.
+                        if let Some(spin_before_park) = handler_context.spin_before_park
+                            && !can_receive_unblocked_task
+                        {
+                            spin_until_ready(spin_before_park, || {
+                                !finished_blocked_task_receiver.is_empty()
+                                    || !new_task_receiver.is_empty()
+                                    || !finished_idle_task_receiver.is_empty()
+                            });
+                        }
                         // ALL recv selectors are eager-evaluated ALWAYS by current crossbeam impl,
                         // which isn't great and is inconsistent with `if`s in the Rust's match
                         // arm. So, eagerly binding the result to a variable unconditionally here
                         // makes no perf. difference...
                         let dummy_unblocked_task_receiver =
-                            dummy_receiver(Self::can_receive_unblocked_task(&state_machine));
+                            dummy_receiver(can_receive_unblocked_task);
 
                         // There's something special called dummy_unblocked_task_receiver here.
                         // This odd pattern was needed to react to newly unblocked tasks from
@@ -1500,6 +1582,17 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             //    thread for all-but-initial sessions.
             move || {
                 loop {
+                    // Optionally stay awake for a short while before `select_biased!` parks this
+                    // thread, so that the next task (typically the next link of a chain of
+                    // conflicting transactions, dispatched right after the task this thread just
+                    // finished) is picked up without a futex wake-up. See
+                    // UNIFIED_SCHEDULER_SPIN_US_ENV.
+                    if let Some(spin_before_park) = handler_context.spin_before_park {
+                        spin_until_ready(spin_before_park, || {
+                            !runnable_task_receiver.for_select().is_empty()
+                                || !runnable_task_receiver.aux_for_select().is_empty()
+                        });
+                    }
                     let (task, sender) = select_biased! {
                         recv(runnable_task_receiver.for_select()) -> message => {
                             let Ok(message) = message else {
@@ -1931,6 +2024,25 @@ mod tests {
                 max_pooling_duration,
                 max_usage_queue_count,
                 timeout_duration,
+                None,
+            )
+        }
+
+        fn new_with_spin_for_verification(
+            block_verification_handler_count: CountOrDefault,
+            spin_before_park: Option<Duration>,
+        ) -> Arc<Self> {
+            Self::do_new(
+                block_verification_handler_count,
+                None,
+                None,
+                None,
+                None,
+                DEFAULT_POOL_CLEANER_INTERVAL,
+                DEFAULT_MAX_POOLING_DURATION,
+                DEFAULT_MAX_USAGE_QUEUE_COUNT,
+                DEFAULT_TIMEOUT_DURATION,
+                spin_before_park,
             )
         }
 
@@ -3432,6 +3544,7 @@ mod tests {
             transaction_status_sender: None,
             replay_vote_sender: None,
             prioritization_fee_cache: None,
+            spin_before_park: None,
         };
 
         let task = SchedulingStateMachine::create_task(tx, 0, &mut |_| {
@@ -3439,5 +3552,160 @@ mod tests {
         });
         DefaultTaskHandler::handle(result, timings, scheduling_context, &task, handler_context);
         assert_matches!(result, Err(TransactionError::AccountLoadedTwice));
+    }
+
+    #[test]
+    fn test_parse_spin_before_park() {
+        assert_eq!(parse_spin_before_park(""), None);
+        assert_eq!(parse_spin_before_park("0"), None);
+        assert_eq!(parse_spin_before_park("-5"), None);
+        assert_eq!(parse_spin_before_park("50us"), None);
+        assert_eq!(
+            parse_spin_before_park(" 50 "),
+            Some(Duration::from_micros(50))
+        );
+        assert_eq!(
+            parse_spin_before_park("999999999"),
+            Some(MAX_SPIN_BEFORE_PARK)
+        );
+    }
+
+    #[test]
+    fn test_spin_until_ready() {
+        // Already ready: returns without consuming the budget.
+        let started = Instant::now();
+        spin_until_ready(Duration::from_secs(60), || true);
+        assert!(started.elapsed() < Duration::from_secs(30));
+
+        // Never ready: gives up once the budget is spent.
+        let budget = Duration::from_millis(2);
+        let started = Instant::now();
+        spin_until_ready(budget, || false);
+        assert!(started.elapsed() >= budget);
+
+        // Becomes ready while spinning: returns at that poll.
+        let mut polls = 0;
+        spin_until_ready(Duration::from_secs(60), || {
+            polls += 1;
+            polls == 1_000
+        });
+        assert_eq!(polls, 1_000);
+    }
+
+    /// Replays the same conflicting and non-conflicting transfers over two sessions (parent and
+    /// child bank, reusing one scheduler) and returns the frozen child bank.
+    fn replay_two_sessions_with_spin(
+        bank: Bank,
+        session_transactions: &[Vec<solana_transaction::Transaction>],
+        spin_before_park: Option<Duration>,
+    ) -> Arc<Bank> {
+        let (mut bank, _bank_forks) = setup_dummy_fork_graph(bank);
+        let pool = DefaultSchedulerPool::new_with_spin_for_verification(Some(3), spin_before_park);
+        let mut task_id: OrderedTaskId = 0;
+        let mut scheduler_id = None;
+        for (session, transactions) in session_transactions.iter().enumerate() {
+            if session > 0 {
+                bank.freeze();
+                bank = Arc::new(Bank::new_from_parent(
+                    bank.clone(),
+                    SlotLeader::default(),
+                    bank.slot().checked_add(1).unwrap(),
+                ));
+            }
+            let context = SchedulingContext::new(bank.clone());
+            let scheduler = pool.take_scheduler(context).unwrap();
+            // The same scheduler (and its possibly spinning threads) serves every session.
+            assert_eq!(*scheduler_id.get_or_insert(scheduler.id()), scheduler.id());
+            for transaction in transactions {
+                let transaction =
+                    RuntimeTransaction::from_transaction_for_tests(transaction.clone());
+                scheduler.schedule_execution(transaction, task_id).unwrap();
+                task_id += 1;
+            }
+            let bank_with_scheduler = BankWithScheduler::new(bank.clone(), Some(scheduler));
+            assert_matches!(
+                bank_with_scheduler.wait_for_completed_scheduler(),
+                Some((Ok(()), _))
+            );
+        }
+        bank.freeze();
+        bank
+    }
+
+    #[test]
+    fn test_scheduler_spin_before_park_preserves_results() {
+        use solana_keypair::Signer as _;
+        agave_logger::setup();
+
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(1_000_000_000_000);
+        let blockhash = genesis_config.hash();
+        let amount = genesis_config.rent.minimum_balance(0);
+        let payers: Vec<_> = (0..4).map(|_| Keypair::new()).collect();
+        let recipients: Vec<_> = (0..8).map(|_| Pubkey::new_unique()).collect();
+
+        // Session 1: fund the payers from the mint (a chain on the mint), then a long chain on a
+        // single hot recipient plus independent transfers.
+        let mut session_1: Vec<_> = payers
+            .iter()
+            .map(|payer| {
+                system_transaction::transfer(
+                    &mint_keypair,
+                    &payer.pubkey(),
+                    1_000_000_000,
+                    blockhash,
+                )
+            })
+            .collect();
+        for i in 0..64u64 {
+            let payer = &payers[(i % payers.len() as u64) as usize];
+            session_1.push(system_transaction::transfer(
+                payer,
+                &recipients[0],
+                amount + i,
+                blockhash,
+            ));
+            session_1.push(system_transaction::transfer(
+                &mint_keypair,
+                &recipients[1 + (i % 7) as usize],
+                amount + i,
+                blockhash,
+            ));
+        }
+        // Session 2 (child bank): more chained and independent transfers.
+        let session_2: Vec<_> = (0..32u64)
+            .map(|i| {
+                system_transaction::transfer(
+                    &payers[(i % payers.len() as u64) as usize],
+                    &recipients[(i % 8) as usize],
+                    amount + 1_000 + i,
+                    blockhash,
+                )
+            })
+            .collect();
+        let sessions = [session_1, session_2];
+
+        let parked =
+            replay_two_sessions_with_spin(Bank::new_for_tests(&genesis_config), &sessions, None);
+        let spinning = replay_two_sessions_with_spin(
+            Bank::new_for_tests(&genesis_config),
+            &sessions,
+            Some(Duration::from_micros(500)),
+        );
+
+        assert_eq!(parked.transaction_count(), 4 + 128 + 32);
+        assert_eq!(spinning.transaction_count(), parked.transaction_count());
+        for pubkey in recipients
+            .iter()
+            .copied()
+            .chain(payers.iter().map(|payer| payer.pubkey()))
+            .chain([mint_keypair.pubkey()])
+        {
+            assert_eq!(spinning.get_balance(&pubkey), parked.get_balance(&pubkey));
+        }
+        assert_eq!(spinning.hash(), parked.hash());
     }
 }
