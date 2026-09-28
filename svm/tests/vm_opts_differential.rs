@@ -947,7 +947,7 @@ fn recorded_mainnet_transactions_identical_with_vm_opts() {
 
 /// Microbenchmark (run in release with `-- --ignored --nocapture` and
 /// `SOLANA_VM_OPTS_REPLAY_DIR`): wall time of executing each recorded transaction (load +
-/// execute, no commit) under each switch setting, interleaved to limit drift. On a non-x86_64
+/// execute, no commit) under each switch setting, alternating settings on every run. On a non-x86_64
 /// host the sBPF interpreter runs instead of the JIT, which inflates the instruction share and
 /// dilutes the relative savings; only the absolute per-transaction deltas are indicative.
 #[test]
@@ -956,30 +956,29 @@ fn bench_recorded_mainnet_transactions() {
     let Some(corpus) = load_replay_corpus() else {
         return;
     };
-    const ROUNDS: usize = 30;
+    const ROUNDS: usize = 40;
     const RUNS_PER_ROUND: usize = 20;
     for case in &corpus.cases {
-        let svms: Vec<_> = SWITCH_SETTINGS
-            .iter()
-            .map(|_| {
-                TestSvm::new(
-                    &case.accounts,
-                    &corpus.feature_set,
-                    corpus.snapshot_slot + 1,
-                    case.clock.epoch,
-                    &corpus.rent,
-                    case.recorded.blockhash,
-                )
-            })
-            .collect();
+        // One SVM for all settings (execution results are not committed), so that settings do
+        // not differ by program-cache instance or memory layout.
+        let svm = TestSvm::new(
+            &case.accounts,
+            &corpus.feature_set,
+            corpus.snapshot_slot + 1,
+            case.clock.epoch,
+            &corpus.rent,
+            case.recorded.blockhash,
+        );
         let transactions = std::slice::from_ref(&case.recorded.transaction);
         let mut samples: Vec<Vec<f64>> = vec![vec![]; SWITCH_SETTINGS.len()];
+        // Settings alternate on every run, so slow drifts (other load, core migration between
+        // performance and efficiency cores) hit all settings alike.
         for round in 0..ROUNDS {
-            for (index, (_, heap, pda, ser, timers)) in SWITCH_SETTINGS.iter().enumerate() {
-                set_switches(*heap, *pda, *ser, *timers);
-                for _ in 0..RUNS_PER_ROUND {
+            for _ in 0..RUNS_PER_ROUND {
+                for (index, (_, heap, pda, ser, timers)) in SWITCH_SETTINGS.iter().enumerate() {
+                    set_switches(*heap, *pda, *ser, *timers);
                     let start = std::time::Instant::now();
-                    let observed = svms[index].run(&corpus.agave_feature_set, transactions);
+                    let observed = svm.run(&corpus.agave_feature_set, transactions);
                     let elapsed = start.elapsed().as_nanos() as f64 / 1000.0;
                     assert!(observed[0].outcome.starts_with("executed: status=Ok"));
                     // The first round warms program caches and pools.
