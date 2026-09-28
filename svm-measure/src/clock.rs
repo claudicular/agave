@@ -295,6 +295,7 @@ mod tests {
         if !cheap_clock_available() {
             return;
         }
+        let initial = cheap_timers_enabled();
         set_cheap_timers(true);
         let cheap = Timestamp::now();
         let instant = Instant::now();
@@ -305,11 +306,12 @@ mod tests {
         // Generous bound: the counter frequency on some machines is only ~24 MHz.
         let ratio = cheap_elapsed / instant_elapsed;
         assert!((0.97..1.03).contains(&ratio), "ratio {ratio}");
-        set_cheap_timers(false);
+        set_cheap_timers(initial);
     }
 
     #[test]
     fn test_timestamp_keeps_its_clock() {
+        let initial = cheap_timers_enabled();
         set_cheap_timers(false);
         let stock = Timestamp::now();
         assert!(!stock.is_cheap());
@@ -323,7 +325,7 @@ mod tests {
             assert!(cheap.elapsed() >= Duration::from_millis(1));
         }
         assert!(stock.elapsed() >= Duration::from_millis(1) || !cheap_clock_available());
-        set_cheap_timers(false);
+        set_cheap_timers(initial);
     }
 
     #[test]
@@ -344,6 +346,7 @@ mod tests {
     #[ignore]
     fn bench_timestamp() {
         const ITERATIONS: u32 = 1_000_000;
+        let initial = cheap_timers_enabled();
         for cheap in [false, true] {
             set_cheap_timers(cheap);
             let start = Instant::now();
@@ -359,6 +362,6 @@ mod tests {
                 if cheap { "on" } else { "off" }
             );
         }
-        set_cheap_timers(false);
+        set_cheap_timers(initial);
     }
 }

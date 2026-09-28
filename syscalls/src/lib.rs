@@ -6085,6 +6085,7 @@ mod tests {
     fn test_program_address_syscalls_pda_cache_differential() {
         use {solana_program_runtime::vm_opts::PDA_CACHE, solana_sbpf::vm::ContextObject};
 
+        let initial = PDA_CACHE.enabled();
         prepare_mockup!(invoke_context, program_id, bpf_loader::id());
         let cost = invoke_context
             .get_execution_cost()
@@ -6123,7 +6124,7 @@ mod tests {
             }
             runs.push(observed);
         }
-        PDA_CACHE.set(false);
+        PDA_CACHE.set(initial);
         assert_eq!(runs[0], runs[1]);
         assert_eq!(runs[0], runs[2]);
     }

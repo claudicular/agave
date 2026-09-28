@@ -744,6 +744,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_heap_zero_opt_is_unobservable() {
+        let initial = vm_opts::HEAP_ZERO_OPT.enabled();
         let stock = {
             vm_opts::HEAP_ZERO_OPT.set(false);
             heap_reuse_sequence()
@@ -752,7 +753,7 @@ pub(crate) mod tests {
             vm_opts::HEAP_ZERO_OPT.set(true);
             heap_reuse_sequence()
         };
-        vm_opts::HEAP_ZERO_OPT.set(false);
+        vm_opts::HEAP_ZERO_OPT.set(initial);
 
         // Every read-back of a previously dirtied heap sees zeros...
         for (index, observed) in stock.iter().enumerate() {
@@ -838,6 +839,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_ser_pool_is_unobservable() {
+        let initial = vm_opts::SER_POOL.enabled();
         let stock = {
             vm_opts::SER_POOL.set(false);
             input_hash_sequence()
@@ -851,7 +853,7 @@ pub(crate) mod tests {
             assert_eq!(first, second);
             first
         };
-        vm_opts::SER_POOL.set(false);
+        vm_opts::SER_POOL.set(initial);
         for (observed, accounts) in &stock {
             assert_eq!(observed.result, Ok(()), "{observed:?}");
             // The first instruction account (index 1) holds the input hash, then its original

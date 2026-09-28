@@ -277,6 +277,7 @@ mod tests {
     fn test_create_program_address_switch() {
         // Both settings of the switch give identical results (the switch is process-global,
         // and correct either way, so flipping it concurrently with other tests is harmless).
+        let initial = vm_opts::PDA_CACHE.enabled();
         let program_id = Pubkey::new_unique();
         for bump in 0..=u8::MAX {
             let bump = [bump];
@@ -288,6 +289,7 @@ mod tests {
             vm_opts::PDA_CACHE.set(false);
             assert_eq!(create_program_address(&seeds, &program_id), expected);
         }
+        vm_opts::PDA_CACHE.set(initial);
     }
 
     #[test]

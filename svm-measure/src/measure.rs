@@ -97,6 +97,7 @@ mod tests {
     fn test_measure_with_cheap_timers() {
         // Same semantics with the cycle-counter clock (when this machine has one).
         let test_duration = Duration::from_millis(20);
+        let initial = crate::clock::cheap_timers_enabled();
         crate::clock::set_cheap_timers(true);
         let mut measure = Measure::start("test");
         crate::clock::set_cheap_timers(false);
@@ -109,7 +110,7 @@ mod tests {
         crate::clock::set_cheap_timers(true);
         let (_, us) = crate::measure_us!(sleep(test_duration));
         let (_, duration) = crate::meas_dur!(sleep(test_duration));
-        crate::clock::set_cheap_timers(false);
+        crate::clock::set_cheap_timers(initial);
         assert!(us >= 19_000, "{us}");
         assert!(duration >= Duration::from_millis(19), "{duration:?}");
     }
