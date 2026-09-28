@@ -115,8 +115,29 @@ impl Accounts {
             .map(|(account, _rent)| account)
             .ok_or(AddressLookupError::LookupTableAccountNotFound)?;
 
+        Self::lookup_table_addresses_into(
+            &table_account,
+            ancestors.max_slot(),
+            address_table_lookup,
+            slot_hashes,
+            loaded_addresses,
+        )
+    }
+
+    /// Resolve `address_table_lookup` against an already-loaded table account as of
+    /// `current_slot`, appending to `loaded_addresses` and returning the table's
+    /// deactivation slot. This is the pure part of
+    /// [`Self::load_lookup_table_addresses_into`], which passes `ancestors.max_slot()`.
+    /// The fast lane uses it to resolve a child slot's lookups against its frozen parent's
+    /// state: `current_slot` is the child slot, and `slot_hashes` the child's SlotHashes.
+    pub fn lookup_table_addresses_into(
+        table_account: &AccountSharedData,
+        current_slot: Slot,
+        address_table_lookup: SVMMessageAddressTableLookup,
+        slot_hashes: &SlotHashes,
+        loaded_addresses: &mut LoadedAddresses,
+    ) -> std::result::Result<Slot, AddressLookupError> {
         if table_account.owner() == &address_lookup_table::program::id() {
-            let current_slot = ancestors.max_slot();
             let lookup_table = AddressLookupTable::deserialize(table_account.data())
                 .map_err(|_ix_err| AddressLookupError::InvalidAccountData)?;
 

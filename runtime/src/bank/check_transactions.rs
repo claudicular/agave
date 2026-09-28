@@ -169,39 +169,13 @@ impl Bank {
             .zip(lock_results)
             .map(|(tx, lock_res)| match lock_res {
                 Ok(()) => {
-                    let compute_budget_and_limits = tx
-                        .borrow()
-                        .transaction_configuration(feature_set)
-                        .map(|config| {
-                            let fee_details = calculate_fee_details(
-                                tx.borrow(),
-                                self.fee_structure.lamports_per_signature,
-                                config.priority_fee_lamports,
-                                fee_features,
-                            );
-                            if let Some(compute_budget) = self.compute_budget {
-                                // This block of code is only necessary to retain legacy behavior of the code.
-                                // It should be removed along with the change to favor transaction's compute budget limits
-                                // over configured compute budget in Bank.
-                                compute_budget.get_compute_budget_and_limits(
-                                    config.loaded_accounts_data_size_limit,
-                                    fee_details,
-                                )
-                            } else {
-                                SVMTransactionExecutionAndFeeBudgetLimits {
-                                    budget: SVMTransactionExecutionBudget {
-                                        compute_unit_limit: u64::from(config.compute_unit_limit),
-                                        heap_size: config.updated_heap_bytes,
-                                        ..SVMTransactionExecutionBudget::new_with_defaults(
-                                            raise_cpi_limit,
-                                        )
-                                    },
-                                    loaded_accounts_data_size_limit: config
-                                        .loaded_accounts_data_size_limit,
-                                    fee_details,
-                                }
-                            }
-                        })
+                    let compute_budget_and_limits = self
+                        .compute_budget_and_limits(
+                            tx.borrow(),
+                            feature_set,
+                            fee_features,
+                            raise_cpi_limit,
+                        )
                         .inspect_err(|_err| {
                             error_counters.invalid_compute_budget += 1;
                         })?;
@@ -224,6 +198,45 @@ impl Bank {
                 Err(e) => Err(e),
             })
             .collect()
+    }
+
+    /// The compute budget, loaded-accounts limit and fee of one transaction, exactly as
+    /// `check_age_and_compute_budget_limits` computes them. Pure: reads only this bank's
+    /// fee structure and configured compute budget.
+    pub(super) fn compute_budget_and_limits(
+        &self,
+        tx: &impl TransactionWithMeta,
+        feature_set: &FeatureSet,
+        fee_features: solana_fee::FeeFeatures,
+        raise_cpi_limit: bool,
+    ) -> TransactionResult<SVMTransactionExecutionAndFeeBudgetLimits> {
+        tx.transaction_configuration(feature_set).map(|config| {
+            let fee_details = calculate_fee_details(
+                tx,
+                self.fee_structure.lamports_per_signature,
+                config.priority_fee_lamports,
+                fee_features,
+            );
+            if let Some(compute_budget) = self.compute_budget {
+                // This block of code is only necessary to retain legacy behavior of the code.
+                // It should be removed along with the change to favor transaction's compute budget limits
+                // over configured compute budget in Bank.
+                compute_budget.get_compute_budget_and_limits(
+                    config.loaded_accounts_data_size_limit,
+                    fee_details,
+                )
+            } else {
+                SVMTransactionExecutionAndFeeBudgetLimits {
+                    budget: SVMTransactionExecutionBudget {
+                        compute_unit_limit: u64::from(config.compute_unit_limit),
+                        heap_size: config.updated_heap_bytes,
+                        ..SVMTransactionExecutionBudget::new_with_defaults(raise_cpi_limit)
+                    },
+                    loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+                    fee_details,
+                }
+            }
+        })
     }
 
     fn check_transaction_age(
@@ -262,13 +275,35 @@ impl Bank {
         strict_nonce_size_check: bool,
         strict_nonce_authority_check: bool,
     ) -> Option<(Pubkey, u64)> {
+        Self::check_nonce_transaction_validity_with(
+            message,
+            next_durable_nonce,
+            strict_nonce_size_check,
+            strict_nonce_authority_check,
+            |nonce_address| self.get_account_with_fixed_root(nonce_address),
+        )
+    }
+
+    /// [`Self::check_nonce_transaction_validity`] with the nonce account supplied by
+    /// `load_nonce_account` instead of this bank's state. The fast lane reads it from its
+    /// multi-version overlay.
+    pub(super) fn check_nonce_transaction_validity_with(
+        message: &impl SVMMessage,
+        next_durable_nonce: &DurableNonce,
+        strict_nonce_size_check: bool,
+        strict_nonce_authority_check: bool,
+        load_nonce_account: impl FnOnce(&Pubkey) -> Option<solana_account::AccountSharedData>,
+    ) -> Option<(Pubkey, u64)> {
         let nonce_is_advanceable = message.recent_blockhash() != next_durable_nonce.as_hash();
         if !nonce_is_advanceable {
             return None;
         }
 
-        let (nonce_address, nonce_data) =
-            self.load_message_nonce_data(message, strict_nonce_size_check)?;
+        let (nonce_address, nonce_data) = Self::load_message_nonce_data_with(
+            message,
+            strict_nonce_size_check,
+            load_nonce_account,
+        )?;
 
         if strict_nonce_authority_check
             && !message
@@ -288,8 +323,18 @@ impl Bank {
         message: &impl SVMMessage,
         strict_nonce_size_check: bool,
     ) -> Option<(Pubkey, NonceData)> {
+        Self::load_message_nonce_data_with(message, strict_nonce_size_check, |nonce_address| {
+            self.get_account_with_fixed_root(nonce_address)
+        })
+    }
+
+    fn load_message_nonce_data_with(
+        message: &impl SVMMessage,
+        strict_nonce_size_check: bool,
+        load_nonce_account: impl FnOnce(&Pubkey) -> Option<solana_account::AccountSharedData>,
+    ) -> Option<(Pubkey, NonceData)> {
         let nonce_address = message.get_durable_nonce()?;
-        let nonce_account = self.get_account_with_fixed_root(nonce_address)?;
+        let nonce_account = load_nonce_account(nonce_address)?;
         if strict_nonce_size_check && nonce_account.data().len() != NonceState::size() {
             return None;
         }

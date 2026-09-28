@@ -361,6 +361,12 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         self.execution_cost = cost;
     }
 
+    /// The base execution cost set by [`Self::set_execution_cost`]. Read-only accessor used
+    /// by the fast lane to configure its private processor identically to a bank's.
+    pub fn execution_cost(&self) -> SVMTransactionExecutionCost {
+        self.execution_cost
+    }
+
     /// Updates the environments when entering a new Epoch.
     pub fn set_program_runtime_environment(&mut self, new_environment: ProgramRuntimeEnvironment) {
         // First update the environment only if it is different
