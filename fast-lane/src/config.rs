@@ -423,4 +423,92 @@ mod tests {
         assert!(Config::parse("out_ring = true\nout_token = false").is_err());
         assert!(Config::parse("out_ring = true\nout_ring_mb = 0").is_err());
     }
+
+    /// The staged FRA config for the rebase build (`fast_lane.rebase.toml`) parses.
+    #[test]
+    fn test_parse_fra_rebase_config() {
+        let config = Config::parse(FRA_REBASE_TOML).unwrap();
+        assert!(config.rebase && config.eager_reexec && config.speculation);
+        assert_eq!(config.workers, 8);
+        assert_eq!(config.theta, 0.5);
+        assert!(config.chain && config.out_ring && config.input_dual);
+        assert_eq!(config.mem_cap_mb, 4096);
+        assert!(!Config::parse("").unwrap().rebase);
+        assert!(Config::parse("rebase = maybe").is_err());
+    }
+
+    const FRA_REBASE_TOML: &str = r#"
+# Fast lane shadow #4 (FRA): the live shadow #3 config (/home/sol/fast_lane.toml, 2026-09-28
+# 15:25Z) + `rebase = true` (delta-rebase value prediction for fee-payer / fee-sink chains,
+# DESIGN §19). Nothing else changed.
+# Binary: /home/sol/fl-bin/agave-validator-75936fc3f5 (fast-lane 75936fc3f5 = c3f25234d5 + rebase).
+# The older binaries reject the `rebase` key (unknown keys fail the config parse): deploy
+# binary and config together. Runtime A/B without restart: `rebase=off` / `rebase=on` in the
+# control file.
+# Install: copy to /home/sol/fast_lane.toml (validator.sh exports AGAVE_FAST_LANE_CONFIG).
+# Layout (48 logical CPUs, SMT sibling of N is N+24):
+#   agave shared threads 0-7,24-31 · FL sched 8, ingest 9 (siblings 32,33 idle)
+#   FL workers 10-14 + 36-38 (K=8; siblings 34,35 idle) · replay handlers 15-21, scheduler 22 (siblings idle)
+#   geyserbench sampler 23 · agave receive chain 47
+# Input: dual (proxy shared-memory ring v2 + blockstore), ring from proxy fl-ring-v2 7311fee.
+# Runtime control: echo disable|enable|theta=X > /home/sol/fast_lane/fast_lane.ctl
+
+enabled = true
+
+workers = 8
+worker_cores = [10, 11, 12, 13, 14, 36, 37, 38]
+sched_core = 8
+ingest_core = 9
+shared_cores = [0-7, 24-31]
+nice = 5
+aux_nice = 10
+spin_us = 1000000
+worker_spin_us = 1000000
+ingest_spin_us = 1000000
+
+input = dual
+ring_path = "/dev/shm/shredstream.v2.ring"
+
+# Phase 2b: start a slot on FL's own complete run of its parent while agave has not frozen
+# the parent yet (P's freeze-time writes and C's SlotHashes are resolved when agave freezes P).
+# Set false to get shadow #2 behaviour with the new binary.
+chain = true
+
+# Phase 3: publish every FINAL transaction's account updates into a shared-memory ring for
+# consumers (geyserbench `fastlane_ring`, later the bot). Accounts: the transaction's
+# grouped-notification accounts owned by SPL Token / Token-2022 (`out_token`) or by an
+# `out_owners` program; transactions without one are not published. Written by the
+# coordinator (core 8) at FINAL; cost reported in `fast_lane_out` log lines every 10 s.
+out_ring = true
+out_ring_path = "/dev/shm/fastlane.out.ring"
+out_ring_mb = 256
+out_token = true
+out_owners = []
+
+speculation = true
+theta = 0.5
+max_incarnations = 3
+eager_reexec = true
+# Delta rebase (needs eager_reexec): predicted outputs for chains through fee payers and fee
+# sinks, and rebase-aware speculation gating. Exactness does not depend on it (predictions are
+# never final or emitted). Runtime toggle: rebase=on|off in the control file.
+rebase = true
+
+parent_wait_ms = 300
+max_runs = 4
+# Hard cap on FL-held memory (overlays, comparator frames/records, queues, pending entries,
+# hints; `mem_*` in fast_lane_summary). Above it FL disables itself and releases everything
+# (stays off until `echo enable > fast_lane.ctl`); new runs stop at half of it. Normal
+# operation is expected well below 4 GiB; lower it once `mem_total_mb` has been observed.
+mem_cap_mb = 4096
+
+comparator = true
+export_dir = "/home/sol/fast_lane"
+control_file = "/home/sol/fast_lane/fast_lane.ctl"
+export_file_mb = 256
+export_files = 8
+export_votes = false
+mismatch_samples_per_min = 20
+summary_interval_s = 10
+"#;
 }

@@ -204,6 +204,23 @@ mod tests {
     }
 
     #[test]
+    fn test_rebase_control_command() {
+        let dir = std::env::temp_dir().join(format!("fl_ctl_rebase_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fast_lane.ctl");
+        let t = Tunables::new(true, true, 0.5, 3).with_rebase(true);
+        assert!(t.rebase());
+        let mut last = None;
+        std::fs::write(&path, "rebase=off\n").unwrap();
+        poll_control_file(&path, &mut last, &t, false);
+        assert!(!t.rebase());
+        std::fs::write(&path, "rebase = on\n").unwrap();
+        poll_control_file(&path, &mut last, &t, false);
+        assert!(t.rebase());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_tunables() {
         let t = Tunables::new(true, true, 0.2, 3);
         assert_eq!(t.theta(), 0.2);
