@@ -700,6 +700,7 @@ pub struct Validator {
     gossip_service: GossipService,
     serve_repair_service: ServeRepairService,
     completed_data_sets_service: Option<CompletedDataSetsService>,
+    fast_lane: Option<agave_fast_lane::FastLaneHandle>,
     snapshot_packager_service: SnapshotPackagerService,
     poh_recorder: Arc<RwLock<PohRecorder>>,
     poh_service: PohService,
@@ -921,6 +922,13 @@ impl Validator {
         } else {
             (None, None, None, None, None, None)
         };
+
+        // Fast lane (off unless AGAVE_FAST_LANE_CONFIG enables it): tee the notifiers it
+        // observes. When disabled these return their inputs unchanged.
+        let fast_lane = agave_fast_lane::FastLane::prepare_from_env();
+        let accounts_update_notifier = fast_lane.tee_accounts_update(accounts_update_notifier);
+        let block_metadata_notifier = fast_lane.tee_block_metadata(block_metadata_notifier);
+        let slot_status_notifier = fast_lane.tee_slot_status(slot_status_notifier);
 
         info!(
             "Geyser plugin: accounts_update_notifier: {}, transaction_notifier: {}, \
@@ -1432,6 +1440,13 @@ impl Validator {
                 (None, None)
             };
 
+        let fast_lane = fast_lane.start(agave_fast_lane::FastLaneDeps {
+            bank_forks: bank_forks.clone(),
+            blockstore: blockstore.clone(),
+            exit: exit.clone(),
+            ledger_path: ledger_path.to_path_buf(),
+        });
+
         let ip_echo_server = match node.sockets.ip_echo {
             None => None,
             Some(tcp_listener) => Some(solana_net_utils::ip_echo_server(
@@ -1870,6 +1885,7 @@ impl Validator {
             sample_performance_service,
             snapshot_packager_service,
             completed_data_sets_service,
+            fast_lane,
             tpu,
             tvu,
             poh_service,
@@ -2057,6 +2073,9 @@ impl Validator {
             completed_data_sets_service
                 .join()
                 .expect("completed_data_sets_service");
+        }
+        if let Some(fast_lane) = self.fast_lane {
+            fast_lane.join();
         }
         if let Some(ip_echo_server) = self.ip_echo_server {
             ip_echo_server.shutdown_background();

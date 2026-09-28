@@ -265,6 +265,9 @@ where
         metrics,
     )?;
 
+    // Fast lane (no-op unless enabled): observe the data sets replay is about to read.
+    agave_fast_lane::tap::on_completed_data_sets(&completed_data_sets);
+
     if let Some(sender) = completed_data_sets_sender {
         sender.try_send(completed_data_sets)?;
     }
