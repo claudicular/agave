@@ -68,8 +68,9 @@ pub fn run_contained<R>(what: &str, f: impl FnOnce() -> R) -> Option<R> {
 pub enum Placement {
     /// Pin to these logical CPUs.
     Pinned(Vec<usize>),
-    /// Unpinned (inherits the spawner's mask) at this nice value.
-    Niced(i32),
+    /// Unpinned at this nice value: restricted to `cpus` if non-empty, else the spawner's
+    /// mask is inherited.
+    Niced(i32, Vec<usize>),
 }
 
 #[cfg(target_os = "linux")]
@@ -85,7 +86,17 @@ fn apply_placement(placement: &Placement) {
                 Err(err) => log::warn!("fast lane: pinning to {cpus:?} failed: {err}"),
             }
         }
-        Placement::Niced(nice) => {
+        Placement::Niced(nice, cpus) => {
+            if !cpus.is_empty() {
+                let ids: Result<Vec<_>, _> = cpus
+                    .iter()
+                    .map(|cpu| agave_cpu_utils::CpuId::new(*cpu))
+                    .collect();
+                if let Err(err) = ids.and_then(|ids| agave_cpu_utils::set_cpu_affinity(None, ids))
+                {
+                    log::warn!("fast lane: restricting to {cpus:?} failed: {err}");
+                }
+            }
             // Per-thread nice: on Linux setpriority(PRIO_PROCESS, tid) targets one task.
             // SAFETY: plain syscalls with scalar arguments.
             let rc = unsafe {

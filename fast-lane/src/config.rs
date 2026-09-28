@@ -23,6 +23,10 @@ pub struct Config {
     pub sched_core: Option<usize>,
     /// Core for the ingest thread. None = unpinned (niced).
     pub ingest_core: Option<usize>,
+    /// CPU set applied to every FL thread that has no dedicated core (coordinator/ingest when
+    /// unpinned, comparator, control, and workers when `worker_cores` is empty). Empty =
+    /// inherit the spawning thread's mask. Accepts ranges: `[0-11, 24-35]`.
+    pub shared_cores: Vec<usize>,
     /// Nice value for unpinned latency threads (coordinator, ingest, workers).
     pub nice: i32,
     /// Nice value for auxiliary threads (comparator, control).
@@ -76,6 +80,7 @@ impl Default for Config {
             worker_cores: Vec::new(),
             sched_core: None,
             ingest_core: None,
+            shared_cores: Vec::new(),
             nice: 5,
             aux_nice: 10,
             spin_us: 50,
@@ -128,12 +133,21 @@ fn parse_list(key: &str, value: &str) -> Result<Vec<usize>, ConfigError> {
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
         .ok_or_else(|| ConfigError(format!("{key} must be a [list]")))?;
-    inner
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| parse_scalar::<usize>(key, s))
-        .collect()
+    let mut out = Vec::new();
+    for item in inner.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match item.split_once('-') {
+            Some((lo, hi)) => {
+                let lo = parse_scalar::<usize>(key, lo.trim())?;
+                let hi = parse_scalar::<usize>(key, hi.trim())?;
+                if lo > hi || hi >= 1024 {
+                    return Err(ConfigError(format!("bad range in {key}: {item}")));
+                }
+                out.extend(lo..=hi);
+            }
+            None => out.push(parse_scalar::<usize>(key, item)?),
+        }
+    }
+    Ok(out)
 }
 
 fn unquote(value: &str) -> &str {
@@ -182,6 +196,7 @@ impl Config {
                     Some(parse_scalar(key, value)?)
                 }
             }
+            "shared_cores" => self.shared_cores = parse_list(key, value)?,
             "nice" => self.nice = parse_scalar(key, value)?,
             "aux_nice" => self.aux_nice = parse_scalar(key, value)?,
             "spin_us" => self.spin_us = parse_scalar(key, value)?,
@@ -254,6 +269,7 @@ mod tests {
             enabled = true
             workers = 3
             worker_cores = [23, 47, 22]
+            shared_cores = [0-2, 5]
             sched_core = none
             theta = 0.5
             speculation = off
@@ -263,6 +279,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.workers, 3);
         assert_eq!(config.worker_cores, vec![23, 47, 22]);
+        assert_eq!(config.shared_cores, vec![0, 1, 2, 5]);
         assert_eq!(config.sched_core, None);
         assert_eq!(config.theta, 0.5);
         assert!(!config.speculation);

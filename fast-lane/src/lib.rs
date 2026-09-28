@@ -218,10 +218,10 @@ impl FastLane {
     }
 }
 
-fn placement(core: Option<usize>, nice: i32) -> Placement {
+fn placement(core: Option<usize>, nice: i32, shared: &[usize]) -> Placement {
     match core {
         Some(core) => Placement::Pinned(vec![core]),
-        None => Placement::Niced(nice),
+        None => Placement::Niced(nice, shared.to_vec()),
     }
 }
 
@@ -269,7 +269,7 @@ fn start_threads(
     // Executors.
     for i in 0..config.workers {
         let place = if config.worker_cores.is_empty() {
-            Placement::Niced(config.nice)
+            Placement::Niced(config.nice, config.shared_cores.clone())
         } else {
             Placement::Pinned(vec![config.worker_cores[i % config.worker_cores.len()]])
         };
@@ -298,7 +298,7 @@ fn start_threads(
         threads.push(
             safety::spawn(
                 "solFlSched",
-                placement(config.sched_core, config.nice),
+                placement(config.sched_core, config.nice, &config.shared_cores),
                 move || {
                     let mut coordinator =
                         Coordinator::new(workers, task_tx, tunables, hint_alpha, sink);
@@ -328,7 +328,7 @@ fn start_threads(
         threads.push(
             safety::spawn(
                 "solFlIngest",
-                placement(config.ingest_core, config.nice),
+                placement(config.ingest_core, config.nice, &config.shared_cores),
                 move || {
                     let mut ingest =
                         Ingest::new(deps_ingest, config_c, coord_tx, cmp_tx, readonly_owners);
@@ -344,7 +344,7 @@ fn start_threads(
         let bank_forks = deps.bank_forks.clone();
         let shared_c = shared.clone();
         threads.push(
-            safety::spawn("solFlCmp", Placement::Niced(config.aux_nice), move || {
+            safety::spawn("solFlCmp", Placement::Niced(config.aux_nice, config.shared_cores.clone()), move || {
                 let mut comparator =
                     Comparator::new(config_c, bank_forks, export_dir, sink_drops);
                 comparator.tap_stats = Some(shared_c);
@@ -362,21 +362,31 @@ fn start_threads(
         let allow_panic = config.allow_panic_command;
         let tunables = tunables.clone();
         threads.push(
-            safety::spawn("solFlCtl", Placement::Niced(config.aux_nice), move || {
-                let mut last = None;
-                loop {
-                    if exit_fl.load(Ordering::Relaxed) || exit_validator.load(Ordering::Relaxed) {
-                        exit_fl.store(true, Ordering::SeqCst);
-                        control::set_active(false);
-                        return;
+            safety::spawn(
+                "solFlCtl",
+                Placement::Niced(config.aux_nice, config.shared_cores.clone()),
+                move || {
+                    let mut last = None;
+                    loop {
+                        if exit_fl.load(Ordering::Relaxed)
+                            || exit_validator.load(Ordering::Relaxed)
+                        {
+                            exit_fl.store(true, Ordering::SeqCst);
+                            control::set_active(false);
+                            return;
+                        }
+                        if control::poll_control_file(
+                            &control_file,
+                            &mut last,
+                            &tunables,
+                            allow_panic,
+                        ) {
+                            panic!("fast lane: panic drill requested by control file");
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
                     }
-                    if control::poll_control_file(&control_file, &mut last, &tunables, allow_panic)
-                    {
-                        panic!("fast lane: panic drill requested by control file");
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-            })
+                },
+            )
             .map_err(spawn_err)?,
         );
     }
