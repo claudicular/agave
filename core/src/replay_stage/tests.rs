@@ -169,6 +169,7 @@ impl ProcessActiveBanksContext {
             replay_mode: ForkReplayMode::Serial,
             replay_verification_worker_pool,
             migration_status,
+            remember_chained_block_id_pass: false,
         }
     }
 }
@@ -7123,3 +7124,492 @@ fn test_process_duplicate_confirmed_slots(same_batch: bool) {
         &mut PurgeRepairSlotCounter::default(),
     );
 }
+
+/// Records bank creations (from `generate_new_bank_forks`) as they happen.
+struct CreatedBankRecorder {
+    events: Arc<Mutex<Vec<(&'static str, Slot)>>>,
+}
+
+impl SlotStatusNotifierInterface for CreatedBankRecorder {
+    fn notify_slot_confirmed(&self, _slot: Slot, _parent: Option<Slot>, _bank_id: BankId) {}
+
+    fn notify_slot_processed(&self, _slot: Slot, _parent: Option<Slot>, _bank_id: BankId) {}
+
+    fn notify_slot_rooted(&self, _slot: Slot, _parent: Option<Slot>, _bank_id: BankId) {}
+
+    fn notify_first_shred_received(&self, _slot: Slot) {}
+
+    fn notify_completed(&self, _slot: Slot) {}
+
+    fn notify_created_bank(&self, slot: Slot, _parent: Slot, _bank_id: BankId) {
+        self.events.lock().unwrap().push(("created", slot));
+    }
+
+    fn notify_slot_dead(&self, slot: Slot, _parent: Slot, _error: String) {
+        self.events.lock().unwrap().push(("dead", slot));
+    }
+}
+
+/// One slot of the fast-pickup scenario: its parent and the transactions of its only
+/// transaction entry.
+struct FastPickupTestSlot {
+    slot: Slot,
+    parent: Slot,
+    transactions: Vec<Transaction>,
+}
+
+/// A full slot's entries starting from `start_hash`: one transaction entry, then enough ticks to
+/// reach the end of `slot` from the end of `parent`.
+fn fast_pickup_test_entries(
+    genesis_config: &solana_genesis_config::GenesisConfig,
+    start_hash: Hash,
+    slot: &FastPickupTestSlot,
+) -> Vec<Entry> {
+    let hashes_per_tick = genesis_config.poh_config.hashes_per_tick.unwrap_or(1);
+    let num_ticks = (slot.slot - slot.parent) * genesis_config.ticks_per_slot;
+    let tx_entry = entry::next_entry(
+        &start_hash,
+        hashes_per_tick.saturating_sub(1).max(1),
+        slot.transactions.clone(),
+    );
+    let first_tick = entry::next_entry(&tx_entry.hash, 1, vec![]);
+    let prev_hash = first_tick.hash;
+    let mut entries = vec![tx_entry, first_tick];
+    entries.extend(entry::create_ticks(
+        num_ticks - 1,
+        hashes_per_tick,
+        prev_hash,
+    ));
+    entries
+}
+
+/// Replay state for simulating the replay loop's replay step in the stock or the fast pickup
+/// order, with shreds arriving in bursts.
+struct FastPickupTestReplay {
+    bank_forks: Arc<RwLock<BankForks>>,
+    blockstore: Arc<Blockstore>,
+    _ledger_path: tempfile::TempDir,
+    leader_schedule_cache: LeaderScheduleCache,
+    progress: ProgressMap,
+    process_active_banks_context: ProcessActiveBanksContext,
+    slot_status_notifier: Option<SlotStatusNotifier>,
+    events: Arc<Mutex<Vec<(&'static str, Slot)>>>,
+    /// Per slot, the entries not inserted yet and the chaining state of those inserted.
+    pending_entries: HashMap<Slot, Vec<Entry>>,
+    next_shred_index: HashMap<Slot, u32>,
+    chained_merkle_root: HashMap<Slot, Hash>,
+    last_entry_hashes: HashMap<Slot, Hash>,
+    shred_keypair: Keypair,
+    finalization_cert_sender: Sender<SmallVec<[Certificate; 2]>>,
+    _replay_vote_receiver: Receiver<ReplayVoteMessage>,
+}
+
+static FAST_PICKUP_TEST_PUBKEY: Pubkey = Pubkey::new_from_array([9; 32]);
+
+impl FastPickupTestReplay {
+    fn new(
+        genesis_config: &solana_genesis_config::GenesisConfig,
+        remember_chained_block_id_pass: bool,
+    ) -> Self {
+        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(genesis_config);
+        // Deterministic ticks (`fill_bank_with_ticks_for_tests` uses random hashes), so two runs
+        // produce identical bank hashes.
+        let mut tick_hash = Hash::default();
+        while bank0.tick_height() < bank0.max_tick_height() {
+            tick_hash = hash(tick_hash.as_ref());
+            bank0.register_tick_for_test(&tick_hash);
+        }
+        bank0.freeze();
+        bank_forks.write().unwrap().install_scheduler_pool(
+            DefaultSchedulerPool::new_for_verification(None, None, None, None, None),
+        );
+        let ledger_path = tempdir().unwrap();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank0);
+        let mut progress = ProgressMap::default();
+        progress.insert(
+            0,
+            ForkProgress::new(bank0.last_blockhash(), None, None, 0, 0, None),
+        );
+        let (replay_vote_sender, replay_vote_receiver) = crossbeam_channel::unbounded();
+        let mut process_active_banks_context = ProcessActiveBanksContext::new_for_tests(
+            bank_forks.clone(),
+            blockstore.clone(),
+            replay_vote_sender,
+        );
+        process_active_banks_context.remember_chained_block_id_pass =
+            remember_chained_block_id_pass;
+        let events = Arc::new(Mutex::new(vec![]));
+        let slot_status_notifier: Option<SlotStatusNotifier> =
+            Some(Arc::new(RwLock::new(CreatedBankRecorder {
+                events: events.clone(),
+            })));
+        let (finalization_cert_sender, _) = crossbeam_channel::unbounded();
+        Self {
+            bank_forks,
+            blockstore,
+            _ledger_path: ledger_path,
+            leader_schedule_cache,
+            progress,
+            process_active_banks_context,
+            slot_status_notifier,
+            events,
+            pending_entries: HashMap::new(),
+            next_shred_index: HashMap::new(),
+            chained_merkle_root: HashMap::new(),
+            last_entry_hashes: HashMap::from([(0, bank0.last_blockhash())]),
+            shred_keypair: Keypair::new_from_array([7; 32]),
+            finalization_cert_sender,
+            _replay_vote_receiver: replay_vote_receiver,
+        }
+    }
+
+    /// Inserts the next `num_entries` entries of `slot` (all remaining ones when `None`) as one
+    /// data-complete range, chained to what was inserted before.
+    fn insert_slot(
+        &mut self,
+        genesis_config: &solana_genesis_config::GenesisConfig,
+        slot: &FastPickupTestSlot,
+        num_entries: Option<usize>,
+    ) {
+        if !self.pending_entries.contains_key(&slot.slot) {
+            let entries = fast_pickup_test_entries(
+                genesis_config,
+                self.last_entry_hashes[&slot.parent],
+                slot,
+            );
+            self.last_entry_hashes
+                .insert(slot.slot, entries.last().unwrap().hash);
+            let chained_merkle_root = self
+                .blockstore
+                .get_last_shred_merkle_root(slot.parent)
+                .unwrap()
+                .unwrap_or_default();
+            self.chained_merkle_root
+                .insert(slot.slot, chained_merkle_root);
+            self.pending_entries.insert(slot.slot, entries);
+        }
+        let pending = self.pending_entries.get_mut(&slot.slot).unwrap();
+        let entries: Vec<_> = pending
+            .drain(..num_entries.unwrap_or(pending.len()))
+            .collect();
+        let is_last_in_slot = pending.is_empty();
+        let next_shred_index = *self.next_shred_index.get(&slot.slot).unwrap_or(&0);
+        let shreds: Vec<Shred> = Shredder::new(slot.slot, slot.parent, 0, 0)
+            .unwrap()
+            .make_merkle_shreds_from_entries(
+                &self.shred_keypair,
+                &entries,
+                is_last_in_slot,
+                self.chained_merkle_root[&slot.slot],
+                next_shred_index,
+                next_shred_index,
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .collect();
+        let data_shreds = shreds.iter().filter(|shred| shred.is_data()).count() as u32;
+        self.next_shred_index
+            .insert(slot.slot, next_shred_index + data_shreds);
+        self.chained_merkle_root
+            .insert(slot.slot, shreds.last().unwrap().merkle_root().unwrap());
+        self.blockstore.insert_shreds(shreds, false).unwrap();
+    }
+
+    /// Borrows only the fields `NewBankForksContext` needs, so `progress` can be borrowed mutably
+    /// next to it.
+    fn new_bank_forks_context<'a>(
+        blockstore: &'a Blockstore,
+        bank_forks: &'a RwLock<BankForks>,
+        leader_schedule_cache: &'a LeaderScheduleCache,
+        slot_status_notifier: &'a Option<SlotStatusNotifier>,
+        migration_status: &'a MigrationStatus,
+    ) -> NewBankForksContext<'a> {
+        NewBankForksContext {
+            blockstore,
+            bank_forks,
+            leader_schedule_cache,
+            rpc_subscriptions: None,
+            slot_status_notifier,
+            migration_status,
+            my_pubkey: &FAST_PICKUP_TEST_PUBKEY,
+        }
+    }
+
+    fn replay_active_banks(&mut self, replay_timing: &mut ReplayLoopTiming) -> Vec<Slot> {
+        let frozen = ReplayStage::process_active_banks(
+            0,
+            &self.process_active_banks_context,
+            &mut self.progress,
+            &mut vec![],
+            &mut LatestValidatorVotesForFrozenBanks::default(),
+            &mut DuplicateSlotsToRepair::default(),
+            &mut PurgeRepairSlotCounter::default(),
+            None,
+            &FAST_PICKUP_TEST_PUBKEY,
+            &FAST_PICKUP_TEST_PUBKEY,
+            replay_timing,
+            &self.finalization_cert_sender,
+        );
+        self.record_frozen(&frozen);
+        frozen
+    }
+
+    fn record_frozen(&self, frozen: &[Slot]) {
+        let mut events = self.events.lock().unwrap();
+        events.extend(frozen.iter().map(|slot| ("frozen", *slot)));
+    }
+
+    /// One replay-loop step in the stock order (generate new banks, then replay) or the fast
+    /// pickup order (replay, then `generate_and_replay_new_banks`). Returns the bank creations
+    /// and freezes of the step, consecutive events of one kind grouped and sorted (the order of
+    /// banks within one replay pass follows `BankForks`' hash map, as in production).
+    fn step(&mut self, fast_pickup_order: bool) -> Vec<(&'static str, Vec<Slot>)> {
+        let events_before = self.events.lock().unwrap().len();
+        let mut replay_timing = ReplayLoopTiming::default();
+        if fast_pickup_order {
+            let frozen = self.replay_active_banks(&mut replay_timing);
+            let (newly_frozen, _) = ReplayStage::generate_and_replay_new_banks(
+                Self::new_bank_forks_context(
+                    &self.blockstore,
+                    &self.bank_forks,
+                    &self.leader_schedule_cache,
+                    &self.slot_status_notifier,
+                    &self.process_active_banks_context.migration_status,
+                ),
+                &self.process_active_banks_context,
+                0,
+                &frozen,
+                &mut self.progress,
+                &mut vec![],
+                &mut LatestValidatorVotesForFrozenBanks::default(),
+                &mut DuplicateSlotsToRepair::default(),
+                &mut PurgeRepairSlotCounter::default(),
+                None,
+                &FAST_PICKUP_TEST_PUBKEY,
+                &mut replay_timing,
+                &self.finalization_cert_sender,
+            );
+            self.record_frozen(&newly_frozen);
+        } else {
+            ReplayStage::generate_new_bank_forks(
+                Self::new_bank_forks_context(
+                    &self.blockstore,
+                    &self.bank_forks,
+                    &self.leader_schedule_cache,
+                    &self.slot_status_notifier,
+                    &self.process_active_banks_context.migration_status,
+                ),
+                &mut self.progress,
+                &mut replay_timing,
+            );
+            self.replay_active_banks(&mut replay_timing);
+        }
+        let events = self.events.lock().unwrap()[events_before..].to_vec();
+        let mut grouped: Vec<(&'static str, Vec<Slot>)> = vec![];
+        for (kind, slot) in events {
+            match grouped.last_mut() {
+                Some((last_kind, slots)) if *last_kind == kind => slots.push(slot),
+                _ => grouped.push((kind, vec![slot])),
+            }
+        }
+        for (_, slots) in &mut grouped {
+            slots.sort_unstable();
+        }
+        grouped
+    }
+
+    /// Steps until a step neither creates nor freezes a bank; returns the non-empty steps.
+    fn run_until_idle(&mut self, fast_pickup_order: bool) -> Vec<Vec<(&'static str, Vec<Slot>)>> {
+        let mut steps = vec![];
+        for _ in 0..32 {
+            let step = self.step(fast_pickup_order);
+            if step.is_empty() {
+                return steps;
+            }
+            steps.push(step);
+        }
+        panic!("replay did not settle");
+    }
+}
+
+#[test]
+fn test_fast_pickup_order_matches_stock_order() {
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100 * solana_native_token::LAMPORTS_PER_SOL);
+    let genesis_hash = genesis_config.hash();
+    let payers: Vec<_> = (0..3u8)
+        .map(|i| Keypair::new_from_array([i + 1; 32]))
+        .collect();
+    let transfer = |from: &Keypair, to: &Pubkey, lamports| {
+        system_transaction::transfer(from, to, lamports, genesis_hash)
+    };
+    // 0 <- 1 <- 2 <- 3, and a fork 2 <- 4 that skips slot 3, with transfers that depend on
+    // earlier slots.
+    let slot1 = FastPickupTestSlot {
+        slot: 1,
+        parent: 0,
+        transactions: payers
+            .iter()
+            .map(|payer| {
+                transfer(
+                    &mint_keypair,
+                    &payer.pubkey(),
+                    solana_native_token::LAMPORTS_PER_SOL,
+                )
+            })
+            .collect(),
+    };
+    let slot2 = FastPickupTestSlot {
+        slot: 2,
+        parent: 1,
+        transactions: vec![
+            transfer(
+                &payers[0],
+                &payers[1].pubkey(),
+                solana_native_token::LAMPORTS_PER_SOL / 2,
+            ),
+            transfer(&payers[1], &Pubkey::new_from_array([42; 32]), 1_000_000),
+        ],
+    };
+    let slot3 = FastPickupTestSlot {
+        slot: 3,
+        parent: 2,
+        transactions: vec![transfer(&payers[1], &payers[2].pubkey(), 2_000_000)],
+    };
+    let slot4 = FastPickupTestSlot {
+        slot: 4,
+        parent: 2,
+        transactions: vec![transfer(&payers[2], &payers[0].pubkey(), 3_000_000)],
+    };
+
+    let run = |fast_pickup_order: bool| {
+        let mut replay = FastPickupTestReplay::new(&genesis_config, fast_pickup_order);
+        let mut bursts = vec![];
+        // Slot 1 arrives whole.
+        replay.insert_slot(&genesis_config, &slot1, None);
+        bursts.push(replay.run_until_idle(fast_pickup_order));
+        // The first range of slot 2 (its transactions and one tick).
+        replay.insert_slot(&genesis_config, &slot2, Some(2));
+        bursts.push(replay.run_until_idle(fast_pickup_order));
+        // The rest of slot 2 arrives together with both of its children: slot 2 freezes in the
+        // step's first replay pass while its children's shreds are already in the blockstore.
+        replay.insert_slot(&genesis_config, &slot2, None);
+        replay.insert_slot(&genesis_config, &slot3, None);
+        replay.insert_slot(&genesis_config, &slot4, None);
+        bursts.push(replay.run_until_idle(fast_pickup_order));
+        (replay, bursts)
+    };
+    let (stock, stock_bursts) = run(false);
+    let (fast, fast_bursts) = run(true);
+
+    // The stock order: a bank's children are created only in the step after it froze.
+    assert_eq!(
+        stock_bursts,
+        vec![
+            vec![vec![("created", vec![1]), ("frozen", vec![1])]],
+            vec![vec![("created", vec![2])]],
+            vec![
+                vec![("frozen", vec![2])],
+                vec![("created", vec![3, 4]), ("frozen", vec![3, 4])],
+            ],
+        ]
+    );
+    // The fast pickup order creates and freezes the same banks in the same steps.
+    assert_eq!(fast_bursts, stock_bursts);
+
+    for slot in 1..=4 {
+        let stock_bank = stock.bank_forks.read().unwrap().get(slot).unwrap();
+        let fast_bank = fast.bank_forks.read().unwrap().get(slot).unwrap();
+        assert!(stock_bank.is_frozen(), "slot {slot}");
+        assert!(fast_bank.is_frozen(), "slot {slot}");
+        assert_eq!(fast_bank.hash(), stock_bank.hash(), "slot {slot}");
+        assert_eq!(
+            fast_bank.transaction_count(),
+            stock_bank.transaction_count(),
+            "slot {slot}"
+        );
+        assert!(stock.progress.get(&slot).unwrap().dead_reason.is_none());
+        assert!(fast.progress.get(&slot).unwrap().dead_reason.is_none());
+        // The fast pickup remembers a passed chained block id check; stock does not.
+        let remembered = |replay: &FastPickupTestReplay| {
+            replay
+                .progress
+                .get(&slot)
+                .unwrap()
+                .replay_progress
+                .read()
+                .unwrap()
+                .chained_block_id_passed()
+        };
+        assert!(remembered(&fast), "slot {slot}");
+        assert!(!remembered(&stock), "slot {slot}");
+    }
+    // Every transaction executed (slot 4 is on a fork that does not contain slot 3).
+    assert_eq!(
+        stock
+            .bank_forks
+            .read()
+            .unwrap()
+            .get(3)
+            .unwrap()
+            .transaction_count(),
+        6
+    );
+}
+
+#[test]
+fn test_generate_new_bank_forks_excluding_parents() {
+    let GenesisConfigInfo { genesis_config, .. } =
+        create_genesis_config(100 * solana_native_token::LAMPORTS_PER_SOL);
+    let mut replay = FastPickupTestReplay::new(&genesis_config, false);
+    let slot1 = FastPickupTestSlot {
+        slot: 1,
+        parent: 0,
+        transactions: vec![],
+    };
+    replay.insert_slot(&genesis_config, &slot1, None);
+
+    let mut replay_timing = ReplayLoopTiming::default();
+    // Slot 0 is frozen but excluded: no child is created.
+    assert_eq!(
+        ReplayStage::generate_new_bank_forks_excluding_parents(
+            FastPickupTestReplay::new_bank_forks_context(
+                &replay.blockstore,
+                &replay.bank_forks,
+                &replay.leader_schedule_cache,
+                &replay.slot_status_notifier,
+                &replay.process_active_banks_context.migration_status,
+            ),
+            &mut replay.progress,
+            &mut replay_timing,
+            &[0],
+        ),
+        0
+    );
+    assert!(replay.bank_forks.read().unwrap().get(1).is_none());
+    // Not excluded: slot 1 is created, once.
+    for expected in [1, 0] {
+        assert_eq!(
+            ReplayStage::generate_new_bank_forks_excluding_parents(
+                FastPickupTestReplay::new_bank_forks_context(
+                    &replay.blockstore,
+                    &replay.bank_forks,
+                    &replay.leader_schedule_cache,
+                    &replay.slot_status_notifier,
+                    &replay.process_active_banks_context.migration_status,
+                ),
+                &mut replay.progress,
+                &mut replay_timing,
+                &[],
+            ),
+            expected
+        );
+    }
+    assert!(replay.bank_forks.read().unwrap().get(1).is_some());
+    assert_eq!(*replay.events.lock().unwrap(), vec![("created", 1)]);
+}
+

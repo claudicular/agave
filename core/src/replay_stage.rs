@@ -114,6 +114,7 @@ use {
 };
 
 mod dead_slots;
+mod pickup;
 mod update_parent;
 
 use {
@@ -265,6 +266,9 @@ struct ProcessActiveBanksContext {
     replay_mode: ForkReplayMode,
     replay_verification_worker_pool: ReplayVerificationWorkerPool,
     migration_status: Arc<MigrationStatus>,
+    /// Skip re-checking the chained block id of a bank that already passed it. See
+    /// `pickup::REPLAY_FAST_PICKUP_ENV`.
+    remember_chained_block_id_pass: bool,
 }
 
 struct ProcessBankForksContext {
@@ -514,6 +518,9 @@ struct ReplayLoopTiming {
     generate_new_bank_forks_write_lock_us: Saturating<u64>,
     // When processing multiple forks concurrently, only captures the longest fork
     replay_blockstore_us: u64,
+    /// Time from the end of the loop's wait (or of the previous iteration, when it did not wait)
+    /// to the start of replaying the active banks: the part of replay pickup the loop itself adds.
+    wake_to_replay_us: u64,
 }
 impl ReplayLoopTiming {
     #[allow(clippy::too_many_arguments)]
@@ -683,6 +690,7 @@ impl ReplayLoopTiming {
                     i64
                 ),
                 ("bank_count", self.bank_count as i64, i64),
+                ("wake_to_replay_us", self.wake_to_replay_us as i64, i64),
                 (
                     "process_duplicate_slots_elapsed_us",
                     self.process_duplicate_slots_elapsed_us as i64,
@@ -815,6 +823,8 @@ impl ReplayStage {
             .map_or(0, |hfs| hfs.slot());
         *replay_highest_frozen.highest_frozen_slot.lock().unwrap() = highest_frozen_slot;
 
+        let pickup_options = pickup::ReplayPickupOptions::from_env();
+
         let run_replay = move || {
             let _exit = Finalizer::new(exit.clone());
 
@@ -921,6 +931,7 @@ impl ReplayStage {
                 replay_mode,
                 replay_verification_worker_pool,
                 migration_status: migration_status.clone(),
+                remember_chained_block_id_pass: pickup_options.fast_pickup,
             };
             let process_bank_forks_context = ProcessBankForksContext {
                 bank_forks: bank_forks.clone(),
@@ -946,6 +957,8 @@ impl ReplayStage {
                 while poh_controller.has_pending_message() && !exit.load(Ordering::Relaxed) {}
             }
 
+            // When the loop last stopped waiting; see `ReplayLoopTiming::wake_to_replay_us`.
+            let mut woke_at = Instant::now();
             loop {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
@@ -977,22 +990,32 @@ impl ReplayStage {
                     entry_notification_sender.as_ref(),
                 );
 
+                // Fast pickup order (see `pickup::REPLAY_FAST_PICKUP_ENV`): replay the active
+                // banks first and look for new banks afterwards. Only while TowerBFT is in charge;
+                // from the Alpenglow feature activation on, the stock order is used.
+                let fast_pickup_order =
+                    pickup_options.fast_pickup && migration_status.is_pre_feature_activation();
+
                 let mut generate_new_bank_forks_time =
                     Measure::start("generate_new_bank_forks_time");
-                Self::generate_new_bank_forks(
-                    NewBankForksContext {
-                        blockstore: &blockstore,
-                        bank_forks: &bank_forks,
-                        leader_schedule_cache: &leader_schedule_cache,
-                        rpc_subscriptions: rpc_subscriptions.as_deref(),
-                        slot_status_notifier: &slot_status_notifier,
-                        migration_status: migration_status.as_ref(),
-                        my_pubkey: &my_pubkey,
-                    },
-                    &mut progress,
-                    &mut replay_timing,
-                );
+                if !fast_pickup_order {
+                    Self::generate_new_bank_forks(
+                        NewBankForksContext {
+                            blockstore: &blockstore,
+                            bank_forks: &bank_forks,
+                            leader_schedule_cache: &leader_schedule_cache,
+                            rpc_subscriptions: rpc_subscriptions.as_deref(),
+                            slot_status_notifier: &slot_status_notifier,
+                            migration_status: migration_status.as_ref(),
+                            my_pubkey: &my_pubkey,
+                        },
+                        &mut progress,
+                        &mut replay_timing,
+                    );
+                }
                 generate_new_bank_forks_time.stop();
+                // Time `generate_new_bank_forks` spent after replay (fast pickup order only).
+                let mut generate_after_replay_us = 0;
 
                 // We either have a bank currently, OR there is a pending message to either reset or set
                 // the bank.
@@ -1000,10 +1023,14 @@ impl ReplayStage {
                     || poh_controller.has_pending_message();
 
                 let mut replay_active_banks_time = Measure::start("replay_active_banks_time");
-                let (mut ancestors, mut descendants) = {
-                    let r_bank_forks = bank_forks.read().unwrap();
-                    (r_bank_forks.ancestors(), r_bank_forks.descendants())
-                };
+                // The ancestors/descendants maps are only read after replay: by the TowerBFT
+                // control path and by `enable_alpenglow`. The stock order builds them here; the
+                // fast pickup builds them once the bank set of this iteration is final (TowerBFT)
+                // or only when enabling Alpenglow needs them (Alpenglow enabled).
+                let defer_fork_maps = pickup_options.fast_pickup
+                    && (fast_pickup_order || migration_status.is_alpenglow_enabled());
+                let mut fork_maps = (!defer_fork_maps).then(|| Self::fork_maps(&bank_forks));
+                replay_timing.wake_to_replay_us += woke_at.elapsed().as_micros() as u64;
                 let mut new_frozen_slots = Self::process_active_banks(
                     cluster_info.my_shred_version(),
                     &process_active_banks_context,
@@ -1018,8 +1045,41 @@ impl ReplayStage {
                     &mut replay_timing,
                     &footer_certs_sender,
                 );
+                if fast_pickup_order {
+                    let (newly_frozen_slots, generate_us) = Self::generate_and_replay_new_banks(
+                        NewBankForksContext {
+                            blockstore: &blockstore,
+                            bank_forks: &bank_forks,
+                            leader_schedule_cache: &leader_schedule_cache,
+                            rpc_subscriptions: rpc_subscriptions.as_deref(),
+                            slot_status_notifier: &slot_status_notifier,
+                            migration_status: migration_status.as_ref(),
+                            my_pubkey: &my_pubkey,
+                        },
+                        &process_active_banks_context,
+                        cluster_info.my_shred_version(),
+                        &new_frozen_slots,
+                        &mut progress,
+                        &mut async_verification_freelist,
+                        &mut latest_validator_votes_for_frozen_banks,
+                        &mut duplicate_slots_to_repair,
+                        &mut purge_repair_slot_counter,
+                        (!migration_status.is_alpenglow_enabled()).then_some(&mut tbft_structs),
+                        &vote_account,
+                        &mut replay_timing,
+                        &footer_certs_sender,
+                    );
+                    new_frozen_slots.extend(newly_frozen_slots);
+                    generate_after_replay_us = generate_us;
+                    fork_maps = Some(Self::fork_maps(&bank_forks));
+                }
                 let did_complete_bank = !new_frozen_slots.is_empty();
                 replay_active_banks_time.stop();
+                let generate_new_bank_forks_us =
+                    generate_new_bank_forks_time.as_us() + generate_after_replay_us;
+                let replay_active_banks_us = replay_active_banks_time
+                    .as_us()
+                    .saturating_sub(generate_after_replay_us);
 
                 // VAT health check
                 Self::maybe_report_vat_health(
@@ -1031,6 +1091,8 @@ impl ReplayStage {
 
                 // Check if we've completed the migration conditions
                 if migration_status.is_ready_to_enable() {
+                    let (ancestors, descendants) =
+                        fork_maps.get_or_insert_with(|| Self::fork_maps(&bank_forks));
                     Self::enable_alpenglow(
                         &exit,
                         &my_pubkey,
@@ -1040,8 +1102,8 @@ impl ReplayStage {
                         &mut poh_controller,
                         &poh_shared_leader_state,
                         leader_schedule_cache.as_ref(),
-                        &mut ancestors,
-                        &mut descendants,
+                        ancestors,
+                        descendants,
                         &mut progress,
                         &replay_highest_frozen,
                         &mut new_frozen_slots,
@@ -1117,9 +1179,11 @@ impl ReplayStage {
                         process_switch_bank_events_time.as_us();
 
                     // Banks might have been switched above, these maps are no longer accurate
-                    drop(ancestors);
-                    drop(descendants);
+                    drop(fork_maps);
                 } else {
+                    let (mut ancestors, mut descendants) = fork_maps
+                        .take()
+                        .unwrap_or_else(|| Self::fork_maps(&bank_forks));
                     let forks_root = bank_forks.read().unwrap().root();
                     // Process cluster-agreed versions of duplicate slots for which we potentially
                     // have the wrong version. Our version was dead or pruned.
@@ -1583,6 +1647,16 @@ impl ReplayStage {
                     let bank_forks_command_receiver = bank_forks_controller_receiver.receiver();
                     let set_root_signal_receiver =
                         bank_forks_controller_receiver.set_root_signal_receiver();
+                    // Optionally stay awake for a while so the next blockstore signal is picked
+                    // up without a futex wake-up. See `pickup::REPLAY_STAGE_SPIN_US_ENV`.
+                    if let Some(spin_before_wait) = pickup_options.spin_before_wait {
+                        pickup::spin_until_ready(spin_before_wait, || {
+                            !ledger_signal_receiver.is_empty()
+                                || !bank_forks_command_receiver.is_empty()
+                                || !set_root_signal_receiver.is_empty()
+                                || exit.load(Ordering::Relaxed)
+                        });
+                    }
                     select! {
                         recv(ledger_signal_receiver) -> result => match result {
                             Err(_) => break,
@@ -1607,10 +1681,11 @@ impl ReplayStage {
                     }
                 }
                 wait_receive_time.stop();
+                woke_at = Instant::now();
 
                 replay_timing.update_common(
-                    generate_new_bank_forks_time.as_us(),
-                    replay_active_banks_time.as_us(),
+                    generate_new_bank_forks_us,
+                    replay_active_banks_us,
                     wait_receive_time.as_us(),
                 );
             }
@@ -3729,11 +3804,32 @@ impl ReplayStage {
         // It's important that we do this here (after we have a bank) rather than failing
         // in generate_new_bank_forks, as we need a bank to mark as dead in order to kick off
         // ancestor hashes service / duplicate block repair.
-        match check_chained_block_id(
-            &process_active_banks_context.blockstore,
-            &bank,
-            process_active_banks_context.migration_status.as_ref(),
-        ) {
+        //
+        // With the fast pickup, a check that passed is not repeated: the child's shred 0 and the
+        // parent's last shred never change without the slot being purged, which also clears this
+        // bank and its progress entry. See `pickup::REPLAY_FAST_PICKUP_ENV`.
+        let remember_pass = process_active_banks_context.remember_chained_block_id_pass;
+        let already_passed =
+            remember_pass && replay_progress.read().unwrap().chained_block_id_passed();
+        let chained_block_id_check = if already_passed {
+            ChainedBlockIdCheck::Pass
+        } else {
+            check_chained_block_id(
+                &process_active_banks_context.blockstore,
+                &bank,
+                process_active_banks_context.migration_status.as_ref(),
+            )
+        };
+        if remember_pass
+            && !already_passed
+            && matches!(chained_block_id_check, ChainedBlockIdCheck::Pass)
+        {
+            replay_progress
+                .write()
+                .unwrap()
+                .set_chained_block_id_passed();
+        }
+        match chained_block_id_check {
             ChainedBlockIdCheck::Inactive | ChainedBlockIdCheck::Pass => (),
             ChainedBlockIdCheck::Unavailable => {
                 // Missing shred 0, can't replay anyway
@@ -5303,6 +5399,82 @@ impl ReplayStage {
         progress: &mut ProgressMap,
         replay_timing: &mut ReplayLoopTiming,
     ) {
+        Self::generate_new_bank_forks_excluding_parents(ctx, progress, replay_timing, &[]);
+    }
+
+    /// Second half of a fast-pickup replay step (see `pickup::REPLAY_FAST_PICKUP_ENV`), run after
+    /// the active banks were replayed: creates the children of banks that were frozen *before*
+    /// this step (not of `frozen_this_step`, whose children the stock order only creates in the
+    /// next iteration, after the control path) and replays any bank it created, as the stock
+    /// order replays banks created at the top of an iteration. Returns the banks this second
+    /// replay froze and the microseconds spent in `generate_new_bank_forks`.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_and_replay_new_banks(
+        new_bank_forks_context: NewBankForksContext<'_>,
+        process_active_banks_context: &ProcessActiveBanksContext,
+        my_shred_version: u16,
+        frozen_this_step: &[Slot],
+        progress: &mut ProgressMap,
+        async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+        latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
+        duplicate_slots_to_repair: &mut DuplicateSlotsToRepair,
+        purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
+        tbft_structs: Option<&mut TowerBFTStructures>,
+        vote_account: &Pubkey,
+        replay_timing: &mut ReplayLoopTiming,
+        finalization_cert_sender: &Sender<SmallVec<[Certificate; 2]>>,
+    ) -> (Vec<Slot>, u64) {
+        let my_pubkey = *new_bank_forks_context.my_pubkey;
+        let mut generate_time = Measure::start("generate_new_bank_forks_time");
+        let num_new_banks = Self::generate_new_bank_forks_excluding_parents(
+            new_bank_forks_context,
+            progress,
+            replay_timing,
+            frozen_this_step,
+        );
+        generate_time.stop();
+        let newly_frozen_slots = if num_new_banks > 0 {
+            Self::process_active_banks(
+                my_shred_version,
+                process_active_banks_context,
+                progress,
+                async_verification_freelist,
+                latest_validator_votes_for_frozen_banks,
+                duplicate_slots_to_repair,
+                purge_repair_slot_counter,
+                tbft_structs,
+                &my_pubkey,
+                vote_account,
+                replay_timing,
+                finalization_cert_sender,
+            )
+        } else {
+            vec![]
+        };
+        (newly_frozen_slots, generate_time.as_us())
+    }
+
+    /// The ancestors and descendants of every bank in `bank_forks`, as read by the TowerBFT
+    /// control path and by `enable_alpenglow`.
+    fn fork_maps(
+        bank_forks: &RwLock<BankForks>,
+    ) -> (HashMap<Slot, HashSet<Slot>>, HashMap<Slot, HashSet<Slot>>) {
+        let r_bank_forks = bank_forks.read().unwrap();
+        (r_bank_forks.ancestors(), r_bank_forks.descendants())
+    }
+
+    /// [`Self::generate_new_bank_forks`], except that no child is created for the frozen banks in
+    /// `excluded_parents`. Returns the number of banks inserted into `bank_forks`.
+    ///
+    /// The fast pickup order replays active banks before calling this, and passes the banks that
+    /// replay just froze: the stock order would only see those as frozen parents in the next
+    /// iteration, after the control path ran.
+    fn generate_new_bank_forks_excluding_parents(
+        ctx: NewBankForksContext<'_>,
+        progress: &mut ProgressMap,
+        replay_timing: &mut ReplayLoopTiming,
+        excluded_parents: &[Slot],
+    ) -> usize {
         let NewBankForksContext {
             blockstore,
             bank_forks,
@@ -5325,7 +5497,9 @@ impl ReplayStage {
                 .keys()
                 .cloned()
                 .filter(|slot| {
-                    *slot >= forks.root() && progress.get(slot).unwrap().dead_reason.is_none()
+                    *slot >= forks.root()
+                        && progress.get(slot).unwrap().dead_reason.is_none()
+                        && !excluded_parents.contains(slot)
                 })
                 .collect();
             let known_bank_slots = forks.banks().keys().copied().collect::<HashSet<_>>();
@@ -5423,6 +5597,7 @@ impl ReplayStage {
 
         let mut generate_new_bank_forks_write_lock =
             Measure::start("generate_new_bank_forks_write_lock");
+        let mut num_inserted = 0;
         if !new_banks.is_empty() {
             let mut forks = bank_forks.write().unwrap();
             let root = forks.root();
@@ -5453,6 +5628,7 @@ impl ReplayStage {
                     progress.insert(slot, fork_progress);
                 }
                 forks.insert(bank);
+                num_inserted += 1;
             }
         }
         generate_new_bank_forks_write_lock.stop();
@@ -5463,6 +5639,7 @@ impl ReplayStage {
         replay_timing.generate_new_bank_forks_loop_us += generate_new_bank_forks_loop.as_us();
         replay_timing.generate_new_bank_forks_write_lock_us +=
             generate_new_bank_forks_write_lock.as_us();
+        num_inserted
     }
 
     pub(crate) fn new_bank_from_parent_with_notify(
