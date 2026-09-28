@@ -137,6 +137,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-fast-lane"
+version = "4.3.0"
+dependencies = [
+ "agave-cpu-utils",
+ "agave-fast-lane",
+ "agave-feature-set",
+ "bs58",
+ "crossbeam-channel",
+ "dashmap",
+ "libc",
+ "log",
+ "parking_lot 0.12.3",
+ "rand 0.9.4",
+ "serde_json",
+ "solana-account 4.5.0",
+ "solana-accounts-db",
+ "solana-clock",
+ "solana-entry",
+ "solana-fee-structure",
+ "solana-genesis-config",
+ "solana-geyser-plugin-manager",
+ "solana-hash 4.6.0",
+ "solana-instruction",
+ "solana-keypair",
+ "solana-ledger",
+ "solana-message",
+ "solana-native-token",
+ "solana-nonce",
+ "solana-precompile-error",
+ "solana-program-runtime",
+ "solana-pubkey 4.3.0",
+ "solana-rent",
+ "solana-rpc",
+ "solana-runtime",
+ "solana-runtime-transaction",
+ "solana-sdk-ids",
+ "solana-signature",
+ "solana-signer",
+ "solana-svm",
+ "solana-svm-callback",
+ "solana-svm-timings",
+ "solana-svm-transaction",
+ "solana-system-interface 3.3.0",
+ "solana-transaction",
+ "solana-transaction-error",
+ "tempfile",
+ "test-case",
+]
+
+[[package]]
 name = "agave-feature-set"
 version = "4.3.0"
 dependencies = [
@@ -8034,6 +8084,7 @@ dependencies = [
  "agave-banking-stage-ingress-types",
  "agave-bls-cert-verify",
  "agave-bls-sigverify",
+ "agave-fast-lane",
  "agave-feature-set",
  "agave-fs",
  "agave-logger",
