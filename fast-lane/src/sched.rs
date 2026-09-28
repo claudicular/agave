@@ -146,6 +146,10 @@ pub struct RunSummary {
 pub trait FinalSink: Send {
     fn on_final(&mut self, finalized: Finalized);
     fn on_run_end(&mut self, run_id: RunId, summary: RunSummary);
+    /// An abort for a run that already ended (e.g. agave marked the slot dead afterwards).
+    fn on_abort_ended(&mut self, _run_id: RunId, _reason: &'static str) {}
+    /// Called about every millisecond by the coordinator loop, busy or idle.
+    fn tick(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +289,9 @@ pub const SPIN_FOREVER: Duration = Duration::from_secs(1);
 
 /// Receive with a bounded busy-poll before parking; `None` on exit/disconnect. A spin of
 /// [`SPIN_FOREVER`] or more busy-polls without ever parking.
+/// Sink tick period.
+const TICK: Duration = Duration::from_millis(1);
+
 pub fn recv_spin<T>(rx: &Receiver<T>, spin: Duration, exit: &AtomicBool) -> Option<T> {
     if spin >= SPIN_FOREVER {
         let mut polls = 0u32;
@@ -371,10 +378,39 @@ impl<S: FinalSink> Coordinator<S> {
 
     /// Main loop: handle messages, dispatch, until shutdown or exit.
     pub fn run_loop(&mut self, rx: Receiver<CoordMsg>, exit: Arc<AtomicBool>, spin: Duration) {
+        let mut last_tick = Instant::now();
         loop {
-            let Some(msg) = recv_spin(&rx, spin, &exit) else {
+            let msg = if spin >= SPIN_FOREVER {
+                // Busy-poll inline so the sink can tick while idle.
+                let mut polls = 0u32;
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => break Some(msg),
+                        Err(TryRecvError::Disconnected) => break None,
+                        Err(TryRecvError::Empty) => {}
+                    }
+                    polls = polls.wrapping_add(1);
+                    if polls % 1024 == 0 {
+                        if exit.load(Ordering::Relaxed) {
+                            break None;
+                        }
+                        if last_tick.elapsed() >= TICK {
+                            self.sink.tick();
+                            last_tick = Instant::now();
+                        }
+                    }
+                    std::hint::spin_loop();
+                }
+            } else {
+                recv_spin(&rx, spin, &exit)
+            };
+            let Some(msg) = msg else {
                 return;
             };
+            if last_tick.elapsed() >= TICK {
+                self.sink.tick();
+                last_tick = Instant::now();
+            }
             if !self.handle(msg) {
                 return;
             }
@@ -433,6 +469,8 @@ impl<S: FinalSink> Coordinator<S> {
                     run.summary.txs = run.txs.len() as u64;
                     run.summary.finals = u64::from(run.n_final);
                     self.sink.on_run_end(run_id, run.summary);
+                } else {
+                    self.sink.on_abort_ended(run_id, reason);
                 }
             }
             CoordMsg::Done {

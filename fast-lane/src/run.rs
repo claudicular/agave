@@ -86,6 +86,9 @@ pub struct TxOutcome {
     /// Exactly the (pubkey, account) list agave's grouped notification would carry;
     /// `None` when agave sends no notification (no-op, unprocessable, empty).
     pub frame: Option<Vec<(Pubkey, AccountSharedData)>>,
+    /// Per `frame` entry: written by the transaction (else a read-only account included
+    /// because of its owner). Empty when there is no frame.
+    pub frame_written: Vec<bool>,
     pub cu: u64,
     pub fee: u64,
     pub t_tap: Instant,
@@ -670,6 +673,7 @@ impl SchedRun for Run {
             chained: self.chain.is_some(),
             status: Ok(()),
             frame: None,
+            frame_written: Vec::new(),
             cu: 0,
             fee: 0,
             t_tap: entry.t_tap,
@@ -699,6 +703,7 @@ impl SchedRun for Run {
                             && self.readonly_owners.contains(account.owner());
                         if is_written || owner_in_filter {
                             frame.push((*key, account.clone()));
+                            outcome.frame_written.push(is_written);
                         }
                     }
                     outcome.frame = (!frame.is_empty()).then_some(frame);
@@ -707,6 +712,7 @@ impl SchedRun for Run {
                         writes.push((*key, account.clone()));
                     }
                     outcome.frame = (!writes.is_empty()).then(|| writes.clone());
+                    outcome.frame_written = vec![true; writes.len()];
                 }
             }
             Some(Ok(ProcessedTransaction::FeesOnly(fees_only))) => {
@@ -717,6 +723,7 @@ impl SchedRun for Run {
                     writes.push((*key, account.clone()));
                 }
                 outcome.frame = (!writes.is_empty()).then(|| writes.clone());
+                outcome.frame_written = vec![true; writes.len()];
             }
             Some(Ok(ProcessedTransaction::NoOp(no_op))) => {
                 outcome.kind = OutcomeKind::NoOp;

@@ -82,10 +82,12 @@ pub enum CmpMsg {
     },
 }
 
-/// The coordinator's sink: forwards FINAL transactions to the comparator.
+/// The coordinator's sink: publishes FINAL transactions into the output ring (if enabled)
+/// and forwards them to the comparator.
 pub struct CmpSink {
     pub tx: Sender<CmpMsg>,
     pub drops: Arc<AtomicU64>,
+    pub out: Option<crate::output::OutPublisher>,
 }
 
 impl FinalSink for CmpSink {
@@ -93,6 +95,9 @@ impl FinalSink for CmpSink {
         let Ok(outcome) = f.payload.downcast::<TxOutcome>() else {
             return;
         };
+        if let Some(out) = self.out.as_mut() {
+            out.on_final(f.run_id, &outcome, f.incarnations, f.speculative);
+        }
         let record = FinalRecord {
             run_id: f.run_id,
             outcome: *outcome,
@@ -112,7 +117,22 @@ impl FinalSink for CmpSink {
     }
 
     fn on_run_end(&mut self, run_id: RunId, summary: RunSummary) {
+        if let Some(out) = self.out.as_mut() {
+            out.on_run_end(run_id, &summary);
+        }
         let _ = self.tx.try_send(CmpMsg::RunEnd { run_id, summary });
+    }
+
+    fn on_abort_ended(&mut self, run_id: RunId, reason: &'static str) {
+        if let Some(out) = self.out.as_mut() {
+            out.on_abort_ended(run_id, reason);
+        }
+    }
+
+    fn tick(&mut self) {
+        if let Some(out) = self.out.as_mut() {
+            out.tick();
+        }
     }
 }
 
@@ -193,6 +213,9 @@ pub struct Comparator {
     minute_start: Instant,
     pub tap_stats: Option<Arc<crate::Shared>>,
     pub sink_drops: Arc<AtomicU64>,
+    /// Phase-3 output ring statistics (cumulative; reported per interval).
+    pub out_stats: Option<Arc<crate::output::OutStats>>,
+    out_prev: [u64; 16],
     totals: Interval,
 }
 
@@ -245,6 +268,8 @@ impl Comparator {
             minute_start: Instant::now(),
             tap_stats: None,
             sink_drops,
+            out_stats: None,
+            out_prev: [0; 16],
             totals: Interval::default(),
         }
     }
@@ -933,9 +958,87 @@ impl Comparator {
             );
             w.write_line(&line);
         }
+        self.out_summary(secs);
         self.totals.matched += iv.matched;
         self.totals.mismatched += iv.mismatched;
         self.flush();
+    }
+
+    /// Output-ring interval statistics: records, bytes, filtered, dropped, and the write
+    /// cost on the coordinator (mean, histogram p50/p99 bucket bounds, max).
+    fn out_summary(&mut self, secs: f64) {
+        let Some(stats) = self.out_stats.as_ref() else {
+            return;
+        };
+        let now: [u64; 16] = [
+            stats.tx_records.load(Ordering::Relaxed),
+            stats.markers.load(Ordering::Relaxed),
+            stats.filtered.load(Ordering::Relaxed),
+            stats.bytes.load(Ordering::Relaxed),
+            stats.dropped.load(Ordering::Relaxed),
+            stats.incomplete.load(Ordering::Relaxed),
+            stats.write_ns_sum.load(Ordering::Relaxed),
+            0,
+            stats.write_ns_hist[0].load(Ordering::Relaxed),
+            stats.write_ns_hist[1].load(Ordering::Relaxed),
+            stats.write_ns_hist[2].load(Ordering::Relaxed),
+            stats.write_ns_hist[3].load(Ordering::Relaxed),
+            stats.write_ns_hist[4].load(Ordering::Relaxed),
+            stats.write_ns_hist[5].load(Ordering::Relaxed),
+            stats.write_ns_hist[6].load(Ordering::Relaxed),
+            stats.write_ns_hist[7].load(Ordering::Relaxed),
+        ];
+        let max_ns = stats.write_ns_max.swap(0, Ordering::Relaxed);
+        let d: Vec<u64> = now
+            .iter()
+            .zip(self.out_prev.iter())
+            .map(|(a, b)| a.saturating_sub(*b))
+            .collect();
+        self.out_prev = now;
+        let hist = &d[8..16];
+        let n: u64 = hist.iter().sum();
+        let bound = |q: f64| -> u64 {
+            let target = (n as f64 * q).ceil() as u64;
+            let mut acc = 0;
+            for (i, c) in hist.iter().enumerate() {
+                acc += c;
+                if acc >= target.max(1) {
+                    return crate::output::WRITE_NS_BUCKETS[i];
+                }
+            }
+            u64::MAX
+        };
+        let (p50, p99) = if n > 0 { (bound(0.5), bound(0.99)) } else { (0, 0) };
+        let mean = if n > 0 { d[6] / n } else { 0 };
+        info!(
+            "fast_lane_out secs={secs:.1} tx_records={} markers={} filtered={} bytes={} \
+             dropped={} incomplete={} write_ns_mean={mean} write_ns_p50_le={p50} \
+             write_ns_p99_le={p99} write_ns_max={max_ns} hist={:?}",
+            d[0], d[1], d[2], d[3], d[4], d[5], hist
+        );
+        solana_metrics::datapoint_info!(
+            "fast_lane_out",
+            ("tx_records", d[0] as i64, i64),
+            ("markers", d[1] as i64, i64),
+            ("filtered", d[2] as i64, i64),
+            ("bytes", d[3] as i64, i64),
+            ("dropped", d[4] as i64, i64),
+            ("incomplete", d[5] as i64, i64),
+            ("write_ns_mean", mean as i64, i64),
+            ("write_ns_p50_le", p50.min(i64::MAX as u64) as i64, i64),
+            ("write_ns_p99_le", p99.min(i64::MAX as u64) as i64, i64),
+            ("write_ns_max", max_ns as i64, i64),
+        );
+        if let Some(w) = self.summaries.as_mut() {
+            w.write_line(&format!(
+                "{{\"out\":true,\"unix_ns\":{},\"secs\":{secs:.3},\"tx_records\":{},\"markers\":{},\
+                 \"filtered\":{},\"bytes\":{},\"dropped\":{},\"incomplete\":{},\"write_ns_mean\":{mean},\
+                 \"write_ns_p50_le\":{p50},\"write_ns_p99_le\":{p99},\"write_ns_max\":{max_ns},\
+                 \"write_ns_hist\":{:?}}}",
+                unix_ns(),
+                d[0], d[1], d[2], d[3], d[4], d[5], hist
+            ));
+        }
     }
 
     /// Totals so far (tests).

@@ -24,6 +24,8 @@ pub mod forks;
 pub mod gate;
 pub mod ingest;
 pub mod mv;
+pub mod out_ring;
+pub mod output;
 pub mod program_cache;
 pub mod ring;
 pub mod run;
@@ -266,6 +268,33 @@ fn start_threads(
     let (task_tx, task_rx) = unbounded();
     let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(262_144);
     let sink_drops = Arc::new(AtomicU64::new(0));
+    // Phase-3 output ring (created before any thread so its failure only disables it).
+    let out_stats = Arc::new(output::OutStats::default());
+    let out = if config.out_ring {
+        match out_ring::OutRing::create(&config.out_ring_path, config.out_ring_mb << 20) {
+            Ok(ring) => {
+                let owners = output::OutPublisher::owner_filter(config.out_token, &config.out_owners);
+                info!(
+                    "fast lane: output ring {} ({} MiB, max record {} B), owners {:?}",
+                    config.out_ring_path.display(),
+                    config.out_ring_mb,
+                    ring.max_record(),
+                    owners
+                );
+                Some(output::OutPublisher::new(ring, owners, out_stats.clone()))
+            }
+            Err(err) => {
+                log::warn!(
+                    "fast lane: output ring {} disabled: {err}",
+                    config.out_ring_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let out_enabled = out.is_some();
     let mut threads = Vec::new();
     let spawn_err = |e: std::io::Error| e.to_string();
 
@@ -295,6 +324,7 @@ fn start_threads(
         let sink = CmpSink {
             tx: cmp_tx.clone(),
             drops: sink_drops.clone(),
+            out,
         };
         let workers = config.workers;
         let hint_alpha = config.hint_alpha;
@@ -351,6 +381,9 @@ fn start_threads(
                 let mut comparator =
                     Comparator::new(config_c, bank_forks, export_dir, sink_drops);
                 comparator.tap_stats = Some(shared_c);
+                if out_enabled {
+                    comparator.out_stats = Some(out_stats);
+                }
                 comparator.run_loop(cmp_rx, frame_rx, exit);
             })
             .map_err(spawn_err)?,

@@ -5,7 +5,10 @@
 //! floats, booleans, quoted or bare strings, or `[a, b, c]` integer lists. Unknown keys are
 //! rejected so typos are caught at boot.
 
-use std::{fmt, path::PathBuf, str::FromStr};
+use {
+    solana_pubkey::Pubkey,
+    std::{fmt, path::PathBuf, str::FromStr},
+};
 
 pub const CONFIG_ENV: &str = "AGAVE_FAST_LANE_CONFIG";
 
@@ -88,6 +91,15 @@ pub struct Config {
     /// SlotHashes entry become known when agave freezes the parent; transactions that read
     /// them re-execute then.
     pub chain: bool,
+    /// Phase 3: publish FINAL transactions' account updates into a shared-memory ring.
+    pub out_ring: bool,
+    pub out_ring_path: PathBuf,
+    /// Data region size of the output ring.
+    pub out_ring_mb: usize,
+    /// Include accounts owned by SPL Token and Token-2022.
+    pub out_token: bool,
+    /// Further owners (programs) whose accounts are published.
+    pub out_owners: Vec<Pubkey>,
 }
 
 impl Default for Config {
@@ -125,6 +137,11 @@ impl Default for Config {
             ring_path: None,
             ring_blockstore_check: false,
             chain: false,
+            out_ring: false,
+            out_ring_path: PathBuf::from("/dev/shm/fastlane.out.ring"),
+            out_ring_mb: 256,
+            out_token: true,
+            out_owners: Vec::new(),
         }
     }
 }
@@ -172,6 +189,22 @@ fn parse_list(key: &str, value: &str) -> Result<Vec<usize>, ConfigError> {
         }
     }
     Ok(out)
+}
+
+fn parse_pubkeys(key: &str, value: &str) -> Result<Vec<Pubkey>, ConfigError> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(|| ConfigError(format!("{key} must be a [list]")))?;
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|item| {
+            Pubkey::from_str(unquote(item))
+                .map_err(|_| ConfigError(format!("bad pubkey in {key}: {item}")))
+        })
+        .collect()
 }
 
 fn unquote(value: &str) -> &str {
@@ -258,6 +291,11 @@ impl Config {
             "ring_path" => self.ring_path = Some(PathBuf::from(value)),
             "ring_blockstore_check" => self.ring_blockstore_check = parse_bool(key, value)?,
             "chain" => self.chain = parse_bool(key, value)?,
+            "out_ring" => self.out_ring = parse_bool(key, value)?,
+            "out_ring_path" => self.out_ring_path = PathBuf::from(value),
+            "out_ring_mb" => self.out_ring_mb = parse_scalar(key, value)?,
+            "out_token" => self.out_token = parse_bool(key, value)?,
+            "out_owners" => self.out_owners = parse_pubkeys(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())
@@ -278,6 +316,12 @@ impl Config {
         }
         if self.export_files == 0 {
             return Err(ConfigError("export_files must be >= 1".into()));
+        }
+        if self.out_ring && !(1..=16_384).contains(&self.out_ring_mb) {
+            return Err(ConfigError("out_ring_mb must be 1..=16384".into()));
+        }
+        if self.out_ring && !self.out_token && self.out_owners.is_empty() {
+            return Err(ConfigError("out_ring needs out_token or out_owners".into()));
         }
         if self.input_dual && self.ring_path.is_none() {
             return Err(ConfigError("input = dual needs ring_path".into()));
@@ -344,5 +388,28 @@ mod tests {
                 .input_dual
         );
         assert!(Config::parse("").unwrap().enabled.eq(&false));
+    }
+
+    #[test]
+    fn test_parse_out_ring() {
+        let config = Config::parse(
+            r#"
+            out_ring = true
+            out_ring_mb = 64
+            out_owners = ["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", 11111111111111111111111111111111]
+            "#,
+        )
+        .unwrap();
+        assert!(config.out_ring && config.out_token);
+        assert_eq!(config.out_ring_mb, 64);
+        assert_eq!(config.out_owners.len(), 2);
+        assert_eq!(config.out_owners[1], Pubkey::default());
+        assert_eq!(
+            config.out_ring_path,
+            PathBuf::from("/dev/shm/fastlane.out.ring")
+        );
+        assert!(Config::parse("out_owners = [notakey]").is_err());
+        assert!(Config::parse("out_ring = true\nout_token = false").is_err());
+        assert!(Config::parse("out_ring = true\nout_ring_mb = 0").is_err());
     }
 }

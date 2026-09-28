@@ -17,6 +17,8 @@ use {
         control::Tunables,
         forks::FlForkGraph,
         mv::{accounts_equal, same_value},
+        out_ring::{self, OutRing, OutRingReader},
+        output::{OutPublisher, OutStats},
         program_cache::ProgramCaches,
         run::{Run, TxOutcome},
         sched::{
@@ -345,16 +347,24 @@ struct Collect {
     ended: Vec<RunSummary>,
 }
 
-struct CollectSink(Arc<Mutex<Collect>>);
+/// Collects outcomes and, when given a publisher, also writes the phase-3 output ring
+/// exactly as the production sink does (on the coordinator thread, at FINAL).
+struct CollectSink(Arc<Mutex<Collect>>, Option<OutPublisher>);
 
 impl FinalSink for CollectSink {
     fn on_final(&mut self, f: Finalized) {
         // A chained run's pseudo-transaction has no outcome.
         if let Ok(outcome) = f.payload.downcast::<TxOutcome>() {
+            if let Some(out) = self.1.as_mut() {
+                out.on_final(f.run_id, &outcome, f.incarnations, f.speculative);
+            }
             self.0.lock().unwrap().outcomes.push(*outcome);
         }
     }
-    fn on_run_end(&mut self, _run_id: RunId, summary: RunSummary) {
+    fn on_run_end(&mut self, run_id: RunId, summary: RunSummary) {
+        if let Some(out) = self.1.as_mut() {
+            out.on_run_end(run_id, &summary);
+        }
         self.0.lock().unwrap().ended.push(summary);
     }
 }
@@ -397,6 +407,7 @@ fn drive(
     speculation: bool,
     theta: f32,
     mut external: Option<External>,
+    out: Option<OutPublisher>,
 ) -> (Vec<TxOutcome>, RunSummary) {
     let total = batches
         .iter()
@@ -421,7 +432,7 @@ fn drive(
         task_tx,
         tunables,
         1.0 / 32.0,
-        CollectSink(sink.clone()),
+        CollectSink(sink.clone(), out),
     );
     coord.handle(CoordMsg::NewRun {
         run_id,
@@ -495,7 +506,8 @@ fn run_fast_lane(
         .unwrap(),
     );
     let batches = push_halves(&run, txs);
-    let (outcomes, summary) = drive(run.clone(), 7, batches, workers, speculation, theta, None);
+    let (outcomes, summary) =
+        drive(run.clone(), 7, batches, workers, speculation, theta, None, None);
     (outcomes, summary, run)
 }
 
@@ -722,7 +734,7 @@ fn test_chained_differential_against_agave() {
     let owners = Arc::new(vec![TOKEN_PROGRAM]);
     let run_p = Arc::new(Run::new(7, 2, &w.parent, &mut programs, owners.clone()).unwrap());
     let batches = push_halves(&run_p, &txs_p);
-    let (outcomes_p, summary_p) = drive(run_p.clone(), 7, batches, 3, true, 0.5, None);
+    let (outcomes_p, summary_p) = drive(run_p.clone(), 7, batches, 3, true, 0.5, None, None);
     assert_eq!(outcomes_p.len(), txs_p.len());
     assert_eq!(summary_p.unprocessable, 0);
     for outcome in &outcomes_p {
@@ -816,6 +828,7 @@ fn test_chained_differential_against_agave() {
             speculation,
             theta,
             Some(resolver),
+            None,
         );
         assert_eq!(outcomes.len(), txs_c.len(), "{what}: every tx final");
         assert_eq!(summary.unprocessable, 0, "{what}");
@@ -856,5 +869,106 @@ fn test_chained_differential_against_agave() {
             assert!(summary.validation_failures >= 2, "{what}: {summary:?}");
         }
         eprintln!("{what}: {summary:?}");
+    }
+}
+
+/// Phase 3: the output ring carries exactly agave's grouped notifications, filtered by
+/// owner, one TX record per matching transaction, framed by SLOT_BEGIN / SLOT_END, with
+/// per-account block order.
+#[test]
+fn test_output_ring_matches_agave_frames() {
+    let w = world();
+    let txs = transactions(&w, 11);
+    let (_child, statuses) = run_agave(&w, &txs);
+    let frames = w.capture.frames.lock().unwrap().clone();
+    let owners = vec![system_program::id(), TOKEN_PROGRAM];
+
+    for (workers, speculation, theta) in [(1usize, false, 0.2f32), (6, true, 1000.0)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fastlane.out.ring");
+        let ring = OutRing::create(&path, 16 << 20).unwrap();
+        let mut reader = OutRingReader::open(&path).unwrap();
+        let stats = Arc::new(OutStats::default());
+        let publisher = OutPublisher::new(ring, owners.clone(), stats.clone());
+
+        let graph = Arc::new(RwLock::new(FlForkGraph::default()));
+        graph.write().unwrap().set_parent(1, 0);
+        let mut programs = ProgramCaches::new(graph);
+        let run = Arc::new(
+            Run::new(7, 2, &w.parent, &mut programs, Arc::new(vec![TOKEN_PROGRAM])).unwrap(),
+        );
+        let batches = push_halves(&run, &txs);
+        let (outcomes, summary) =
+            drive(run.clone(), 7, batches, workers, speculation, theta, None, Some(publisher));
+        assert_eq!(outcomes.len(), txs.len());
+
+        let mut records = Vec::new();
+        loop {
+            match reader.poll() {
+                out_ring::Poll::Record(r) => records.push(*r),
+                out_ring::Poll::Empty => break,
+                out_ring::Poll::Reset => panic!("reset"),
+            }
+        }
+        assert_eq!(records.first().unwrap().header.kind, out_ring::KIND_SLOT_BEGIN);
+        let end = records.last().unwrap();
+        assert_eq!(end.header.kind, out_ring::KIND_SLOT_END);
+        assert_eq!(u64::from(end.header.tx_ordinal), summary.txs);
+        let tx_records: Vec<_> = records
+            .iter()
+            .filter(|r| r.header.kind == out_ring::KIND_TX)
+            .collect();
+        // Expected: every agave frame with an account of a filtered owner.
+        let expected: HashMap<Signature, Vec<(Pubkey, AccountSharedData)>> = frames
+            .iter()
+            .filter(|((slot, _), _)| *slot == 2)
+            .filter_map(|((_, sig), frame)| {
+                let kept: Vec<_> = frame
+                    .iter()
+                    .filter(|(_, a)| owners.contains(a.owner()))
+                    .cloned()
+                    .collect();
+                (!kept.is_empty()).then(|| (*sig, kept))
+            })
+            .collect();
+        assert!(expected.len() > 150);
+        assert_eq!(tx_records.len(), expected.len(), "one record per matching tx");
+        let mut last_writer: HashMap<Pubkey, u32> = HashMap::new();
+        let mut readonly_seen = 0;
+        for r in &tx_records {
+            let sig = Signature::from(r.signature);
+            let exp = &expected[&sig];
+            assert_eq!(r.header.slot, 2);
+            assert_eq!(r.header.parent_slot, 1);
+            assert_eq!(r.header.fork_id, 7);
+            assert_eq!(r.header.flags & out_ring::FLAG_OK != 0, statuses[&sig].is_ok());
+            assert_eq!(r.accounts.len(), exp.len(), "{sig}");
+            for (a, (key, b)) in r.accounts.iter().zip(exp) {
+                assert_eq!(&a.pubkey, key);
+                assert_eq!(&a.owner, b.owner());
+                assert_eq!(a.lamports, b.lamports());
+                assert_eq!(a.data, b.data());
+                if a.flags & out_ring::ACCT_WRITTEN == 0 {
+                    // Only the read-only token account is included without a write.
+                    assert_eq!(a.pubkey, Pubkey::new_from_array([7; 32]));
+                    readonly_seen += 1;
+                } else {
+                    // Per-account block order among writers.
+                    if let Some(prev) = last_writer.insert(a.pubkey, r.header.tx_ordinal) {
+                        assert!(prev < r.header.tx_ordinal, "block order of {}", a.pubkey);
+                    }
+                }
+            }
+            assert!(r.header.t_publish_ns >= r.header.t_source_ns);
+        }
+        assert!(readonly_seen > 0);
+        assert_eq!(
+            stats.tx_records.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            tx_records.len()
+        );
+        assert_eq!(
+            stats.filtered.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            txs.len() - tx_records.len()
+        );
     }
 }
