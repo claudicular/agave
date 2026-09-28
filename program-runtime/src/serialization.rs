@@ -16,7 +16,12 @@ use {
         IndexOfAccount, MAX_ACCOUNTS_PER_INSTRUCTION, instruction::InstructionContext,
         instruction_accounts::BorrowedInstructionAccount,
     },
-    std::mem::{self, size_of},
+    std::{
+        alloc::{Layout, alloc, dealloc, handle_alloc_error},
+        cell::RefCell,
+        mem::{self, size_of},
+        ptr::NonNull,
+    },
 };
 
 /// Modifies the memory mapping in serialization and CPI return for virtual_address_space_adjustments
@@ -75,8 +80,254 @@ enum SerializeAccount<'a, 'ix_data> {
     Duplicate(IndexOfAccount),
 }
 
-struct Serializer {
-    buffer: AlignedMemory<HOST_ALIGN>,
+/// The append-only byte buffer the [`Serializer`] writes the program input into.
+///
+/// The serializer computes the exact size first and then writes every byte from offset 0 up to
+/// that size, in order; only the written prefix (`len()`) is ever exposed, through
+/// `as_slice[_mut]` and the memory regions built from it.
+trait SerializationBuffer {
+    fn len(&self) -> usize;
+    fn as_slice(&self) -> &[u8];
+    fn as_slice_mut(&mut self) -> &mut [u8];
+    /// Appends `num` copies of `value`, failing if capacity would be exceeded.
+    fn fill_write(&mut self, num: usize, value: u8) -> std::io::Result<()>;
+    /// # Safety
+    /// The caller guarantees `len() + size_of::<T>() <= capacity`.
+    unsafe fn write_unchecked<T: Pod>(&mut self, value: T);
+    /// # Safety
+    /// The caller guarantees `len() + value.len() <= capacity`.
+    unsafe fn write_all_unchecked(&mut self, value: &[u8]);
+}
+
+impl SerializationBuffer for AlignedMemory<HOST_ALIGN> {
+    fn len(&self) -> usize {
+        AlignedMemory::len(self)
+    }
+    fn as_slice(&self) -> &[u8] {
+        AlignedMemory::as_slice(self)
+    }
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        AlignedMemory::as_slice_mut(self)
+    }
+    fn fill_write(&mut self, num: usize, value: u8) -> std::io::Result<()> {
+        AlignedMemory::fill_write(self, num, value)
+    }
+    unsafe fn write_unchecked<T: Pod>(&mut self, value: T) {
+        unsafe { AlignedMemory::write_unchecked(self, value) }
+    }
+    unsafe fn write_all_unchecked(&mut self, value: &[u8]) {
+        unsafe { AlignedMemory::write_all_unchecked(self, value) }
+    }
+}
+
+/// Maximum number of idle parameter buffers kept per thread (one per nesting level).
+const MAX_POOLED_PARAMETER_BUFFERS: usize =
+    crate::execution_budget::MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268;
+/// Parameter buffers larger than this are freed instead of pooled, bounding idle memory at
+/// `MAX_POOLED_PARAMETER_BUFFERS * MAX_POOLED_PARAMETER_BUFFER_CAPACITY` per thread.
+const MAX_POOLED_PARAMETER_BUFFER_CAPACITY: usize = 4 * 1024 * 1024;
+/// Capacities are rounded up to this granularity so that buffers of similar size are reusable.
+const PARAMETER_BUFFER_CAPACITY_GRANULARITY: usize = 64 * 1024;
+
+/// An owned, `HOST_ALIGN`-aligned, uninitialized allocation.
+struct RawParameterBuffer {
+    ptr: NonNull<u8>,
+    capacity: usize,
+}
+
+impl RawParameterBuffer {
+    fn allocate(min_capacity: usize) -> Self {
+        let capacity = min_capacity
+            .max(1)
+            .div_ceil(PARAMETER_BUFFER_CAPACITY_GRANULARITY)
+            .saturating_mul(PARAMETER_BUFFER_CAPACITY_GRANULARITY);
+        let layout = Layout::from_size_align(capacity, HOST_ALIGN).expect("valid layout");
+        // SAFETY: `layout` has a non-zero size.
+        let ptr = unsafe { alloc(layout) };
+        let Some(ptr) = NonNull::new(ptr) else {
+            handle_alloc_error(layout)
+        };
+        Self { ptr, capacity }
+    }
+}
+
+impl Drop for RawParameterBuffer {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `allocate` with exactly this layout.
+        unsafe {
+            dealloc(
+                self.ptr.as_ptr(),
+                Layout::from_size_align_unchecked(self.capacity, HOST_ALIGN),
+            )
+        }
+    }
+}
+
+thread_local! {
+    static PARAMETER_BUFFER_POOL: RefCell<Vec<RawParameterBuffer>> =
+        RefCell::new(Vec::with_capacity(MAX_POOLED_PARAMETER_BUFFERS));
+}
+
+/// A program-input (parameter) buffer whose allocation is recycled through a per-thread pool
+/// (`SOLANA_VM_SER_POOL`, see [`crate::vm_opts::SER_POOL`]).
+///
+/// Serializing into a recycled allocation avoids a large allocator round trip and fresh page
+/// faults per invocation. It is byte-for-byte equivalent to [`AlignedMemory::with_capacity`]:
+/// both start empty over uninitialized memory, the serializer writes every byte up to `len`
+/// (including the explicit zero fill of the realloc padding, which is always written because
+/// this buffer, like `with_capacity`, never assumes zeroed memory), and nothing beyond `len` is
+/// ever exposed. Stale bytes from a previous use therefore can never be observed.
+pub struct PooledParameterBuffer {
+    raw: Option<RawParameterBuffer>,
+    len: usize,
+}
+
+impl PooledParameterBuffer {
+    /// Takes a pooled allocation of at least `size` bytes, or allocates one.
+    fn with_capacity(size: usize) -> Self {
+        let raw = PARAMETER_BUFFER_POOL
+            .try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                // Best fit: the smallest idle allocation that is large enough.
+                let best_fit = pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, raw)| raw.capacity >= size)
+                    .min_by_key(|(_, raw)| raw.capacity)
+                    .map(|(position, _)| position);
+                match best_fit {
+                    Some(position) => Some(pool.swap_remove(position)),
+                    None => {
+                        // Nothing fits: free the most recently returned allocation so that the
+                        // larger replacement takes its place instead of growing the pool.
+                        pool.pop();
+                        None
+                    }
+                }
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| RawParameterBuffer::allocate(size));
+        Self {
+            raw: Some(raw),
+            len: 0,
+        }
+    }
+
+    fn raw(&self) -> &RawParameterBuffer {
+        self.raw.as_ref().expect("present until drop")
+    }
+
+    fn capacity(&self) -> usize {
+        self.raw().capacity
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.raw().ptr.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The written bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the first `len` bytes were initialized by the serializer.
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
+    }
+
+    /// The written bytes.
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the first `len` bytes were initialized by the serializer.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.len) }
+    }
+
+    /// Returns the allocation to the pool (or frees it when the pool is full or it is large).
+    fn recycle(raw: RawParameterBuffer) {
+        if raw.capacity > MAX_POOLED_PARAMETER_BUFFER_CAPACITY {
+            return;
+        }
+        let _ = PARAMETER_BUFFER_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < MAX_POOLED_PARAMETER_BUFFERS {
+                pool.push(raw);
+            }
+        });
+    }
+
+    /// Scribbles over every idle pooled allocation of this thread, so tests can prove that
+    /// stale bytes never leak into a later serialization.
+    #[cfg(test)]
+    pub(crate) fn dirty_pool_for_tests(value: u8) {
+        PARAMETER_BUFFER_POOL.with_borrow_mut(|pool| {
+            for raw in pool.iter_mut() {
+                // SAFETY: the allocation is `capacity` bytes long and not in use.
+                unsafe { std::ptr::write_bytes(raw.ptr.as_ptr(), value, raw.capacity) };
+            }
+        });
+    }
+}
+
+impl Drop for PooledParameterBuffer {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            Self::recycle(raw);
+        }
+    }
+}
+
+impl SerializationBuffer for PooledParameterBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn as_slice(&self) -> &[u8] {
+        PooledParameterBuffer::as_slice(self)
+    }
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        PooledParameterBuffer::as_slice_mut(self)
+    }
+    fn fill_write(&mut self, num: usize, value: u8) -> std::io::Result<()> {
+        let new_len = self
+            .len
+            .checked_add(num)
+            .filter(|new_len| *new_len <= self.capacity())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "parameter buffer fill_write failed",
+                )
+            })?;
+        // SAFETY: `len..new_len` is within the allocation.
+        unsafe { std::ptr::write_bytes(self.ptr().add(self.len), value, num) };
+        self.len = new_len;
+        Ok(())
+    }
+    unsafe fn write_unchecked<T: Pod>(&mut self, value: T) {
+        let new_len = self.len.saturating_add(size_of::<T>());
+        debug_assert!(new_len <= self.capacity());
+        // SAFETY: the caller guarantees capacity.
+        unsafe {
+            self.ptr().add(self.len).cast::<T>().write_unaligned(value);
+        }
+        self.len = new_len;
+    }
+    unsafe fn write_all_unchecked(&mut self, value: &[u8]) {
+        let new_len = self.len.saturating_add(value.len());
+        debug_assert!(new_len <= self.capacity());
+        // SAFETY: the caller guarantees capacity; `value` cannot alias the uniquely owned buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), self.ptr().add(self.len), value.len());
+        }
+        self.len = new_len;
+    }
+}
+
+struct Serializer<B: SerializationBuffer> {
+    buffer: B,
     regions: Vec<MemoryRegion>,
     vaddr: u64,
     region_start: usize,
@@ -85,16 +336,17 @@ struct Serializer {
     account_data_direct_mapping: bool,
 }
 
-impl Serializer {
+impl<B: SerializationBuffer> Serializer<B> {
     fn new(
-        size: usize,
+        buffer: B,
         start_addr: u64,
         is_loader_v1: bool,
         virtual_address_space_adjustments: bool,
         account_data_direct_mapping: bool,
-    ) -> Serializer {
+    ) -> Serializer<B> {
+        debug_assert_eq!(buffer.len(), 0);
         Serializer {
-            buffer: AlignedMemory::with_capacity(size),
+            buffer,
             regions: Vec::new(),
             region_start: 0,
             vaddr: start_addr,
@@ -216,7 +468,7 @@ impl Serializer {
         self.vaddr += range.len() as u64;
     }
 
-    fn finish(mut self) -> (AlignedMemory<HOST_ALIGN>, Vec<MemoryRegion>) {
+    fn finish(mut self) -> (B, Vec<MemoryRegion>) {
         self.push_region();
         debug_assert_eq!(self.region_start, self.buffer.len());
         (self.buffer, self.regions)
@@ -250,6 +502,48 @@ pub fn serialize_parameters(
     ),
     InstructionError,
 > {
+    serialize_parameters_into(
+        instruction_context,
+        virtual_address_space_adjustments,
+        account_data_direct_mapping,
+        direct_account_pointers_in_program_input,
+        AlignedMemory::with_capacity,
+    )
+}
+
+/// [`serialize_parameters`] into a [`PooledParameterBuffer`]: the same bytes, regions,
+/// metadata and instruction-data offset, in a recycled allocation.
+pub fn serialize_parameters_pooled(
+    instruction_context: &InstructionContext,
+    virtual_address_space_adjustments: bool,
+    account_data_direct_mapping: bool,
+    direct_account_pointers_in_program_input: bool,
+) -> Result<
+    (
+        PooledParameterBuffer,
+        Vec<MemoryRegion>,
+        Vec<SerializedAccountMetadata>,
+        usize,
+    ),
+    InstructionError,
+> {
+    serialize_parameters_into(
+        instruction_context,
+        virtual_address_space_adjustments,
+        account_data_direct_mapping,
+        direct_account_pointers_in_program_input,
+        PooledParameterBuffer::with_capacity,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+fn serialize_parameters_into<B: SerializationBuffer>(
+    instruction_context: &InstructionContext,
+    virtual_address_space_adjustments: bool,
+    account_data_direct_mapping: bool,
+    direct_account_pointers_in_program_input: bool,
+    new_buffer: impl FnOnce(usize) -> B,
+) -> Result<(B, Vec<MemoryRegion>, Vec<SerializedAccountMetadata>, usize), InstructionError> {
     let num_ix_accounts = instruction_context.get_number_of_instruction_accounts();
     if num_ix_accounts > MAX_ACCOUNTS_PER_INSTRUCTION as IndexOfAccount {
         return Err(InstructionError::MaxAccountsExceeded);
@@ -287,6 +581,7 @@ pub fn serialize_parameters(
             &program_id,
             virtual_address_space_adjustments,
             account_data_direct_mapping,
+            new_buffer,
         )
     } else {
         // Used by loader-v2 (bpf_loader) and loader-v3 (bpf_loader_upgradeable)
@@ -298,6 +593,7 @@ pub fn serialize_parameters(
             account_data_direct_mapping,
             // SIMD-0449: only available on ABIv1
             direct_account_pointers_in_program_input,
+            new_buffer,
         )
     }
 }
@@ -333,21 +629,15 @@ pub fn deserialize_parameters(
     }
 }
 
-fn serialize_parameters_for_abiv0(
+#[allow(clippy::type_complexity)]
+fn serialize_parameters_for_abiv0<B: SerializationBuffer>(
     accounts: Vec<SerializeAccount>,
     instruction_data: &[u8],
     program_id: &Pubkey,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
-) -> Result<
-    (
-        AlignedMemory<HOST_ALIGN>,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
+    new_buffer: impl FnOnce(usize) -> B,
+) -> Result<(B, Vec<MemoryRegion>, Vec<SerializedAccountMetadata>, usize), InstructionError> {
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for account in &accounts {
@@ -374,7 +664,7 @@ fn serialize_parameters_for_abiv0(
          + size_of::<Pubkey>(); // program id
 
     let mut s = Serializer::new(
-        size,
+        new_buffer(size),
         MM_INPUT_START,
         true,
         virtual_address_space_adjustments,
@@ -487,22 +777,16 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
     Ok(())
 }
 
-fn serialize_parameters_for_abiv1(
+#[allow(clippy::type_complexity)]
+fn serialize_parameters_for_abiv1<B: SerializationBuffer>(
     accounts: Vec<SerializeAccount>,
     instruction_data: &[u8],
     program_id: &Pubkey,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
     direct_account_pointers_program_input: bool,
-) -> Result<
-    (
-        AlignedMemory<HOST_ALIGN>,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
+    new_buffer: impl FnOnce(usize) -> B,
+) -> Result<(B, Vec<MemoryRegion>, Vec<SerializedAccountMetadata>, usize), InstructionError> {
     let mut accounts_metadata = Vec::with_capacity(accounts.len());
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
@@ -545,7 +829,7 @@ fn serialize_parameters_for_abiv1(
     };
 
     let mut s = Serializer::new(
-        size,
+        new_buffer(size),
         MM_INPUT_START,
         false,
         virtual_address_space_adjustments,
@@ -1762,5 +2046,354 @@ mod tests {
         let vm_data_addr = account_metadata.vm_data_addr;
         let (_region_index, region) = memory_mapping.find_region(vm_data_addr).unwrap();
         assert_eq!(region.len(), 5);
+    }
+
+    /// Everything a program (or deserialization) can observe of one serialization: the bytes,
+    /// every region (vm range, length, writability, payload, where its host memory lies relative
+    /// to the buffer, and its content), the account metadata and the instruction-data offset.
+    /// (vm range, len, gap size, writable, payload, host location, content)
+    type ObservedRegion = (
+        std::ops::Range<u64>,
+        usize,
+        u64,
+        bool,
+        Option<u16>,
+        String,
+        Vec<u8>,
+    );
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedSerialization {
+        bytes: Vec<u8>,
+        regions: Vec<ObservedRegion>,
+        metadata: Vec<(u64, usize, u64, u64, u64, u64)>,
+        instruction_data_offset: usize,
+    }
+
+    fn observe(
+        bytes: &[u8],
+        regions: &[MemoryRegion],
+        metadata: &[SerializedAccountMetadata],
+        instruction_data_offset: usize,
+    ) -> ObservedSerialization {
+        let base = bytes.as_ptr() as usize;
+        ObservedSerialization {
+            bytes: bytes.to_vec(),
+            regions: regions
+                .iter()
+                .map(|region| {
+                    let host = region.host_buffer();
+                    let ptr = host.ptr() as *const u8 as usize;
+                    // Regions either point into the serialization buffer (compare offsets) or
+                    // into account storage (identical pointers in both runs).
+                    let location = if ptr >= base && ptr <= base + bytes.len() {
+                        format!("buffer+{}", ptr - base)
+                    } else {
+                        format!("external {ptr:#x}")
+                    };
+                    let content = unsafe {
+                        // SAFETY: test code, regions point at live memory of `len` bytes.
+                        std::slice::from_raw_parts(ptr as *const u8, region.len()).to_vec()
+                    };
+                    (
+                        region.vm_addr_range(),
+                        region.len(),
+                        region.gap_size(),
+                        host.is_mutable(),
+                        region.access_violation_handler_payload,
+                        location,
+                        content,
+                    )
+                })
+                .collect(),
+            metadata: metadata
+                .iter()
+                .map(|m| {
+                    (
+                        m.vm_addr,
+                        m.original_data_len,
+                        m.vm_data_addr,
+                        m.vm_key_addr,
+                        m.vm_lamports_addr,
+                        m.vm_owner_addr,
+                    )
+                })
+                .collect(),
+            instruction_data_offset,
+        }
+    }
+
+    /// Serializes the current instruction with the stock allocation and with a recycled pooled
+    /// allocation whose idle bytes were scribbled over, and asserts identical observations.
+    fn assert_pooled_serialization_is_identical(
+        instruction_context: &InstructionContext,
+        virtual_address_space_adjustments: bool,
+        account_data_direct_mapping: bool,
+        direct_account_pointers_in_program_input: bool,
+    ) {
+        let stock = serialize_parameters(
+            instruction_context,
+            virtual_address_space_adjustments,
+            account_data_direct_mapping,
+            direct_account_pointers_in_program_input,
+        )
+        .map(|(buffer, regions, metadata, offset)| {
+            observe(buffer.as_slice(), &regions, &metadata, offset)
+        });
+        for scribble in [0xa5, 0xff, 0x00] {
+            PooledParameterBuffer::dirty_pool_for_tests(scribble);
+            let pooled = serialize_parameters_pooled(
+                instruction_context,
+                virtual_address_space_adjustments,
+                account_data_direct_mapping,
+                direct_account_pointers_in_program_input,
+            )
+            .map(|(buffer, regions, metadata, offset)| {
+                observe(buffer.as_slice(), &regions, &metadata, offset)
+            });
+            assert_eq!(stock, pooled);
+        }
+    }
+
+    fn account_with_data(len: usize, owner: Pubkey, executable: bool) -> AccountSharedData {
+        AccountSharedData::from(Account {
+            lamports: len as u64 + 1,
+            data: (0..len).map(|i| (i % 251) as u8).collect(),
+            owner,
+            executable,
+            rent_epoch: 0,
+        })
+    }
+
+    #[test]
+    fn test_serialize_parameters_pooled_is_identical() {
+        // Data lengths cover every u128 alignment residue, empty accounts and accounts larger
+        // than the pool granularity; the order of the cases makes later (smaller) serializations
+        // reuse allocations that previously held larger, different inputs.
+        let data_lens: [&[usize]; 5] = [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17],
+            &[200_000, 3, 0],
+            &[33, 10_240, 10_241],
+            &[],
+            &[1_000_000],
+        ];
+        for loader_id in [
+            bpf_loader::id(),
+            bpf_loader_upgradeable::id(),
+            bpf_loader_deprecated::id(),
+        ] {
+            for lens in data_lens {
+                for virtual_address_space_adjustments in [false, true] {
+                    for account_data_direct_mapping in [false, true] {
+                        if account_data_direct_mapping && !virtual_address_space_adjustments {
+                            continue;
+                        }
+                        for direct_account_pointers_in_program_input in [false, true] {
+                            let program_id = Pubkey::new_unique();
+                            let mut transaction_accounts =
+                                vec![(program_id, account_with_data(0, loader_id, true))];
+                            for (i, len) in lens.iter().enumerate() {
+                                transaction_accounts.push((
+                                    Pubkey::new_unique(),
+                                    account_with_data(*len, program_id, i % 3 == 2),
+                                ));
+                            }
+                            let mut indexes: Vec<IndexOfAccount> =
+                                (1..transaction_accounts.len() as IndexOfAccount).collect();
+                            // Duplicates of the first and last account.
+                            if let (Some(first), Some(last)) =
+                                (indexes.first().copied(), indexes.last().copied())
+                            {
+                                indexes.push(first);
+                                indexes.push(last);
+                            }
+                            let instruction_accounts =
+                                deduplicated_instruction_accounts(&indexes, |i| i % 2 == 0);
+                            with_mock_invoke_context!(
+                                invoke_context,
+                                transaction_context,
+                                transaction_accounts
+                            );
+                            invoke_context
+                                .transaction_context
+                                .configure_top_level_instruction_for_tests(
+                                    0,
+                                    instruction_accounts,
+                                    vec![1, 2, 3, 4, 5, 6, 7],
+                                )
+                                .unwrap();
+                            invoke_context.push().unwrap();
+                            let instruction_context = invoke_context
+                                .transaction_context
+                                .get_current_instruction_context()
+                                .unwrap();
+                            assert_pooled_serialization_is_identical(
+                                &instruction_context,
+                                virtual_address_space_adjustments,
+                                account_data_direct_mapping,
+                                direct_account_pointers_in_program_input,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_serialize_parameters_pooled_error_is_identical() {
+        // Too many instruction accounts fails before any buffer is taken, identically.
+        let program_id = Pubkey::new_unique();
+        let mut transaction_accounts =
+            vec![(program_id, account_with_data(0, bpf_loader::id(), true))];
+        for _ in 0..MAX_ACCOUNTS_PER_INSTRUCTION {
+            transaction_accounts.push((
+                Pubkey::new_unique(),
+                account_with_data(0, program_id, false),
+            ));
+        }
+        let num_transaction_accounts = transaction_accounts.len();
+        let mut instruction_accounts = deduplicated_instruction_accounts(
+            &(1..num_transaction_accounts as IndexOfAccount).collect::<Vec<_>>(),
+            |_| false,
+        );
+        instruction_accounts.push(instruction_accounts.last().cloned().unwrap());
+        with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
+        invoke_context
+            .transaction_context
+            .configure_instruction_at_index(
+                0,
+                0,
+                instruction_accounts,
+                vec![u16::MAX; num_transaction_accounts],
+                Cow::Owned(vec![]),
+                Some(0),
+            )
+            .unwrap();
+        invoke_context.push().unwrap();
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()
+            .unwrap();
+        assert_eq!(
+            serialize_parameters(&instruction_context, false, false, false).err(),
+            Some(InstructionError::MaxAccountsExceeded)
+        );
+        assert_eq!(
+            serialize_parameters_pooled(&instruction_context, false, false, false).err(),
+            Some(InstructionError::MaxAccountsExceeded)
+        );
+    }
+
+    #[test]
+    fn test_parameter_buffer_pool_recycles_and_bounds() {
+        // Start from an empty pool (tests may share a thread with --test-threads=1).
+        PARAMETER_BUFFER_POOL.with_borrow_mut(Vec::clear);
+        // A dropped buffer's allocation is reused by the next request that fits.
+        let first = PooledParameterBuffer::with_capacity(100_000);
+        let first_ptr = first.ptr();
+        let first_capacity = first.capacity();
+        assert!(first_capacity >= 100_000);
+        assert_eq!(first_capacity % PARAMETER_BUFFER_CAPACITY_GRANULARITY, 0);
+        assert_eq!(first_ptr as usize % HOST_ALIGN, 0);
+        drop(first);
+        let second = PooledParameterBuffer::with_capacity(90_000);
+        assert_eq!(second.ptr(), first_ptr);
+        assert!(second.is_empty());
+        drop(second);
+        // Oversized buffers are not retained.
+        let huge = PooledParameterBuffer::with_capacity(MAX_POOLED_PARAMETER_BUFFER_CAPACITY + 1);
+        drop(huge);
+        PARAMETER_BUFFER_POOL.with_borrow(|pool| {
+            assert!(pool.len() <= MAX_POOLED_PARAMETER_BUFFERS);
+            assert!(
+                pool.iter()
+                    .all(|raw| raw.capacity <= MAX_POOLED_PARAMETER_BUFFER_CAPACITY)
+            );
+        });
+        // Nested (simultaneously live) buffers never share an allocation, and the pool never
+        // holds more than one allocation per nesting level.
+        let nested: Vec<_> = (0..MAX_POOLED_PARAMETER_BUFFERS + 2)
+            .map(|i| PooledParameterBuffer::with_capacity(1000 * (i + 1)))
+            .collect();
+        let mut ptrs: Vec<_> = nested.iter().map(|b| b.ptr() as usize).collect();
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        assert_eq!(ptrs.len(), nested.len());
+        drop(nested);
+        PARAMETER_BUFFER_POOL
+            .with_borrow(|pool| assert_eq!(pool.len(), MAX_POOLED_PARAMETER_BUFFERS));
+        // A request larger than every idle allocation replaces one instead of growing the pool.
+        let big = PooledParameterBuffer::with_capacity(3 * 1024 * 1024);
+        drop(big);
+        PARAMETER_BUFFER_POOL.with_borrow(|pool| {
+            assert_eq!(pool.len(), MAX_POOLED_PARAMETER_BUFFERS);
+            assert!(pool.iter().any(|raw| raw.capacity >= 3 * 1024 * 1024));
+        });
+    }
+
+    #[test]
+    fn test_pooled_fill_write_bounds() {
+        let mut buffer = PooledParameterBuffer::with_capacity(16);
+        let capacity = buffer.capacity();
+        buffer.fill_write(capacity - 1, 0).unwrap();
+        assert!(buffer.fill_write(2, 0).is_err());
+        assert_eq!(buffer.len(), capacity - 1);
+        buffer.fill_write(1, 9).unwrap();
+        assert_eq!(buffer.as_slice().last(), Some(&9));
+        assert!(buffer.as_slice()[..capacity - 1].iter().all(|b| *b == 0));
+    }
+
+    /// Microbenchmark (run with `--release -- --ignored --nocapture`): serializing a
+    /// PumpSwap-like input (26 accounts, one 105 KB) with fresh vs pooled allocations.
+    #[test]
+    #[ignore]
+    fn bench_serialize_parameters_pooled() {
+        const ITERATIONS: u32 = 2_000;
+        let program_id = Pubkey::new_unique();
+        let mut transaction_accounts =
+            vec![(program_id, account_with_data(0, bpf_loader::id(), true))];
+        for i in 0..26 {
+            let len = match i {
+                0 => 105_000,
+                1..=6 => 165,
+                7..=12 => 82,
+                _ => 0,
+            };
+            transaction_accounts.push((
+                Pubkey::new_unique(),
+                account_with_data(len, program_id, false),
+            ));
+        }
+        let indexes: Vec<IndexOfAccount> =
+            (1..transaction_accounts.len() as IndexOfAccount).collect();
+        let instruction_accounts = deduplicated_instruction_accounts(&indexes, |i| i % 2 == 0);
+        with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
+        invoke_context
+            .transaction_context
+            .configure_top_level_instruction_for_tests(0, instruction_accounts, vec![0; 24])
+            .unwrap();
+        invoke_context.push().unwrap();
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()
+            .unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(
+                serialize_parameters(&instruction_context, false, false, false).unwrap(),
+            );
+        }
+        let fresh = start.elapsed().as_nanos() / u128::from(ITERATIONS);
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            std::hint::black_box(
+                serialize_parameters_pooled(&instruction_context, false, false, false).unwrap(),
+            );
+        }
+        let pooled = start.elapsed().as_nanos() / u128::from(ITERATIONS);
+        println!(
+            "serialize_parameters (26 accounts, ~382 KB): fresh {fresh} ns, pooled {pooled} ns"
+        );
     }
 }

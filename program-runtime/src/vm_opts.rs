@@ -105,6 +105,14 @@ pub static HEAP_ZERO_OPT: EnvFlag = EnvFlag::new(
 /// candidates in a bounded per-thread cache keyed by the full 32-byte hash. See [`crate::pda`].
 pub static PDA_CACHE: EnvFlag = EnvFlag::new("SOLANA_VM_PDA_CACHE", "vm pda on-curve cache");
 
+/// `SOLANA_VM_SER_POOL`: serialize each invocation's program input into an allocation recycled
+/// through a per-thread pool instead of a fresh allocation. See
+/// [`crate::serialization::PooledParameterBuffer`].
+pub static SER_POOL: EnvFlag = EnvFlag::new(
+    "SOLANA_VM_SER_POOL",
+    "vm parameter serialization buffer pool",
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

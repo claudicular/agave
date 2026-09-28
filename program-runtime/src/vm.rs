@@ -14,7 +14,8 @@ use {
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_sbpf::{
-        ebpf::{self, MM_HEAP_START, MM_RODATA_START, MM_STACK_START},
+        aligned_memory::AlignedMemory,
+        ebpf::{self, HOST_ALIGN, MM_HEAP_START, MM_RODATA_START, MM_STACK_START},
         elf::Executable,
         error::{EbpfError, ProgramResult},
         memory_region::{AccessType, MemoryMapping, MemoryRegion},
@@ -182,6 +183,22 @@ unsafe fn set_memory_context<'b>(
         .map_err(|err| Box::new(err) as Box<dyn std::error::Error>)
 }
 
+/// The serialized program input of one invocation. It must outlive the invocation's
+/// `MemoryMapping`, whose input regions point into it.
+enum ParameterBytes {
+    Aligned(AlignedMemory<HOST_ALIGN>),
+    Pooled(serialization::PooledParameterBuffer),
+}
+
+impl ParameterBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ParameterBytes::Aligned(buffer) => buffer.as_slice(),
+            ParameterBytes::Pooled(buffer) => buffer.as_slice(),
+        }
+    }
+}
+
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 pub fn execute<'a, 'b: 'a>(
     executable: &'a Executable<InvokeContext<'static, 'static>>,
@@ -212,12 +229,35 @@ pub fn execute<'a, 'b: 'a>(
 
     let mut serialize_time = Measure::start("serialize");
     let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
-        serialization::serialize_parameters(
-            &instruction_context,
-            virtual_address_space_adjustments,
-            account_data_direct_mapping,
-            direct_account_pointers_in_program_input,
-        )?;
+        if vm_opts::SER_POOL.enabled() {
+            let (buffer, regions, accounts_metadata, instruction_data_offset) =
+                serialization::serialize_parameters_pooled(
+                    &instruction_context,
+                    virtual_address_space_adjustments,
+                    account_data_direct_mapping,
+                    direct_account_pointers_in_program_input,
+                )?;
+            (
+                ParameterBytes::Pooled(buffer),
+                regions,
+                accounts_metadata,
+                instruction_data_offset,
+            )
+        } else {
+            let (buffer, regions, accounts_metadata, instruction_data_offset) =
+                serialization::serialize_parameters(
+                    &instruction_context,
+                    virtual_address_space_adjustments,
+                    account_data_direct_mapping,
+                    direct_account_pointers_in_program_input,
+                )?;
+            (
+                ParameterBytes::Aligned(buffer),
+                regions,
+                accounts_metadata,
+                instruction_data_offset,
+            )
+        };
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
@@ -502,7 +542,7 @@ pub fn execute<'a, 'b: 'a>(
 }
 
 #[cfg(test)]
-#[allow(clippy::arithmetic_side_effects)]
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 pub(crate) mod tests {
     use {
         super::*,
@@ -511,7 +551,7 @@ pub(crate) mod tests {
             program_cache_entry::{ProgramCacheEntryOwner, ProgramCacheEntryType},
             with_mock_invoke_context,
         },
-        solana_account::{AccountSharedData, WritableAccount},
+        solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
         solana_pubkey::Pubkey,
         solana_sbpf::{
             assembler::assemble,
@@ -559,16 +599,41 @@ pub(crate) mod tests {
         heap_size: u32,
         instruction_data: &[u8],
     ) -> Observed {
+        run_program_with_accounts(executable, heap_size, instruction_data, vec![]).0
+    }
+
+    /// Like [`run_program`], with instruction accounts `(key, account, is_writable)`. Also
+    /// returns the accounts after the invocation.
+    pub(crate) fn run_program_with_accounts(
+        executable: &Executable<InvokeContext<'static, 'static>>,
+        heap_size: u32,
+        instruction_data: &[u8],
+        accounts: Vec<(Pubkey, AccountSharedData, bool)>,
+    ) -> (Observed, Vec<AccountSharedData>) {
+        use solana_transaction_context::instruction_accounts::InstructionAccount;
         // Fixed, so that logs of repeated runs are comparable.
         let program_id = Pubkey::new_from_array([7; 32]);
         let mut program_account = AccountSharedData::new(1, 0, &bpf_loader::id());
         program_account.set_executable(true);
-        let transaction_accounts = vec![(program_id, program_account)];
+        let instruction_accounts = accounts
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, is_writable))| {
+                InstructionAccount::new(index as u16 + 1, false, *is_writable)
+            })
+            .collect::<Vec<_>>();
+        let transaction_accounts = std::iter::once((program_id, program_account))
+            .chain(accounts.into_iter().map(|(key, account, _)| (key, account)))
+            .collect::<Vec<_>>();
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         invoke_context.set_heap_size_for_tests(heap_size);
         invoke_context
             .transaction_context
-            .configure_top_level_instruction_for_tests(0, vec![], instruction_data.to_vec())
+            .configure_top_level_instruction_for_tests(
+                0,
+                instruction_accounts,
+                instruction_data.to_vec(),
+            )
             .unwrap();
         invoke_context.push().unwrap();
         let result = execute(executable, &mut invoke_context, &dummy_cache_entry())
@@ -580,11 +645,34 @@ pub(crate) mod tests {
             .borrow()
             .get_recorded_content()
             .to_vec();
-        Observed {
-            result,
-            remaining_cu,
-            logs,
-        }
+        let post_accounts = (0..invoke_context.transaction_context.get_number_of_accounts())
+            .map(|index| {
+                invoke_context
+                    .transaction_context
+                    .accounts()
+                    .try_borrow(index)
+                    .map(|account| {
+                        #[allow(deprecated)]
+                        let executable = account.executable();
+                        AccountSharedData::from(solana_account::Account {
+                            lamports: account.lamports(),
+                            data: account.data().to_vec(),
+                            owner: *account.owner(),
+                            executable,
+                            rent_epoch: account.rent_epoch(),
+                        })
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (
+            Observed {
+                result,
+                remaining_cu,
+                logs,
+            },
+            post_accounts,
+        )
     }
 
     /// Writes 0xff to every byte of `[MM_HEAP_START, MM_HEAP_START + len)`, 8 bytes at a time.
@@ -676,6 +764,106 @@ pub(crate) mod tests {
         }
         // ...and results, compute units and logs are identical with the switch on.
         assert_eq!(stock, optimized);
+    }
+
+    /// Hashes every byte of the serialized input `[MM_INPUT_START, end)`, where `end` is the
+    /// end of the program id that follows the instruction data (r2 points at the instruction
+    /// data, whose u64 length precedes it). Stores the hash into the first 8 data bytes of the
+    /// first account (writable, 16 data bytes, program-owned), writes a pattern into its realloc
+    /// padding and grows it by 3 bytes, so the hash and the padding handling become visible in
+    /// the post-invocation account state (via deserialization).
+    fn input_hash_program() -> Executable<InvokeContext<'static, 'static>> {
+        assemble_v0(
+            "
+            mov64 r9, r1
+            ldxdw r3, [r2-8]
+            add64 r3, r2
+            add64 r3, 32
+            mov64 r0, 0
+            mov64 r4, r1
+            ldxb r5, [r4+0]
+            mul64 r0, 31
+            add64 r0, r5
+            add64 r4, 1
+            jlt r4, r3, -5
+            stxdw [r9+96], r0
+            mov64 r6, 0x77
+            stxb [r9+112], r6
+            stxb [r9+113], r6
+            stxb [r9+114], r6
+            ldxdw r6, [r9+88]
+            add64 r6, 3
+            stxdw [r9+88], r6
+            mov64 r0, 0
+            exit",
+        )
+    }
+
+    fn input_hash_sequence() -> Vec<(Observed, Vec<AccountSharedData>)> {
+        let program = input_hash_program();
+        let owner = Pubkey::new_from_array([7; 32]);
+        let account = |seed: u8, len: usize| {
+            let mut account = AccountSharedData::new(u64::from(seed), len, &owner);
+            account
+                .data_as_mut_slice()
+                .iter_mut()
+                .enumerate()
+                .for_each(|(i, b)| *b = (i as u8).wrapping_mul(seed));
+            account
+        };
+        [
+            // Large input first so later, smaller inputs reuse its (dirty) allocation.
+            vec![(5, 16), (9, 120_000), (8, 30_000), (3, 0)],
+            vec![(5, 16), (7, 9)],
+            vec![(5, 16), (11, 12_345), (2, 1), (4, 0)],
+            vec![(5, 16)],
+        ]
+        .into_iter()
+        .map(|accounts| {
+            let accounts = accounts
+                .into_iter()
+                .enumerate()
+                .map(|(i, (seed, len))| {
+                    (
+                        Pubkey::new_from_array([i as u8 + 10; 32]),
+                        account(seed, len),
+                        i == 0,
+                    )
+                })
+                .collect();
+            run_program_with_accounts(&program, MIN_HEAP_FRAME_BYTES, &[1, 2, 3], accounts)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_ser_pool_is_unobservable() {
+        let stock = {
+            vm_opts::SER_POOL.set(false);
+            input_hash_sequence()
+        };
+        let pooled = {
+            vm_opts::SER_POOL.set(true);
+            crate::serialization::PooledParameterBuffer::dirty_pool_for_tests(0xa5);
+            let first = input_hash_sequence();
+            crate::serialization::PooledParameterBuffer::dirty_pool_for_tests(0xff);
+            let second = input_hash_sequence();
+            assert_eq!(first, second);
+            first
+        };
+        vm_opts::SER_POOL.set(false);
+        for (observed, accounts) in &stock {
+            assert_eq!(observed.result, Ok(()), "{observed:?}");
+            // The first instruction account (index 1) holds the input hash, then its original
+            // bytes 8..16, then the 3 pattern bytes it grew into.
+            let data = accounts[1].data();
+            assert_eq!(data.len(), 19);
+            assert_ne!(data[..8], [0; 8]);
+            assert_eq!(data[16..], [0x77; 3]);
+        }
+        // Different inputs hash differently (the hash covers the whole input).
+        assert_ne!(stock[1].1[1].data()[..8], stock[3].1[1].data()[..8]);
+        assert_eq!(stock, pooled);
     }
 
     #[test]
