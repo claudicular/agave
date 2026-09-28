@@ -203,17 +203,18 @@ fn transactions(w: &World, seed: u64) -> Vec<VersionedTransaction> {
     let blockhash = w.parent.last_blockhash();
     let token_ro = Pubkey::new_from_array([7; 32]);
     let mut txs = Vec::new();
-    for i in 0..220 {
+    for i in 0..220u64 {
         let from = &w.keys[rng.random_range(0..w.keys.len())];
         let to = if rng.random_bool(0.1) {
             Pubkey::new_unique()
         } else {
             w.keys[rng.random_range(0..w.keys.len())].pubkey()
         };
+        // `+ i` keeps every transaction unique (a block cannot repeat a signature).
         let lamports = match rng.random_range(0..10) {
-            0 => 40_000_000_000, // often exceeds the balance: failure
-            1 => 1,
-            _ => rng.random_range(1_000..5_000_000),
+            0 => 40_000_000_000 + i, // often exceeds the balance: failure
+            1 => 1 + i,
+            _ => rng.random_range(1_000..5_000_000) + i,
         };
         let use_payer = rng.random_bool(0.5);
         let mut ixs = vec![system_instruction::transfer(&from.pubkey(), &to, lamports)];
