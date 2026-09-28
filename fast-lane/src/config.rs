@@ -451,7 +451,8 @@ mod tests {
 # 15:25Z) + `vm_opts = true` (result-identical VM shortcuts on FL's executor threads only,
 # DESIGN §20) + `rebase = true` (delta-rebase value prediction for fee-payer / fee-sink
 # chains, DESIGN §19). Nothing else changed.
-# Binary: /home/sol/fl-bin/agave-validator-<sha10> named in PROGRESS.md's latest READY line.
+# Binary: /home/sol/fl-bin/agave-validator-f33fbabe35 (fast-lane f33fbabe35 = c3f25234d5 + rebase
+# + FL-only VM shortcuts).
 # The older binaries reject these keys (unknown keys fail the config parse): deploy binary
 # and config together. Runtime A/B without restart: `vm_opts=off|on`, `rebase=off|on` in the
 # control file.
