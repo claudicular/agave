@@ -1,6 +1,7 @@
 use {
     crate::{
         cluster_nodes::{ClusterNodesCache, DATA_PLANE_FANOUT},
+        receive_diet::{self, TraceStage, receive_diet},
         retransmit_stage::RetransmitStage,
     },
     agave_feature_set as feature_set,
@@ -18,7 +19,7 @@ use {
             layout::{get_shred, resign_packet},
             wire::is_retransmitter_signed_variant,
         },
-        sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds},
+        sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds, verify_shreds_serial},
     },
     solana_perf::{
         self,
@@ -108,6 +109,9 @@ pub fn spawn_shred_sigverify(
             // We can't store the keypair outside the loop
             // because the identity might be hot swapped.
             let keypair = cluster_info.keypair();
+            // Receive diet switches may be flipped at runtime; read them once per iteration.
+            let serial_max_packets = receive_diet().serial_sigverify_max_packets();
+            let tracing = receive_diet::trace_enabled();
             match run_shred_sigverify(
                 &thread_pool,
                 &keypair,
@@ -123,6 +127,8 @@ pub fn spawn_shred_sigverify(
                 &cache,
                 &mut stats,
                 &mut shred_buffer,
+                serial_max_packets,
+                tracing,
             ) {
                 Ok(()) => (),
                 Err(ShredSigverifyError::RecvTimeout) => (),
@@ -154,6 +160,10 @@ fn run_shred_sigverify<const K: usize>(
     cache: &RwLock<LruCache>,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
+    // Receive diet `serial_sigverify` bound; 0 = off.
+    serial_max_packets: usize,
+    // Receive diet tracer on.
+    tracing: bool,
 ) -> Result<(), ShredSigverifyError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
     let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
@@ -168,9 +178,18 @@ fn run_shred_sigverify<const K: usize>(
     }
 
     let now = Instant::now();
+    if tracing {
+        trace_packets(TraceStage::SigverifyDequeued, shred_buffer);
+    }
     stats.num_iters += 1;
     stats.num_batches += shred_buffer.len();
     stats.num_discards_pre += count_discards(shred_buffer);
+    // With the receive diet `serial_sigverify` switch, an iteration holding only a few packets
+    // (the common case once the TVU receive coalesce is off) is processed on this thread: the
+    // same dedup, verification and resigning, without three rayon hand-offs.
+    let thread_pool = (serial_max_packets == 0
+        || shred_buffer.iter().map(PacketBatch::len).sum::<usize>() > serial_max_packets)
+        .then_some(thread_pool);
     // Repair shreds include a randomly generated u32 nonce, so it does not
     // make sense to deduplicate the entire packet payload (i.e. they are not
     // duplicate of any other packet.data(..)).
@@ -184,20 +203,29 @@ fn run_shred_sigverify<const K: usize>(
     // path once a shred is repaired.
     // For backward compatibility we need to allow trailing bytes in the packet
     // after the shred payload, but have to exclude them here from the deduper.
-    stats.num_duplicates += thread_pool.install(|| {
-        shred_buffer
-            .par_iter_mut()
-            .flatten()
-            .filter(|packet| {
-                !packet.meta().discard()
-                    && shred::wire::get_shred(packet.as_ref())
-                        .map(|shred| deduper.dedup(shred))
-                        .unwrap_or(true)
-                    && !packet.meta().repair()
-            })
+    let is_duplicate = |packet: &PacketRefMut| {
+        !packet.meta().discard()
+            && shred::wire::get_shred(packet.as_ref())
+                .map(|shred| deduper.dedup(shred))
+                .unwrap_or(true)
+            && !packet.meta().repair()
+    };
+    stats.num_duplicates += match thread_pool {
+        Some(thread_pool) => thread_pool.install(|| {
+            shred_buffer
+                .par_iter_mut()
+                .flatten()
+                .filter(is_duplicate)
+                .map(|mut packet| packet.meta_mut().set_discard(true))
+                .count()
+        }),
+        None => shred_buffer
+            .iter_mut()
+            .flat_map(|batch| batch.iter_mut())
+            .filter(is_duplicate)
             .map(|mut packet| packet.meta_mut().set_discard(true))
-            .count()
-    });
+            .count(),
+    };
     let (working_bank, root_bank) = {
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
@@ -214,28 +242,41 @@ fn run_shred_sigverify<const K: usize>(
     // Verify retransmitter's signature, and resign shreds
     // Merkle root as the retransmitter node.
     let resign_start = Instant::now();
-    thread_pool.install(|| {
-        shred_buffer
-            .par_iter_mut()
-            .flatten()
-            .filter(|packet| !packet.meta().discard())
-            .for_each(|mut packet| {
-                if maybe_verify_and_resign_packet(
-                    &mut packet,
-                    &root_bank,
-                    &working_bank,
-                    cluster_info,
-                    leader_schedule_cache,
-                    cluster_nodes_cache,
-                    stats,
-                    keypair,
-                )
-                .is_err()
-                {
-                    packet.meta_mut().set_discard(true);
-                }
-            })
-    });
+    let verify_and_resign = |mut packet: PacketRefMut| {
+        if maybe_verify_and_resign_packet(
+            &mut packet,
+            &root_bank,
+            &working_bank,
+            cluster_info,
+            leader_schedule_cache,
+            cluster_nodes_cache,
+            stats,
+            keypair,
+        )
+        .is_err()
+        {
+            packet.meta_mut().set_discard(true);
+        }
+    };
+    // The pass only resigns resigned-variant shreds (the last erasure batches of a slot) and
+    // discards packets it cannot parse; with the diet switch on it is skipped when the iteration
+    // holds neither.
+    if serial_max_packets == 0 || needs_resign_pass(shred_buffer) {
+        match thread_pool {
+            Some(thread_pool) => thread_pool.install(|| {
+                shred_buffer
+                    .par_iter_mut()
+                    .flatten()
+                    .filter(|packet| !packet.meta().discard())
+                    .for_each(verify_and_resign)
+            }),
+            None => shred_buffer
+                .iter_mut()
+                .flat_map(|batch| batch.iter_mut())
+                .filter(|packet| !packet.meta().discard())
+                .for_each(verify_and_resign),
+        }
+    }
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
     // Extract shred payload from packets, and separate out repaired shreds.
     let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
@@ -272,6 +313,12 @@ fn run_shred_sigverify<const K: usize>(
         }
     }
     // Send all shreds to window service to be inserted into blockstore.
+    if tracing {
+        shreds
+            .iter()
+            .chain(repairs.iter().map(|(shred, _, _)| shred))
+            .for_each(|shred| receive_diet::trace_shred(TraceStage::SigverifySent, shred));
+    }
     let shreds = shreds
         .into_iter()
         .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
@@ -415,7 +462,8 @@ fn verify_retransmitter_signature(
 }
 
 fn verify_packets(
-    thread_pool: &ThreadPool,
+    // None: verify on the calling thread.
+    thread_pool: Option<&ThreadPool>,
     self_pubkey: &Pubkey,
     working_bank: &Bank,
     leader_schedule_cache: &LeaderScheduleCache,
@@ -427,8 +475,34 @@ fn verify_packets(
             .filter_map(|(slot, pubkey)| Some((slot, pubkey?)))
             .chain(std::iter::once((Slot::MAX, Pubkey::default())))
             .collect();
-    let out = verify_shreds(thread_pool, packets, &leader_slots, cache);
+    let out = match thread_pool {
+        Some(thread_pool) => verify_shreds(thread_pool, packets, &leader_slots, cache),
+        None => verify_shreds_serial(packets, &leader_slots, cache),
+    };
     solana_perf::sigverify::mark_disabled(packets, &out);
+}
+
+/// True if the resign pass has anything to do: a non-discarded packet that is of a resigned
+/// variant, or whose variant cannot be read (the pass discards those).
+fn needs_resign_pass(packets: &[PacketBatch]) -> bool {
+    packets
+        .iter()
+        .flat_map(|batch| batch.iter())
+        .filter(|packet| !packet.meta().discard())
+        .any(|packet| {
+            get_shred(packet)
+                .map(|shred| is_retransmitter_signed_variant(shred).unwrap_or(true))
+                .unwrap_or(true)
+        })
+}
+
+fn trace_packets(stage: TraceStage, packets: &[PacketBatch]) {
+    packets
+        .iter()
+        .flat_map(|batch| batch.iter())
+        .filter(|packet| !packet.meta().discard())
+        .filter_map(get_shred)
+        .for_each(|shred| receive_diet::trace_shred(stage, shred));
 }
 
 // Returns pubkey of leaders for shred slots referenced in the packets.
@@ -664,8 +738,9 @@ mod tests {
             .into_iter()
             .map(PacketBatch::from)
             .collect::<Vec<_>>();
+        let fresh_batches = batches.clone();
         verify_packets(
-            &thread_pool,
+            Some(&thread_pool),
             &Pubkey::new_unique(), // self_pubkey
             &working_bank,
             &leader_schedule_cache,
@@ -674,6 +749,178 @@ mod tests {
         );
         assert!(!batches[0].get(0).unwrap().meta().discard());
         assert!(batches[0].get(1).unwrap().meta().discard());
+        // Same answer on the calling thread.
+        let mut batches = fresh_batches;
+        verify_packets(
+            None,
+            &Pubkey::new_unique(), // self_pubkey
+            &working_bank,
+            &leader_schedule_cache,
+            &mut batches,
+            &RwLock::new(LruCache::new(/*capacity:*/ 128)),
+        );
+        assert!(!batches[0].get(0).unwrap().meta().discard());
+        assert!(batches[0].get(1).unwrap().meta().discard());
+    }
+
+    // Serial processing (receive diet `serial_sigverify`) must give exactly the thread-pool
+    // results: the same verified and retransmitted payloads (including resigned bytes) and the
+    // same counters.
+    #[test_matrix([true, false])]
+    fn test_run_shred_sigverify_serial_matches_thread_pool(is_last_in_slot: bool) {
+        let leader_keypair = Arc::new(Keypair::new());
+        let leader_pubkey = leader_keypair.pubkey();
+        let bank = Bank::new_for_tests(
+            &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
+        );
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let node_keypair = Arc::new(Keypair::new());
+        let cluster_info = ClusterInfo::new(
+            ContactInfo::new_localhost(&node_keypair.pubkey(), timestamp()),
+            node_keypair.clone(),
+            SocketAddrSpace::Unspecified,
+        );
+        let make_shreds = |keypair: &Keypair| -> Vec<Vec<u8>> {
+            Shredder::new(root_bank.slot(), root_bank.parent_slot(), 0, 0)
+                .unwrap()
+                .make_merkle_shreds_from_entries(
+                    keypair,
+                    &create_ticks(300, 1, Hash::default()),
+                    is_last_in_slot,
+                    Hash::default(), // chained_merkle_root
+                    0,               // next_shred_index
+                    0,               // next_code_index
+                    &ReedSolomonCache::default(),
+                    &mut ProcessShredsStats::default(),
+                )
+                .map(|shred| shred.payload().to_vec())
+                .collect()
+        };
+        let valid = make_shreds(&leader_keypair);
+        let invalid = make_shreds(&Keypair::new());
+        assert!(valid.len() > 8);
+        // Valid shreds, some sent twice, and a few signed by the wrong key.
+        let payloads: Vec<&[u8]> = valid
+            .iter()
+            .chain(valid.iter().step_by(3))
+            .chain(invalid.iter().take(4))
+            .map(Vec::as_slice)
+            .collect();
+        let batches: Vec<PacketBatch> = payloads
+            .chunks(5)
+            .map(|chunk| {
+                let mut batch = RecycledPacketBatch::with_capacity(chunk.len());
+                batch.resize(chunk.len(), Packet::default());
+                for (packet, payload) in batch.iter_mut().zip(chunk) {
+                    packet.buffer_mut()[..payload.len()].copy_from_slice(payload);
+                    packet.meta_mut().size = payload.len();
+                }
+                PacketBatch::from(batch)
+            })
+            .collect();
+        let thread_pool = ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+        let run = |serial_max_packets: usize| {
+            let (fetch_sender, fetch_receiver) = crossbeam_channel::unbounded();
+            for batch in &batches {
+                fetch_sender.send(batch.clone()).unwrap();
+            }
+            let (retransmit_sender, retransmit_receiver) = EvictingSender::new_bounded(1024);
+            let (verified_sender, verified_receiver) = crossbeam_channel::unbounded();
+            let deduper = Deduper::<2, [u8]>::new(&mut rand::rng(), /*num_bits:*/ 1 << 20);
+            let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
+            let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
+                CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+                CLUSTER_NODES_CACHE_TTL,
+            );
+            let mut stats = ShredSigVerifyStats::new(Instant::now());
+            let mut shred_buffer = Vec::new();
+            assert!(
+                run_shred_sigverify(
+                    &thread_pool,
+                    &node_keypair,
+                    &cluster_info,
+                    &bank_forks,
+                    &leader_schedule_cache,
+                    &deduper,
+                    &fetch_receiver,
+                    &retransmit_sender,
+                    &verified_sender,
+                    &cluster_nodes_cache,
+                    &|_| None,
+                    &cache,
+                    &mut stats,
+                    &mut shred_buffer,
+                    serial_max_packets,
+                    false, // tracing
+                )
+                .is_ok()
+            );
+            let verified: Vec<(Vec<u8>, bool)> = verified_receiver
+                .try_iter()
+                .flatten()
+                .map(|(shred, repaired, _)| (shred.to_vec(), repaired))
+                .collect();
+            let retransmitted: Vec<Vec<u8>> = retransmit_receiver
+                .try_iter()
+                .flatten()
+                .map(|shred| shred.to_vec())
+                .collect();
+            let counters = [
+                stats.num_iters,
+                stats.num_packets,
+                stats.num_duplicates,
+                stats.num_discards_post,
+                stats.num_retransmit_shreds,
+                stats.num_invalid_retransmitter.load(Ordering::Relaxed),
+                stats
+                    .num_retranmitter_signature_skipped
+                    .load(Ordering::Relaxed),
+            ];
+            (verified, retransmitted, counters)
+        };
+        // On the thread pool, the order in which the two copies of a duplicate are seen (and so
+        // the output order) is not deterministic, and two copies deduplicated concurrently can
+        // both pass the Bloom filter. Compare the sets of payloads; on this thread the result is
+        // exact: every valid shred once, every copy and every forged shred discarded.
+        let unique = |payloads: &[Vec<u8>]| -> Vec<Vec<u8>> {
+            let mut payloads = payloads.to_vec();
+            payloads.sort_unstable();
+            payloads.dedup();
+            payloads
+        };
+        let num_duplicates = valid.len().div_ceil(3);
+        let serial = run(payloads.len());
+        assert_eq!(serial.0.len(), valid.len());
+        assert!(serial.0.iter().all(|(_, repaired)| !repaired));
+        let serial_verified: Vec<_> = serial.0.iter().map(|(shred, _)| shred.clone()).collect();
+        assert_eq!(unique(&serial_verified).len(), valid.len());
+        assert_eq!(serial.1, serial_verified);
+        assert_eq!(
+            serial.2,
+            [
+                1,
+                payloads.len(),
+                num_duplicates,
+                num_duplicates + 4,
+                valid.len(),
+                0,
+                serial.2[6],
+            ]
+        );
+        assert_eq!(run(usize::MAX), serial);
+        // Bound 0 (switch off) and a bound below the iteration size use the thread pool.
+        for serial_max_packets in [0, payloads.len() - 1] {
+            let pooled = run(serial_max_packets);
+            let pooled_verified: Vec<_> = pooled.0.iter().map(|(shred, _)| shred.clone()).collect();
+            assert_eq!(unique(&pooled_verified), unique(&serial_verified));
+            assert_eq!(unique(&pooled.1), unique(&serial.1));
+            let num_raced = pooled.0.len() - valid.len();
+            assert_eq!(pooled.2[2] + num_raced, num_duplicates);
+            // A copy that raced through is resigned (and counted) a second time.
+            assert!((serial.2[6]..=serial.2[6] + num_raced).contains(&pooled.2[6]));
+        }
     }
 
     #[test_matrix(

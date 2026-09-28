@@ -9,6 +9,8 @@ pub mod cluster_nodes;
 
 pub mod retransmit_stage;
 
+pub mod receive_diet;
+
 pub mod sigverify_shreds;
 
 pub use solana_net_utils::PinnedXdpSender as XdpSender;
