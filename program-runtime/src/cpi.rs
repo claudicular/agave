@@ -664,7 +664,7 @@ pub fn translate_signers(
                         translate_vm_slice(untranslated_seed, memory_mapping, check_aligned)
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
-                Pubkey::create_program_address(&seeds_bytes, program_id)
+                crate::pda::create_program_address(&seeds_bytes, program_id)
                     .map_err(|err| Box::new(CpiError::BadSeeds(err)) as Error)
             })
             .collect::<Result<Vec<_>, Error>>()?)

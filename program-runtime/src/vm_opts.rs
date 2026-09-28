@@ -101,6 +101,10 @@ pub static HEAP_ZERO_OPT: EnvFlag = EnvFlag::new(
     "vm heap reset: mapped prefix only",
 );
 
+/// `SOLANA_VM_PDA_CACHE`: memoize the ed25519 on-curve test of program-derived-address
+/// candidates in a bounded per-thread cache keyed by the full 32-byte hash. See [`crate::pda`].
+pub static PDA_CACHE: EnvFlag = EnvFlag::new("SOLANA_VM_PDA_CACHE", "vm pda on-curve cache");
+
 #[cfg(test)]
 mod tests {
     use super::*;

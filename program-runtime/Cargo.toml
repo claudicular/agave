@@ -65,6 +65,7 @@ solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
 solana-sbpf = { workspace = true, features = ["jit"] }
 solana-sdk-ids = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 solana-slot-hashes = { workspace = true, features = ["wincode"] }
 solana-stable-layout = { workspace = true }
 solana-stake-history = { workspace = true }

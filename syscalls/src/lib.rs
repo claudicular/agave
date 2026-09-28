@@ -30,7 +30,7 @@ use {
         invoke_context::InvokeContext,
         loaded_programs::ProgramRuntimeEnvironment,
         memory::{MemoryTranslationError, translate_vm_slice},
-        stable_log, translate_inner, translate_slice_inner, translate_type_inner,
+        pda, stable_log, translate_inner, translate_slice_inner, translate_type_inner,
     },
     solana_pubkey::{MAX_SEED_LEN, MAX_SEEDS, PUBKEY_BYTES, Pubkey, PubkeyError},
     solana_sbpf::{
@@ -843,7 +843,7 @@ declare_builtin_function!(
             check_aligned,
         )?;
 
-        let Ok(new_address) = Pubkey::create_program_address(&seeds, program_id) else {
+        let Ok(new_address) = pda::create_program_address(&seeds, program_id) else {
             return Ok(1);
         };
         translate_mut!(
@@ -889,7 +889,7 @@ declare_builtin_function!(
                 seeds_with_bump.push(&bump_seed);
 
                 if let Ok(new_address) =
-                    Pubkey::create_program_address(&seeds_with_bump, program_id)
+                    pda::create_program_address(&seeds_with_bump, program_id)
                 {
                     translate_mut!(
                         memory_mapping,
@@ -6076,6 +6076,56 @@ mod tests {
             create_program_address(&mut invoke_context, &[b"", &[1]], &address),
             Result::Err(error) if error.downcast_ref::<InstructionError>().unwrap() == &InstructionError::ComputationalBudgetExceeded
         );
+    }
+
+    /// `SOLANA_VM_PDA_CACHE` must not change any observable outcome of the PDA syscalls: the
+    /// returned address/bump, the error and the compute units consumed, cold or warm cache,
+    /// with ample or truncated budgets.
+    #[test]
+    fn test_program_address_syscalls_pda_cache_differential() {
+        use {solana_program_runtime::vm_opts::PDA_CACHE, solana_sbpf::vm::ContextObject};
+
+        prepare_mockup!(invoke_context, program_id, bpf_loader::id());
+        let cost = invoke_context
+            .get_execution_cost()
+            .create_program_address_units;
+        let max_seeds: Vec<[u8; 1]> = (0..MAX_SEEDS as u8).map(|i| [i]).collect();
+        let max_seeds: Vec<&[u8]> = max_seeds.iter().map(|s| s.as_slice()).collect();
+        let long_seed = [7u8; MAX_SEED_LEN + 1];
+        let mut cases: Vec<(Vec<&[u8]>, Pubkey)> = vec![
+            (vec![b"Lil'", b"Bits"], bpf_loader_upgradeable::id()),
+            (vec![b""], bpf_loader_upgradeable::id()),
+            (vec![b"Talking", b"Squirrels"], bpf_loader_upgradeable::id()),
+            // try_find appends a bump, exceeding MAX_SEEDS: every iteration fails and is charged.
+            (max_seeds.clone(), bpf_loader_upgradeable::id()),
+            (vec![&long_seed], bpf_loader_upgradeable::id()),
+        ];
+        for _ in 0..40 {
+            cases.push((vec![b"pool", b"config"], Pubkey::new_unique()));
+        }
+
+        let mut runs = Vec::new();
+        // Stock, then cache on (cold), then cache on (warm).
+        for cached in [false, true, true] {
+            PDA_CACHE.set(cached);
+            let mut observed = Vec::new();
+            for (seeds, address) in &cases {
+                for budget in [cost * 256, cost * 3, cost] {
+                    invoke_context.compute_meter.mock_set_remaining(budget);
+                    let found = try_find_program_address(&mut invoke_context, seeds, address)
+                        .map_err(|err| err.to_string());
+                    observed.push((format!("{found:?}"), invoke_context.get_remaining()));
+                    invoke_context.compute_meter.mock_set_remaining(budget);
+                    let created = create_program_address(&mut invoke_context, seeds, address)
+                        .map_err(|err| err.to_string());
+                    observed.push((format!("{created:?}"), invoke_context.get_remaining()));
+                }
+            }
+            runs.push(observed);
+        }
+        PDA_CACHE.set(false);
+        assert_eq!(runs[0], runs[1]);
+        assert_eq!(runs[0], runs[2]);
     }
 
     #[test]

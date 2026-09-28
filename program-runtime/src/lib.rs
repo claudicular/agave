@@ -13,6 +13,7 @@ pub mod loading_task;
 pub mod mem_pool;
 pub mod memory;
 pub mod memory_context;
+pub mod pda;
 pub mod program_cache_entry;
 pub mod program_metrics;
 pub mod serialization;
