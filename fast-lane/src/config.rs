@@ -54,6 +54,13 @@ pub struct Config {
     pub max_incarnations: u32,
     /// Re-dispatch executed/running readers as soon as a stale read is detected.
     pub eager_reexec: bool,
+    /// Delta-rebase value prediction (needs `eager_reexec`): when a speculatively executed
+    /// transaction's input changes, install a predicted output (its own change re-applied to
+    /// the new input) for later transactions to speculate on, and let accounts whose
+    /// predictions verify (fee payers, fee sinks) be speculated past. Exactness is unchanged:
+    /// predictions are never final and every FINAL read is checked against executed values.
+    /// Runtime toggle: `rebase=on|off` in the control file.
+    pub rebase: bool,
     /// Give up on a slot whose parent does not freeze within this time.
     pub parent_wait_ms: u64,
     /// Maximum concurrently active runs.
@@ -123,6 +130,7 @@ impl Default for Config {
             hint_alpha: 1.0 / 32.0,
             max_incarnations: 3,
             eager_reexec: true,
+            rebase: false,
             parent_wait_ms: 300,
             max_runs: 4,
             mem_cap_mb: 1024,
@@ -266,6 +274,7 @@ impl Config {
             "hint_alpha" => self.hint_alpha = parse_scalar(key, value)?,
             "max_incarnations" => self.max_incarnations = parse_scalar(key, value)?,
             "eager_reexec" => self.eager_reexec = parse_bool(key, value)?,
+            "rebase" => self.rebase = parse_bool(key, value)?,
             "parent_wait_ms" => self.parent_wait_ms = parse_scalar(key, value)?,
             "max_runs" => self.max_runs = parse_scalar(key, value)?,
             "mem_cap_mb" => self.mem_cap_mb = parse_scalar(key, value)?,

@@ -49,6 +49,8 @@ pub struct FinalRecord {
     pub n_preds: usize,
     pub t_ingest: Instant,
     pub t_first_dispatch: Instant,
+    pub t_ready: Instant,
+    pub rebased: u32,
     pub t_exec_start: Instant,
     pub t_exec_end: Instant,
     pub t_final: Instant,
@@ -106,6 +108,8 @@ impl FinalSink for CmpSink {
             n_preds: f.n_preds,
             t_ingest: f.t_ingest,
             t_first_dispatch: f.t_first_dispatch,
+            t_ready: f.t_ready,
+            rebased: f.rebased,
             t_exec_start: f.t_exec_start,
             t_exec_end: f.t_exec_end,
             t_final: f.t_final,
@@ -208,6 +212,11 @@ struct Interval {
     chained_lead_us: Vec<i64>,
     sysvar_checks_ok: u64,
     sysvar_check_mismatch: u64,
+    predictions: u64,
+    pred_hits: u64,
+    pred_misses: u64,
+    spec_relaxed: u64,
+    final_fixups: u64,
 }
 
 struct RunInfo {
@@ -256,7 +265,7 @@ impl Comparator {
                 "slot,ordinal,signature,vote,token,outcome,class,fl_final_unix_ns,\
                  agave_unix_ns,tap_unix_ns,lead_us,fl_latency_us,agave_latency_us,\
                  incarnations,spec,exec_us,n_preds,kind,ok,parent_slot,ingest_us,\
-                 first_dispatch_us,exec_start_us,exec_end_us,src,chained",
+                 first_dispatch_us,exec_start_us,exec_end_us,src,chained,ready_us,rebased",
             ),
             mb,
             config.export_files,
@@ -402,6 +411,11 @@ impl Comparator {
                 self.interval.eager_reexecs += summary.eager_reexecs;
                 self.interval.spec_dispatches += summary.spec_dispatches;
                 self.interval.nonspec_dispatches += summary.nonspec_dispatches;
+                self.interval.predictions += summary.predictions;
+                self.interval.pred_hits += summary.pred_hits;
+                self.interval.pred_misses += summary.pred_misses;
+                self.interval.spec_relaxed += summary.spec_relaxed;
+                self.interval.final_fixups += summary.final_fixups;
                 match summary.aborted {
                     Some(reason) => {
                         *self.interval.runs_aborted.entry(reason).or_default() += 1;
@@ -606,7 +620,7 @@ impl Comparator {
                 .as_micros();
             let since_tap = |t: Instant| t.saturating_duration_since(outcome.t_tap).as_micros();
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{},{},{},{},{}",
                 outcome.slot,
                 outcome.ordinal,
                 outcome.signature,
@@ -633,6 +647,8 @@ impl Comparator {
                 since_tap(record.t_exec_end),
                 if outcome.from_ring { "ring" } else { "blockstore" },
                 u8::from(outcome.chained),
+                since_tap(record.t_ready),
+                record.rebased,
             );
             export.write_line(&line);
         }
@@ -899,7 +915,8 @@ impl Comparator {
              mem_total_mb={} mem_overlay_mb={} live_runs={} mem_frame_queue_mb={} \
              mem_cmp_queue_mb={} mem_cmp_held_mb={} cmp_fl={} cmp_agave={} cmp_runs={} \
              mem_ingest_pending_kb={} banks_held={} program_entries={} program_mb={} \
-             hints_kb={} cap_trips={}",
+             hints_kb={} mem_pred_kb={} cap_trips={} rebase_preds={} rebase_hit={} \
+             rebase_miss={} spec_relaxed={} final_fixups={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -953,7 +970,13 @@ impl Comparator {
             mem.program_entries,
             mem.program >> 20,
             mem.hints >> 10,
+            mem.pred >> 10,
             cap_trips,
+            iv.predictions,
+            iv.pred_hits,
+            iv.pred_misses,
+            iv.spec_relaxed,
+            iv.final_fixups,
         );
         solana_metrics::datapoint_info!(
             "fast_lane",
@@ -990,6 +1013,11 @@ impl Comparator {
             ("chained_mismatch", iv.chained_mismatched as i64, i64),
             ("sysvar_checks_ok", iv.sysvar_checks_ok as i64, i64),
             ("sysvar_check_mismatch", iv.sysvar_check_mismatch as i64, i64),
+            ("rebase_predictions", iv.predictions as i64, i64),
+            ("rebase_hits", iv.pred_hits as i64, i64),
+            ("rebase_misses", iv.pred_misses as i64, i64),
+            ("spec_relaxed", iv.spec_relaxed as i64, i64),
+            ("final_fixups", iv.final_fixups as i64, i64),
         );
         solana_metrics::datapoint_info!(
             "fast_lane_mem",
@@ -1007,6 +1035,7 @@ impl Comparator {
             ("program_entries", mem.program_entries, i64),
             ("program_bytes", mem.program, i64),
             ("hint_bytes", mem.hints, i64),
+            ("pred_bytes", mem.pred, i64),
             ("cap_trips", cap_trips as i64, i64),
         );
         if let Some(w) = self.summaries.as_mut() {
@@ -1023,7 +1052,8 @@ impl Comparator {
                  \"sysvar_checks_ok\":{},\"sysvar_check_mismatch\":{},\"mem\":{{\"total\":{},\
                  \"overlay\":{},\"live_runs\":{},\"frame_queue\":{},\"cmp_queue\":{},\"cmp_held\":{},\
                  \"ingest_pending\":{},\"banks_held\":{},\"program_entries\":{},\"program\":{},\
-                 \"hints\":{},\"cap_trips\":{}}}}}",
+                 \"hints\":{},\"pred\":{},\"cap_trips\":{}}},\"rebase\":{{\"predictions\":{},\
+                 \"hits\":{},\"misses\":{},\"spec_relaxed\":{},\"final_fixups\":{}}}}}",
                 unix_ns(),
                 iv.matched,
                 iv.mismatched,
@@ -1076,7 +1106,13 @@ impl Comparator {
                 mem.program_entries,
                 mem.program,
                 mem.hints,
+                mem.pred,
                 cap_trips,
+                iv.predictions,
+                iv.pred_hits,
+                iv.pred_misses,
+                iv.spec_relaxed,
+                iv.final_fixups,
             );
             w.write_line(&line);
         }

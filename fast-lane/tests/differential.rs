@@ -406,6 +406,7 @@ fn drive(
     workers: usize,
     speculation: bool,
     theta: f32,
+    rebase: bool,
     mut external: Option<External>,
     out: Option<OutPublisher>,
 ) -> (Vec<TxOutcome>, RunSummary) {
@@ -426,7 +427,7 @@ fn drive(
         })
         .collect();
     let sink = Arc::new(Mutex::new(Collect::default()));
-    let tunables = Arc::new(Tunables::new(speculation, true, theta, 3));
+    let tunables = Arc::new(Tunables::new(speculation, true, theta, 3).with_rebase(rebase));
     let mut coord = Coordinator::new(
         workers,
         task_tx,
@@ -491,6 +492,7 @@ fn run_fast_lane(
     workers: usize,
     speculation: bool,
     theta: f32,
+    rebase: bool,
 ) -> (Vec<TxOutcome>, RunSummary, Arc<Run>) {
     let graph = Arc::new(RwLock::new(FlForkGraph::default()));
     graph.write().unwrap().set_parent(1, 0);
@@ -507,7 +509,7 @@ fn run_fast_lane(
     );
     let batches = push_halves(&run, txs);
     let (outcomes, summary) =
-        drive(run.clone(), 7, batches, workers, speculation, theta, None, None);
+        drive(run.clone(), 7, batches, workers, speculation, theta, rebase, None, None);
     (outcomes, summary, run)
 }
 
@@ -583,15 +585,20 @@ fn test_differential_against_agave() {
     let failures = statuses.values().filter(|s| s.is_err()).count();
     assert!(failures > 5, "the workload must contain failures ({failures})");
 
-    for (workers, speculation, theta) in [
-        (1usize, false, 0.2f32),
-        (2, true, 0.2),
-        (6, true, 0.2),
-        (6, true, 1000.0),
-        (3, true, 0.5),
+    for (workers, speculation, theta, rebase) in [
+        (1usize, false, 0.2f32, false),
+        (2, true, 0.2, false),
+        (6, true, 0.2, false),
+        (6, true, 1000.0, false),
+        (3, true, 0.5, false),
+        (2, true, 0.2, true),
+        (3, true, 0.5, true),
+        (8, true, 0.5, true),
+        (6, true, 1000.0, true),
     ] {
-        let what = format!("K={workers} spec={speculation} theta={theta}");
-        let (outcomes, summary, run) = run_fast_lane(&w, &txs, workers, speculation, theta);
+        let what = format!("K={workers} spec={speculation} theta={theta} rebase={rebase}");
+        let (outcomes, summary, run) =
+            run_fast_lane(&w, &txs, workers, speculation, theta, rebase);
         assert_eq!(outcomes.len(), txs.len(), "{what}: every tx final");
         assert_eq!(summary.unprocessable, 0, "{what}");
         for outcome in &outcomes {
@@ -612,6 +619,10 @@ fn test_differential_against_agave() {
         }
         if speculation && theta >= 1000.0 {
             assert!(summary.spec_dispatches > 0, "{what}: {summary:?}");
+        }
+        if !rebase {
+            assert_eq!(summary.predictions, 0, "{what}");
+            assert_eq!(summary.final_fixups, 0, "{what}");
         }
         eprintln!("{what}: {summary:?}");
     }
@@ -734,7 +745,8 @@ fn test_chained_differential_against_agave() {
     let owners = Arc::new(vec![TOKEN_PROGRAM]);
     let run_p = Arc::new(Run::new(7, 2, &w.parent, &mut programs, owners.clone()).unwrap());
     let batches = push_halves(&run_p, &txs_p);
-    let (outcomes_p, summary_p) = drive(run_p.clone(), 7, batches, 3, true, 0.5, None, None);
+    let (outcomes_p, summary_p) =
+        drive(run_p.clone(), 7, batches, 3, true, 0.5, false, None, None);
     assert_eq!(outcomes_p.len(), txs_p.len());
     assert_eq!(summary_p.unprocessable, 0);
     for outcome in &outcomes_p {
@@ -778,17 +790,21 @@ fn test_chained_differential_against_agave() {
 
     let slot_hashes_id = solana_sdk_ids::sysvar::slot_hashes::id();
     let clock_id = solana_sdk_ids::sysvar::clock::id();
-    for (i, (workers, speculation, theta, after_finals)) in [
-        (1usize, false, 0.2f32, 0usize),
-        (2, false, 0.2, usize::MAX),
-        (3, true, 0.5, 40),
-        (6, true, 1000.0, usize::MAX),
-        (3, true, 0.2, usize::MAX),
+    for (i, (workers, speculation, theta, after_finals, rebase)) in [
+        (1usize, false, 0.2f32, 0usize, false),
+        (2, false, 0.2, usize::MAX, false),
+        (3, true, 0.5, 40, false),
+        (6, true, 1000.0, usize::MAX, false),
+        (3, true, 0.2, usize::MAX, false),
+        (3, true, 0.5, 40, true),
+        (8, true, 1000.0, usize::MAX, true),
     ]
     .into_iter()
     .enumerate()
     {
-        let what = format!("chained K={workers} spec={speculation} theta={theta} resolve@{after_finals}");
+        let what = format!(
+            "chained K={workers} spec={speculation} theta={theta} resolve@{after_finals} rebase={rebase}"
+        );
         let run_c = if i == 0 {
             first_run_c.clone()
         } else {
@@ -827,6 +843,7 @@ fn test_chained_differential_against_agave() {
             workers,
             speculation,
             theta,
+            rebase,
             Some(resolver),
             None,
         );
@@ -883,7 +900,9 @@ fn test_output_ring_matches_agave_frames() {
     let frames = w.capture.frames.lock().unwrap().clone();
     let owners = vec![system_program::id(), TOKEN_PROGRAM];
 
-    for (workers, speculation, theta) in [(1usize, false, 0.2f32), (6, true, 1000.0)] {
+    for (workers, speculation, theta, rebase) in
+        [(1usize, false, 0.2f32, false), (6, true, 1000.0, false), (8, true, 0.5, true)]
+    {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fastlane.out.ring");
         let ring = OutRing::create(&path, 16 << 20).unwrap();
@@ -899,7 +918,7 @@ fn test_output_ring_matches_agave_frames() {
         );
         let batches = push_halves(&run, &txs);
         let (outcomes, summary) =
-            drive(run.clone(), 7, batches, workers, speculation, theta, None, Some(publisher));
+            drive(run.clone(), 7, batches, workers, speculation, theta, rebase, None, Some(publisher));
         assert_eq!(outcomes.len(), txs.len());
 
         let mut records = Vec::new();

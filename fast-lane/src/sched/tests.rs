@@ -35,6 +35,11 @@ fn fnv(bytes: impl IntoIterator<Item = u8>, seed: u64) -> u64 {
 #[derive(Clone)]
 struct MockTx {
     locks: Vec<(Pubkey, bool)>,
+    /// Commutative accounts ("fee sinks"): a write-locker credits them by an amount that
+    /// depends only on the transaction, and their value does not influence anything else.
+    /// With any sinks, the fee payer's balance does not influence the outcome either (a fee
+    /// payer with enough funds). Empty = the original fully value-dependent semantics.
+    sinks: Arc<Vec<Pubkey>>,
 }
 
 /// Deterministic semantics of transaction `k` given the values it read, in lock order.
@@ -43,9 +48,13 @@ fn mock_semantics(
     tx: &MockTx,
     reads: &[Option<AccountSharedData>],
 ) -> Vec<(Pubkey, AccountSharedData)> {
+    let commutative = !tx.sinks.is_empty();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&k.to_le_bytes());
-    for r in reads {
+    for (i, r) in reads.iter().enumerate() {
+        if commutative && (i == 0 || tx.sinks.contains(&tx.locks[i].0)) {
+            continue;
+        }
         match r {
             Some(a) => {
                 bytes.extend_from_slice(&a.lamports().to_le_bytes());
@@ -70,6 +79,18 @@ fn mock_semantics(
     let mut writes = vec![(fee_payer, payer_value(reads))];
     for (i, (key, w)) in tx.locks.iter().enumerate().skip(1) {
         if !*w {
+            continue;
+        }
+        if tx.sinks.contains(key) {
+            // Credit: lamports and the data word, by amounts that depend only on k.
+            let mut a = reads[i].clone().unwrap_or_else(|| {
+                AccountSharedData::new(10, 8, &Pubkey::new_from_array([1; 32]))
+            });
+            a.set_lamports(a.lamports() + u64::from(k % 7) + 1);
+            let word = u64::from_le_bytes(a.data()[..8].try_into().unwrap());
+            a.data_as_mut_slice()[..8]
+                .copy_from_slice(&word.wrapping_add(u64::from(k % 11) * 3 + 1).to_le_bytes());
+            writes.push((*key, a));
             continue;
         }
         let mode = (h >> (i * 2)) % 8;
@@ -146,6 +167,8 @@ impl SchedRun for MockRun {
 struct CollectSink {
     finals: Vec<(TxIdx, u32, Vec<(Pubkey, AccountSharedData)>)>,
     ended: Vec<(RunId, RunSummary)>,
+    /// Ingest -> FINAL per transaction (µs).
+    latency_us: Vec<u64>,
 }
 
 impl FinalSink for Arc<StdMutex<CollectSink>> {
@@ -154,7 +177,10 @@ impl FinalSink for Arc<StdMutex<CollectSink>> {
             .payload
             .downcast::<Vec<(Pubkey, AccountSharedData)>>()
             .unwrap();
-        self.lock().unwrap().finals.push((f.k, f.incarnations, writes));
+        let mut sink = self.lock().unwrap();
+        sink.latency_us
+            .push(f.t_final.saturating_duration_since(f.t_ingest).as_micros() as u64);
+        sink.finals.push((f.k, f.incarnations, writes));
     }
     fn on_run_end(&mut self, run_id: RunId, summary: RunSummary) {
         self.lock().unwrap().ended.push((run_id, summary));
@@ -172,6 +198,42 @@ struct Case {
     max_inc: u32,
     max_delay_us: u64,
     batch: usize,
+    rebase: bool,
+    /// Commutative sink accounts among the hot accounts (see [`MockTx::sinks`]).
+    sinks: usize,
+    /// Probability that a transaction uses one of a few shared fee payers.
+    shared_payers: f64,
+    /// Pause between fed batches (µs).
+    feed_gap_us: u64,
+    /// Start with learned hints for the sinks and shared payers (a warm coordinator, as in
+    /// production where hints persist across slots).
+    warm_hints: bool,
+}
+
+impl Default for Case {
+    fn default() -> Self {
+        Self {
+            seed: 1,
+            n_accounts: 10,
+            n_txs: 100,
+            workers: 3,
+            speculation: true,
+            eager: true,
+            theta: 0.5,
+            max_inc: 3,
+            max_delay_us: 0,
+            batch: 16,
+            rebase: false,
+            sinks: 0,
+            shared_payers: 0.3,
+            feed_gap_us: 100,
+            warm_hints: false,
+        }
+    }
+}
+
+thread_local! {
+    static LAST_LATENCIES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn run_case(case: &Case) -> RunSummary {
@@ -193,13 +255,19 @@ fn run_case(case: &Case) -> RunSummary {
             keys[rng.random_range(0..keys.len())]
         }
     };
+    let sinks: Arc<Vec<Pubkey>> = Arc::new(keys.iter().take(case.sinks.min(keys.len().saturating_sub(1))).copied().collect());
     let mut txs = Vec::new();
     for _ in 0..case.n_txs {
         let n = rng.random_range(1..=5);
         let mut locks: Vec<(Pubkey, bool)> = Vec::new();
-        // Fee payers: mostly distinct, sometimes shared (payer chains).
-        let payer = if rng.random_bool(0.3) {
-            keys[rng.random_range(0..keys.len())]
+        // Fee payers: mostly distinct, sometimes shared (payer chains). With sinks, shared
+        // payers are a few dedicated wallets (bots sending many transactions).
+        let payer = if rng.random_bool(case.shared_payers) {
+            if sinks.is_empty() {
+                keys[rng.random_range(0..keys.len())]
+            } else {
+                Pubkey::new_from_array([200 + rng.random_range(0..3u8); 32])
+            }
         } else {
             Pubkey::new_unique()
         };
@@ -212,9 +280,23 @@ fn run_case(case: &Case) -> RunSummary {
                 }
                 continue;
             }
+            if sinks.contains(&key) && key == payer {
+                continue;
+            }
             locks.push((key, rng.random_bool(0.6)));
         }
-        txs.push(MockTx { locks });
+        txs.push(MockTx {
+            locks,
+            sinks: Arc::clone(&sinks),
+        });
+    }
+    if !sinks.is_empty() {
+        for i in 0..3u8 {
+            base.insert(
+                Pubkey::new_from_array([200 + i; 32]),
+                AccountSharedData::new(1_000_000_000, 0, &Pubkey::default()),
+            );
+        }
     }
 
     // Serial reference.
@@ -251,8 +333,20 @@ fn run_case(case: &Case) -> RunSummary {
         })
         .collect();
     let sink = Arc::new(StdMutex::new(CollectSink::default()));
-    let tunables = Arc::new(Tunables::new(case.speculation, case.eager, case.theta, case.max_inc));
+    let tunables = Arc::new(
+        Tunables::new(case.speculation, case.eager, case.theta, case.max_inc)
+            .with_rebase(case.rebase),
+    );
     let mut coord = Coordinator::new(case.workers, task_tx, tunables, 0.25, Arc::clone(&sink));
+    if case.warm_hints {
+        let payers = (0..3u8).map(|i| Pubkey::new_from_array([200 + i; 32]));
+        for key in sinks.iter().copied().chain(payers) {
+            for _ in 0..64 {
+                coord.hints.observe(&key, true);
+                coord.hints.observe_miss(&key, false, false);
+            }
+        }
+    }
     coord_tx
         .send(CoordMsg::NewRun {
             run_id: 1,
@@ -264,6 +358,7 @@ fn run_case(case: &Case) -> RunSummary {
         let coord_tx = coord_tx.clone();
         let txs = txs.clone();
         let batch = case.batch;
+        let gap = case.feed_gap_us;
         thread::spawn(move || {
             let mut first = 0usize;
             while first < txs.len() {
@@ -286,7 +381,7 @@ fn run_case(case: &Case) -> RunSummary {
                     })
                     .unwrap();
                 first = end;
-                thread::sleep(Duration::from_micros(100));
+                thread::sleep(Duration::from_micros(gap));
             }
             coord_tx
                 .send(CoordMsg::InputComplete {
@@ -372,9 +467,15 @@ fn run_case(case: &Case) -> RunSummary {
             );
         }
     }
+    LAST_LATENCIES.with(|l| *l.borrow_mut() = sink.latency_us.clone());
     let (_, summary) = &sink.ended[0];
     assert_eq!(summary.finals as usize, case.n_txs);
     assert!(summary.aborted.is_none());
+    if !(case.rebase && case.eager) {
+        assert_eq!(summary.predictions, 0, "{summary:?}");
+        assert_eq!(summary.final_fixups, 0, "{summary:?}");
+        assert_eq!(summary.spec_relaxed, 0, "{summary:?}");
+    }
     summary.clone()
 }
 
@@ -393,6 +494,7 @@ fn test_serial_equivalence_many_cases() {
             max_inc: rng.random_range(1..4),
             max_delay_us: [0u64, 50, 400][rng.random_range(0..3)],
             batch: rng.random_range(1..64),
+            ..Case::default()
         };
         let _ = run_case(&case);
     }
@@ -412,6 +514,7 @@ fn test_blind_speculation_hot_account() {
         max_inc: 3,
         max_delay_us: 100,
         batch: 16,
+        ..Case::default()
     });
     // The case must actually speculate, fail validation and re-execute.
     assert!(summary.spec_dispatches > 0, "{summary:?}");
@@ -427,6 +530,7 @@ fn test_blind_speculation_hot_account() {
         max_inc: 1,
         max_delay_us: 100,
         batch: 400,
+        ..Case::default()
     });
 }
 
@@ -449,7 +553,13 @@ fn test_tick_releases_runs_when_disabled() {
     let key = Pubkey::new_unique();
     let run = Arc::new(MockRun {
         overlay: Overlay::new(2, Arc::new(MapBase(HashMap::new()))),
-        txs: vec![MockTx { locks: vec![(key, true)] }; 3],
+        txs: vec![
+            MockTx {
+                locks: vec![(key, true)],
+                sinks: Arc::new(Vec::new()),
+            };
+            3
+        ],
         max_delay_us: 0,
         seed: 1,
     });
@@ -481,4 +591,139 @@ fn test_tick_releases_runs_when_disabled() {
     assert_eq!(sink.ended[0].1.aborted, Some("disabled"));
     drop(coord);
     assert_eq!(Arc::strong_count(&run), 1, "the coordinator dropped the run");
+}
+
+/// Delta rebase on: exact serial results for random DAGs (value-dependent and commutative
+/// semantics, shared fee payers, every worker count / delay / threshold), and no leftover
+/// predicted version (the final state check).
+#[test]
+fn test_serial_equivalence_rebase() {
+    let mut rng = StdRng::seed_from_u64(4242);
+    let mut totals = RunSummary::default();
+    for i in 0..80u64 {
+        let case = Case {
+            seed: 5000 + i,
+            n_accounts: rng.random_range(3..40),
+            n_txs: rng.random_range(1..300),
+            workers: [1usize, 2, 3, 6, 8][rng.random_range(0..5)],
+            speculation: rng.random_bool(0.9),
+            eager: rng.random_bool(0.9),
+            theta: [0.0f32, 0.2, 0.5, 5.0, 1000.0][rng.random_range(0..5)],
+            max_inc: rng.random_range(1..4),
+            max_delay_us: [0u64, 50, 400][rng.random_range(0..3)],
+            batch: rng.random_range(1..64),
+            rebase: true,
+            sinks: [0usize, 1, 2, 3][rng.random_range(0..4)],
+            shared_payers: [0.0f64, 0.3, 0.8][rng.random_range(0..3)],
+            feed_gap_us: 100,
+            warm_hints: rng.random_bool(0.5),
+        };
+        let summary = run_case(&case);
+        totals.predictions += summary.predictions;
+        totals.pred_hits += summary.pred_hits;
+        totals.pred_misses += summary.pred_misses;
+        totals.spec_relaxed += summary.spec_relaxed;
+        totals.final_fixups += summary.final_fixups;
+    }
+    println!("rebase totals: {totals:?}");
+    // The mechanism must actually be exercised.
+    assert!(totals.predictions > 0, "{totals:?}");
+    assert!(totals.pred_hits > 0, "{totals:?}");
+    assert!(totals.spec_relaxed > 0, "{totals:?}");
+}
+
+/// Payer chains and commutative sinks, blind-ish speculation, many workers: predictions
+/// are made and verified, results stay serial.
+#[test]
+fn test_rebase_payer_chain_and_sinks() {
+    for seed in 0..6u64 {
+        let summary = run_case(&Case {
+            seed: 900 + seed,
+            n_accounts: 12,
+            n_txs: 400,
+            workers: 8,
+            theta: 0.5,
+            max_delay_us: 200,
+            batch: 32,
+            rebase: true,
+            sinks: 3,
+            shared_payers: 0.9,
+            ..Case::default()
+        });
+        assert!(summary.predictions > 0, "{summary:?}");
+        assert!(summary.pred_hits > 0, "{summary:?}");
+        println!("payer/sink seed {seed}: {summary:?}");
+    }
+    // Same workload without rebase (control).
+    let control = run_case(&Case {
+        seed: 900,
+        n_accounts: 12,
+        n_txs: 400,
+        workers: 8,
+        theta: 0.5,
+        max_delay_us: 200,
+        batch: 32,
+        rebase: false,
+        sinks: 3,
+        shared_payers: 0.9,
+        ..Case::default()
+    });
+    println!("control: {control:?}");
+}
+
+#[test]
+fn test_miss_hint_ewma() {
+    let mut hints = Hints::new(0.5);
+    let payer = Pubkey::new_unique();
+    let other = Pubkey::new_unique();
+    assert_eq!(hints.miss(&payer, true), MISS_PRIOR_PAYER);
+    assert_eq!(hints.miss(&other, false), MISS_PRIOR);
+    for _ in 0..40 {
+        hints.observe_miss(&other, false, false);
+    }
+    assert!(hints.miss(&other, false) < 0.1);
+    hints.observe_miss(&payer, true, true);
+    assert!(hints.miss(&payer, true) > MISS_PRIOR_PAYER);
+}
+
+/// Latency comparison (not a correctness test): chains through shared fee payers and
+/// commutative sinks, ~0.2 ms executions on 8 workers at moderate load. Run with
+/// `cargo test --release -p agave-fast-lane --lib rebase_latency -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn rebase_latency_bench() {
+    for rebase in [false, true, false, true] {
+        let mut all = Vec::new();
+        let mut incs = 0u64;
+        let mut n = 0u64;
+        for seed in 0..4u64 {
+            let summary = run_case(&Case {
+                seed: 77 + seed,
+                n_accounts: 400,
+                n_txs: 600,
+                workers: 8,
+                theta: 0.5,
+                max_delay_us: 800,
+                batch: 12,
+                feed_gap_us: 2000,
+                rebase,
+                sinks: 3,
+                shared_payers: 0.5,
+                warm_hints: true,
+                ..Case::default()
+            });
+            incs += summary.incarnations;
+            n += summary.finals;
+            LAST_LATENCIES.with(|l| all.extend(l.borrow().iter().copied()));
+        }
+        all.sort_unstable();
+        let p = |q: f64| all[((all.len() - 1) as f64 * q) as usize];
+        println!(
+            "rebase={rebase}: ingest->FINAL p50 {} p90 {} p99 {} us, incarnations/tx {:.2}",
+            p(0.5),
+            p(0.9),
+            p(0.99),
+            incs as f64 / n as f64
+        );
+    }
 }

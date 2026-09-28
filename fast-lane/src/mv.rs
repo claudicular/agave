@@ -16,7 +16,7 @@
 
 use {
     parking_lot::Mutex,
-    solana_account::{AccountSharedData, ReadableAccount},
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4},
@@ -92,6 +92,100 @@ pub fn accounts_equal(a: &AccountSharedData, b: &AccountSharedData) -> bool {
         && a.rent_epoch() == b.rent_epoch()
         && (std::ptr::eq(a.data().as_ptr(), b.data().as_ptr()) && a.data().len() == b.data().len()
             || a.data() == b.data())
+}
+
+/// Incarnation numbers with this bit set mark a *predicted* version (see [`rebase`]):
+/// installed by the coordinator as a speculative input for later transactions, never final.
+pub const PRED_INC_BIT: u32 = 1 << 31;
+
+/// Largest account data [`rebase`] predicts (bytes).
+pub const REBASE_MAX_DATA: usize = 16 * 1024;
+
+fn is_token_owner(owner: &Pubkey) -> bool {
+    *owner == crate::output::TOKEN_PROGRAM || *owner == crate::output::TOKEN_2022_PROGRAM
+}
+
+/// Value prediction ("delta rebase"): a transaction read `old_in` and wrote `old_out`; the
+/// value it will read is now `new_in`. Predict what it will write by re-applying its own
+/// change to the new input:
+/// - lamports: `new_in + (old_out - old_in)`;
+/// - each aligned 8-byte data word the transaction did not change: the new input's word;
+///   a changed word: additive (`new + (out - in)`, wrapping) for SPL Token / Token-2022
+///   accounts and when the new input differs from the old output, else the old output
+///   (an idempotent overwrite, e.g. a timestamp set to the slot's clock);
+/// - trailing bytes and `rent_epoch`: the new input's where unchanged, else the old output's.
+///
+/// `None` (no prediction) when owner, executable flag or length differ between the three,
+/// for loader-owned or executable accounts, for data over [`REBASE_MAX_DATA`], or when the
+/// lamports would leave `u64`.
+///
+/// A prediction is only ever a *speculative input* for later transactions: it is never
+/// emitted and never final, and a reader of it is FINAL only if the value it read equals
+/// the executed final value (`Coordinator::finalize`). So a wrong prediction costs a
+/// re-execution, never exactness.
+pub fn rebase(
+    old_in: &AccountSharedData,
+    old_out: &AccountSharedData,
+    new_in: &AccountSharedData,
+) -> Option<AccountSharedData> {
+    let len = old_in.data().len();
+    if old_out.data().len() != len || new_in.data().len() != len || len > REBASE_MAX_DATA {
+        return None;
+    }
+    if old_in.owner() != old_out.owner() || new_in.owner() != old_in.owner() {
+        return None;
+    }
+    if old_in.executable()
+        || old_out.executable()
+        || new_in.executable()
+        || is_loader_owned(old_in)
+    {
+        return None;
+    }
+    let lamports = i128::from(new_in.lamports()) + i128::from(old_out.lamports())
+        - i128::from(old_in.lamports());
+    let lamports = u64::try_from(lamports).ok()?;
+    let rent_epoch = if old_in.rent_epoch() == old_out.rent_epoch() {
+        new_in.rent_epoch()
+    } else {
+        old_out.rent_epoch()
+    };
+    let (a, b, c) = (old_in.data(), old_out.data(), new_in.data());
+    let mut out = if a == b {
+        // Data untouched (lamport-only change, e.g. a fee payer): share the new input's data.
+        new_in.clone()
+    } else {
+        let additive = is_token_owner(old_in.owner());
+        let mut data = c.to_vec();
+        let words = len / 8;
+        let word = |s: &[u8], i: usize| {
+            u64::from_le_bytes(s[i * 8..i * 8 + 8].try_into().expect("8 bytes"))
+        };
+        for i in 0..words {
+            let (ai, bi, ci) = (word(a, i), word(b, i), word(c, i));
+            if ai == bi {
+                continue;
+            }
+            let v = if additive || ci != bi {
+                ci.wrapping_add(bi.wrapping_sub(ai))
+            } else {
+                bi
+            };
+            data[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        for j in words * 8..len {
+            if a[j] != b[j] {
+                data[j] = b[j];
+            }
+        }
+        let mut account = AccountSharedData::new(0, 0, old_out.owner());
+        account.set_data_from_slice(&data);
+        account.set_executable(false);
+        account
+    };
+    out.set_lamports(lamports);
+    out.set_rent_epoch(rent_epoch);
+    Some(out)
 }
 
 pub struct Overlay {
@@ -334,6 +428,69 @@ impl Overlay {
         }
     }
 
+    /// The version `tx` currently has for `key` (incarnation, value), if any.
+    pub fn version_of(&self, key: &Pubkey, tx: TxIdx) -> Option<(u32, AccountSharedData)> {
+        let entry = self.accounts.get(key)?;
+        let versions = entry.value().versions.lock();
+        let pos = versions.partition_point(|v| v.tx < tx);
+        (pos < versions.len() && versions[pos].tx == tx)
+            .then(|| (versions[pos].inc, versions[pos].account.clone()))
+    }
+
+    /// Make `tx`'s versions exactly the validated incarnation's `writes` (incarnation `inc`)
+    /// and mark them final; remove `tx`'s versions of `keys` it does not write. Returns the
+    /// keys whose version had to be replaced, inserted or removed (none unless a predicted
+    /// value was still installed): what becomes final is always an executed result, never a
+    /// prediction.
+    pub fn commit_final(
+        &self,
+        tx: TxIdx,
+        inc: u32,
+        writes: &[(Pubkey, AccountSharedData)],
+        keys: &[Pubkey],
+    ) -> Vec<Pubkey> {
+        let mut fixups = Vec::new();
+        for (key, account) in writes {
+            let entry = self.entry(key);
+            let mut versions = entry.versions.lock();
+            let pos = versions.partition_point(|v| v.tx < tx);
+            if pos < versions.len() && versions[pos].tx == tx {
+                let v = &mut versions[pos];
+                if v.inc != inc {
+                    fixups.push(*key);
+                    self.account_bytes(
+                        crate::mem::account_bytes(account) - crate::mem::account_bytes(&v.account),
+                    );
+                    v.inc = inc;
+                    v.account = account.clone();
+                }
+                v.final_ = true;
+            } else {
+                fixups.push(*key);
+                self.account_bytes(crate::mem::account_bytes(account));
+                versions.insert(
+                    pos,
+                    Version {
+                        tx,
+                        inc,
+                        account: account.clone(),
+                        final_: true,
+                    },
+                );
+            }
+        }
+        for key in keys {
+            if writes.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            if self.version_of(key, tx).is_some() {
+                fixups.push(*key);
+                self.remove_version(key, tx);
+            }
+        }
+        fixups
+    }
+
     /// Mark `tx`'s versions of `keys` final.
     pub fn mark_final(&self, tx: TxIdx, keys: &[Pubkey]) {
         for key in keys {
@@ -469,5 +626,87 @@ mod tests {
         // Removing the version releases it.
         ov.install(1, 2, &[], &[key]);
         assert_eq!(ov.bytes(), 1128);
+    }
+
+    #[test]
+    fn test_rebase_rules() {
+        let owner = Pubkey::new_from_array([9; 32]);
+        // Lamport-only (fee payer): the new input's data is shared, lamports re-applied.
+        let payer_in = AccountSharedData::new(1_000, 0, &Pubkey::default());
+        let mut payer_out = payer_in.clone();
+        payer_out.set_lamports(995);
+        let mut payer_new = payer_in.clone();
+        payer_new.set_lamports(990);
+        let p = rebase(&payer_in, &payer_out, &payer_new).unwrap();
+        assert_eq!(p.lamports(), 985);
+        // Lamports may not leave u64.
+        let mut drained = payer_in.clone();
+        drained.set_lamports(3);
+        assert!(rebase(&payer_in, &payer_out, &drained).is_none());
+
+        // SPL Token account: the amount word is additive even when the new input equals
+        // the old output (two equal credits).
+        let token = crate::output::TOKEN_PROGRAM;
+        let mut t_in = AccountSharedData::new(2_039_280, 165, &token);
+        t_in.data_as_mut_slice()[64..72].copy_from_slice(&100u64.to_le_bytes());
+        let mut t_out = t_in.clone();
+        t_out.data_as_mut_slice()[64..72].copy_from_slice(&107u64.to_le_bytes());
+        let t_new = t_out.clone();
+        let p = rebase(&t_in, &t_out, &t_new).unwrap();
+        assert_eq!(&p.data()[64..72], &114u64.to_le_bytes());
+        assert_eq!(&p.data()[..64], &t_new.data()[..64]);
+
+        // Other owners: additive per changed word, idempotent overwrite when the new input
+        // already holds the old output's word; unchanged words and trailing bytes follow
+        // the new input.
+        let mut a = AccountSharedData::new(10, 20, &owner);
+        a.data_as_mut_slice()[..8].copy_from_slice(&5u64.to_le_bytes());
+        a.data_as_mut_slice()[8..16].copy_from_slice(&1_000u64.to_le_bytes());
+        a.data_as_mut_slice()[19] = 1;
+        let mut b = a.clone();
+        b.data_as_mut_slice()[..8].copy_from_slice(&8u64.to_le_bytes()); // counter +3
+        b.data_as_mut_slice()[8..16].copy_from_slice(&2_000u64.to_le_bytes()); // timestamp
+        b.data_as_mut_slice()[19] = 7;
+        let mut c = a.clone();
+        c.data_as_mut_slice()[..8].copy_from_slice(&6u64.to_le_bytes());
+        c.data_as_mut_slice()[8..16].copy_from_slice(&2_000u64.to_le_bytes());
+        c.data_as_mut_slice()[16] = 42;
+        let p = rebase(&a, &b, &c).unwrap();
+        assert_eq!(&p.data()[..8], &9u64.to_le_bytes());
+        assert_eq!(&p.data()[8..16], &2_000u64.to_le_bytes());
+        assert_eq!(p.data()[16], 42);
+        assert_eq!(p.data()[19], 7);
+        assert_eq!(p.owner(), &owner);
+
+        // No prediction across owner/length changes or for loader-owned accounts.
+        let mut other_owner = c.clone();
+        other_owner.set_owner(Pubkey::new_unique());
+        assert!(rebase(&a, &b, &other_owner).is_none());
+        let longer = AccountSharedData::new(10, 21, &owner);
+        assert!(rebase(&a, &b, &longer).is_none());
+        let loader = AccountSharedData::new(10, 20, &bpf_loader_upgradeable::id());
+        assert!(rebase(&loader, &loader, &loader).is_none());
+    }
+
+    #[test]
+    fn test_commit_final_replaces_prediction() {
+        let key = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let ov = Overlay::new(8, Arc::new(MapBase(HashMap::new())));
+        ov.install(3, 1, &[(key, acct(11, 1)), (other, acct(5, 5))], &[]);
+        // A prediction replaces tx 3's version of `key`.
+        ov.install(3, PRED_INC_BIT | 1, &[(key, acct(12, 2))], &[]);
+        assert_eq!(ov.version_of(&key, 3).unwrap().0, PRED_INC_BIT | 1);
+        // Final = the validated incarnation's writes (it no longer writes `other`).
+        let fixed = ov.commit_final(3, 1, &[(key, acct(11, 1))], &[key, other]);
+        assert_eq!(fixed, vec![key, other]);
+        let fv = ov.final_below(&key, 4);
+        assert_eq!(fv.origin, Origin::Ver(3, 1));
+        assert_eq!(fv.value.unwrap().lamports(), 11);
+        assert!(ov.version_of(&other, 3).is_none());
+        // Nothing to fix when the executed version is installed.
+        ov.install(5, 0, &[(other, acct(6, 6))], &[]);
+        assert!(ov.commit_final(5, 0, &[(other, acct(6, 6))], &[other]).is_empty());
+        assert_eq!(ov.final_below(&other, 6).origin, Origin::Ver(5, 0));
     }
 }

@@ -47,6 +47,7 @@ pub struct Tunables {
     eager_reexec: AtomicBool,
     theta_bits: AtomicU32,
     max_incarnations: AtomicU32,
+    rebase: AtomicBool,
 }
 
 impl Tunables {
@@ -56,7 +57,19 @@ impl Tunables {
             eager_reexec: AtomicBool::new(eager_reexec),
             theta_bits: AtomicU32::new(theta.to_bits()),
             max_incarnations: AtomicU32::new(max_incarnations),
+            rebase: AtomicBool::new(false),
         }
+    }
+    /// Delta-rebase value prediction and rebase-aware speculation (`sched`): off by default.
+    pub fn with_rebase(self, rebase: bool) -> Self {
+        self.set_rebase(rebase);
+        self
+    }
+    pub fn rebase(&self) -> bool {
+        self.rebase.load(Ordering::Relaxed)
+    }
+    pub fn set_rebase(&self, v: bool) {
+        self.rebase.store(v, Ordering::Relaxed)
     }
     pub fn speculation(&self) -> bool {
         self.speculation.load(Ordering::Relaxed)
@@ -160,6 +173,7 @@ pub fn poll_control_file(
                 "speculation" => {
                     tunables.set_speculation(matches!(value.as_str(), "true" | "on" | "1"))
                 }
+                "rebase" => tunables.set_rebase(matches!(value.as_str(), "true" | "on" | "1")),
                 "theta" => match value.parse::<f32>() {
                     Ok(theta) if (0.0..=1000.0).contains(&theta) => tunables.set_theta(theta),
                     _ => warn!("fast lane: bad theta {value}"),

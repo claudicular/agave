@@ -70,8 +70,11 @@ pub static BANKS_HELD: Gauge = Gauge::new();
 /// agave's cache share agave's memory, so this over-counts; reported, not part of the cap.
 pub static PROGRAM_ENTRIES: Gauge = Gauge::new();
 pub static PROGRAM_BYTES: Gauge = Gauge::new();
-/// Scheduler change-probability hints (bytes estimate).
+/// Scheduler change-probability and rebase-miss hints (bytes estimate).
 pub static HINT_BYTES: Gauge = Gauge::new();
+/// Delta-rebase prediction records the coordinator keeps until the predicted transaction's
+/// next incarnation verifies them (record + predicted account data; released with the run).
+pub static PRED_BYTES: Gauge = Gauge::new();
 
 /// Times the cap made the fast lane disable itself.
 pub static CAP_TRIPS: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +91,7 @@ pub struct Snapshot {
     pub program_entries: i64,
     pub program: i64,
     pub hints: i64,
+    pub pred: i64,
 }
 
 impl Snapshot {
@@ -103,6 +107,7 @@ impl Snapshot {
             program_entries: PROGRAM_ENTRIES.get(),
             program: PROGRAM_BYTES.get(),
             hints: HINT_BYTES.get(),
+            pred: PRED_BYTES.get(),
         }
     }
 
@@ -114,6 +119,7 @@ impl Snapshot {
             + self.cmp_held
             + self.ingest_pending
             + self.hints
+            + self.pred
     }
 }
 

@@ -14,11 +14,20 @@
 //! account). A hint only chooses what runs in parallel; it never affects results.
 //!
 //! Records are emitted at FINAL, so the records of any one account appear in block order.
+//!
+//! Delta rebase (`rebase` tunable, DESIGN §19): when an executed, not-yet-final
+//! transaction's input changes, the coordinator installs a *predicted* version of its
+//! outputs (its own change re-applied to the new input, [`crate::mv::rebase`]) so later
+//! transactions speculate on it instead of waiting for the re-execution, and accounts whose
+//! predictions verify (fee payers, fee sinks) no longer block speculation. Predictions are
+//! only speculative inputs: they are never final, never emitted, and replaced by the
+//! executed value before a transaction is FINAL; every FINAL read is still checked against
+//! executed final values, so a wrong prediction costs a re-execution, never exactness.
 
 use {
     crate::{
         control::Tunables,
-        mv::{Origin, Overlay, Read, TxIdx, same_value},
+        mv::{Origin, Overlay, PRED_INC_BIT, Read, TxIdx, accounts_equal, rebase, same_value},
     },
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError},
     log::warn,
@@ -27,7 +36,7 @@ use {
     std::{
         any::Any,
         cmp::Reverse,
-        collections::{BTreeSet, BinaryHeap, HashMap},
+        collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -123,6 +132,10 @@ pub struct Finalized {
     pub t_ingest: Instant,
     /// First dispatch of any incarnation to a worker.
     pub t_first_dispatch: Instant,
+    /// Every predecessor FINAL (ingest time if none was pending).
+    pub t_ready: Instant,
+    /// Predicted versions the coordinator installed for this transaction.
+    pub rebased: u32,
     pub t_exec_start: Instant,
     pub t_exec_end: Instant,
     pub t_final: Instant,
@@ -139,8 +152,47 @@ pub struct RunSummary {
     pub validation_failures: u64,
     pub eager_reexecs: u64,
     pub aborted: Option<&'static str>,
+    /// FINAL transactions whose validated outcome is unprocessable.
     pub unprocessable: u64,
+    /// Predicted (delta-rebased) versions installed.
+    pub predictions: u64,
+    /// Predictions checked by the transaction's next incarnation on the same input: equal
+    /// (hit) or not (miss).
+    pub pred_hits: u64,
+    pub pred_misses: u64,
+    /// Transactions made speculative only by the rebase-aware rule.
+    pub spec_relaxed: u64,
+    /// Versions replaced/inserted/removed at FINAL so that the final version is the
+    /// executed result (a prediction was still installed).
+    pub final_fixups: u64,
 }
+
+/// A prediction the coordinator installed for a transaction, checked when its next
+/// incarnation completes (hint input only).
+struct PredRec {
+    key: Pubkey,
+    /// The input value the prediction was computed for.
+    basis: AccountSharedData,
+    predicted: AccountSharedData,
+}
+
+impl PredRec {
+    fn bytes(&self) -> i64 {
+        2 * crate::mem::ACCOUNT_OVERHEAD + solana_account::ReadableAccount::data(&self.predicted).len() as i64
+    }
+}
+
+/// Fee payers get this rebase-miss prior (their change is usually the fee alone).
+const MISS_PRIOR_PAYER: f32 = 0.25;
+/// Other accounts: no speculation credit until predictions have verified.
+const MISS_PRIOR: f32 = 1.0;
+/// An unexecuted certain writer (fee payer, nonce) blocks speculation unless the account's
+/// rebase-miss rate is at most this.
+const CERTAIN_MISS_MAX: f32 = 0.3;
+/// EWMA weight of the rebase-miss hint.
+const MISS_ALPHA: f32 = 1.0 / 16.0;
+/// Most readers one cascade step examines (bounds coordinator time per event).
+const CASCADE_BUDGET: usize = 4096;
 
 /// Receives FINAL transactions and run ends (runs on the coordinator thread).
 pub trait FinalSink: Send {
@@ -179,6 +231,12 @@ struct TxS {
     executed_once: bool,
     t_ingest: Instant,
     t_first_dispatch: Option<Instant>,
+    /// Incarnation that produced `out`.
+    out_inc: u32,
+    /// Predictions installed since `out` (verified by the next incarnation).
+    pred_recs: Vec<PredRec>,
+    rebased: u32,
+    t_ready: Option<Instant>,
 }
 
 struct AcctS {
@@ -187,6 +245,8 @@ struct AcctS {
     last_writer: Option<TxIdx>,
     unexec_w: BTreeSet<TxIdx>,
     unexec_certain: BTreeSet<TxIdx>,
+    /// Fee payer of some transaction of the run.
+    payer: bool,
 }
 
 struct RunS {
@@ -199,6 +259,16 @@ struct RunS {
     total: Option<TxIdx>,
     running: u32,
     summary: RunSummary,
+    /// Sequence for predicted incarnation numbers.
+    pred_seq: u32,
+    /// Bytes held by `PredRec`s of this run (in `mem::PRED_BYTES`).
+    pred_bytes: i64,
+}
+
+impl Drop for RunS {
+    fn drop(&mut self) {
+        crate::mem::PRED_BYTES.sub(self.pred_bytes);
+    }
 }
 
 /// Priority class: lower runs first.
@@ -209,12 +279,14 @@ const CLASS_VOTE: u8 = 3;
 
 type HeapKey = Reverse<(u8, u64, TxIdx, u32, RunId)>;
 
-/// Global per-account change-probability hints (EWMA over FINAL write-lockers).
+/// Global per-account hints: change probability (EWMA over FINAL write-lockers) and
+/// rebase-miss rate (EWMA over verified predictions).
 pub struct Hints {
     phat: FastMap<Pubkey, f32>,
     alpha: f32,
     prior: f32,
     cap: usize,
+    miss: FastMap<Pubkey, f32>,
 }
 
 impl Hints {
@@ -224,7 +296,29 @@ impl Hints {
             alpha,
             prior: 0.5,
             cap: 262_144,
+            miss: FastMap::default(),
         }
+    }
+    /// Probability that a change of `key` is not predicted by rebasing the writer's own
+    /// change (learned; prior by kind).
+    pub fn miss(&self, key: &Pubkey, payer: bool) -> f32 {
+        self.miss.get(key).copied().unwrap_or(if payer {
+            MISS_PRIOR_PAYER
+        } else {
+            MISS_PRIOR
+        })
+    }
+    pub fn observe_miss(&mut self, key: &Pubkey, payer: bool, missed: bool) {
+        if self.miss.len() >= self.cap && !self.miss.contains_key(key) {
+            self.miss.clear();
+        }
+        let x = if missed { 1.0 } else { 0.0 };
+        let prior = if payer { MISS_PRIOR_PAYER } else { MISS_PRIOR };
+        let p = self.miss.entry(*key).or_insert(prior);
+        *p += MISS_ALPHA * (x - *p);
+    }
+    pub fn miss_len(&self) -> usize {
+        self.miss.len()
     }
     pub fn get(&self, key: &Pubkey) -> f32 {
         self.phat.get(key).copied().unwrap_or(self.prior)
@@ -245,7 +339,7 @@ impl Hints {
         self.alpha
     }
     pub fn is_empty(&self) -> bool {
-        self.phat.is_empty()
+        self.phat.is_empty() && self.miss.is_empty()
     }
 }
 
@@ -479,7 +573,7 @@ impl<S: FinalSink> Coordinator<S> {
                 self.hints = Hints::new(self.hints.alpha());
             }
         }
-        crate::mem::HINT_BYTES.set(self.hints.len() as i64 * 64);
+        crate::mem::HINT_BYTES.set((self.hints.len() + self.hints.miss_len()) as i64 * 64);
     }
 
     /// Handle one message. Returns false on shutdown.
@@ -500,6 +594,8 @@ impl<S: FinalSink> Coordinator<S> {
                         total: None,
                         running: 0,
                         summary: RunSummary::default(),
+                        pred_seq: 0,
+                        pred_bytes: 0,
                     },
                 );
             }
@@ -521,7 +617,7 @@ impl<S: FinalSink> Coordinator<S> {
                     run.summary.aborted = Some(reason);
                     run.summary.txs = run.txs.len() as u64;
                     run.summary.finals = u64::from(run.n_final);
-                    self.sink.on_run_end(run_id, run.summary);
+                    self.sink.on_run_end(run_id, std::mem::take(&mut run.summary));
                 } else {
                     self.sink.on_abort_ended(run_id, reason);
                 }
@@ -576,6 +672,7 @@ impl<S: FinalSink> Coordinator<S> {
             last_writer: None,
             unexec_w: BTreeSet::new(),
             unexec_certain: BTreeSet::new(),
+            payer: false,
         });
         run.acct_idx.insert(*key, i);
         i
@@ -605,6 +702,12 @@ impl<S: FinalSink> Coordinator<S> {
                 .iter()
                 .map(|key| Self::acct_index(run, key))
                 .collect();
+            // `certain_writes[0]` is the fee payer (`Run::push_entries`).
+            if let Some(&payer) = certain.first() {
+                if !meta.external {
+                    run.accts[payer as usize].payer = true;
+                }
+            }
             let mut preds: Vec<TxIdx> = Vec::with_capacity(locks.len());
             for &(a, _) in &locks {
                 if let Some(pw) = run.accts[a as usize].last_writer {
@@ -650,6 +753,10 @@ impl<S: FinalSink> Coordinator<S> {
                 executed_once: false,
                 t_ingest,
                 t_first_dispatch: None,
+                out_inc: 0,
+                pred_recs: Vec::new(),
+                rebased: 0,
+                t_ready: (pending == 0).then_some(t_ingest),
             });
             new_ready.push(k);
         }
@@ -663,6 +770,7 @@ impl<S: FinalSink> Coordinator<S> {
         let speculation = self.tunables.speculation();
         let theta = self.tunables.theta();
         let max_inc = self.tunables.max_incarnations();
+        let rebase = self.rebase_on();
         let Some(run) = self.runs.get_mut(&run_id) else {
             return;
         };
@@ -674,8 +782,12 @@ impl<S: FinalSink> Coordinator<S> {
             if tx.is_vote { CLASS_VOTE } else { CLASS_NONSPEC }
         } else if speculation
             && tx.spec_incs < max_inc
-            && Self::spec_ok(run, k, theta, &self.hints)
+            && Self::spec_ok(run, k, theta, &self.hints, rebase)
         {
+            if rebase && !Self::spec_ok(run, k, theta, &self.hints, false) {
+                run.summary.spec_relaxed += 1;
+            }
+            let tx = &run.txs[k as usize];
             if tx.is_vote { CLASS_VOTE } else { CLASS_SPEC }
         } else {
             return;
@@ -690,9 +802,16 @@ impl<S: FinalSink> Coordinator<S> {
         heap.push(Reverse((class, run.order, k, tx.token, run_id)));
     }
 
+    /// Delta rebase is active (it needs eager re-execution).
+    fn rebase_on(&self) -> bool {
+        self.tunables.rebase() && self.tunables.eager_reexec()
+    }
+
     /// Whether every unexecuted earlier write-locker of every account `k` locks is
-    /// unlikely to change it.
-    fn spec_ok(run: &RunS, k: TxIdx, theta: f32, hints: &Hints) -> bool {
+    /// unlikely to change it — with `rebase`, unlikely to change it in a way the delta
+    /// rebase does not predict (`n * p_change * p_miss <= theta`; a certain writer such as a
+    /// fee payer is allowed when the account's miss rate is low).
+    fn spec_ok(run: &RunS, k: TxIdx, theta: f32, hints: &Hints, rebase: bool) -> bool {
         let tx = &run.txs[k as usize];
         for &(a, _) in &tx.locks {
             let acct = &run.accts[a as usize];
@@ -700,11 +819,18 @@ impl<S: FinalSink> Coordinator<S> {
             if unexec.next().is_none() {
                 continue;
             }
-            if acct.unexec_certain.range(..k).next().is_some() {
+            let miss = if rebase {
+                hints.miss(&acct.key, acct.payer)
+            } else {
+                1.0
+            };
+            if acct.unexec_certain.range(..k).next().is_some()
+                && !(rebase && miss <= CERTAIN_MISS_MAX)
+            {
                 return false;
             }
             let n = 1 + unexec.count();
-            if n as f32 * hints.get(&acct.key) > theta {
+            if n as f32 * hints.get(&acct.key) * miss > theta {
                 return false;
             }
         }
@@ -753,6 +879,7 @@ impl<S: FinalSink> Coordinator<S> {
 
     fn on_done(&mut self, run_id: RunId, k: TxIdx, inc: u32, out: ExecOutput) {
         let eager = self.tunables.eager_reexec();
+        let rebase_on = self.rebase_on();
         let max_inc = self.tunables.max_incarnations();
         let Some(run) = self.runs.get_mut(&run_id) else {
             return;
@@ -766,8 +893,38 @@ impl<S: FinalSink> Coordinator<S> {
             debug_assert_eq!(tx.next_inc, inc + 1);
             tx.write_keys = new_keys.clone();
         }
-        if out.unprocessable {
-            run.summary.unprocessable += 1;
+
+        // Check the predictions installed for this transaction since its previous
+        // incarnation (hints only): on the input a prediction assumed, did this incarnation
+        // write the predicted value?
+        if !run.txs[k as usize].pred_recs.is_empty() {
+            let recs = std::mem::take(&mut run.txs[k as usize].pred_recs);
+            for rec in recs {
+                let bytes = rec.bytes();
+                run.pred_bytes -= bytes;
+                crate::mem::PRED_BYTES.sub(bytes);
+                let same_input = out.reads.iter().any(|read| {
+                    read.key == rec.key
+                        && read.value.as_ref().is_some_and(|v| accounts_equal(v, &rec.basis))
+                });
+                if !same_input {
+                    continue;
+                }
+                let hit = out
+                    .writes
+                    .iter()
+                    .any(|(key, w)| *key == rec.key && accounts_equal(w, &rec.predicted));
+                if hit {
+                    run.summary.pred_hits += 1;
+                } else {
+                    run.summary.pred_misses += 1;
+                }
+                let payer = run
+                    .acct_idx
+                    .get(&rec.key)
+                    .is_some_and(|&a| run.accts[a as usize].payer);
+                self.hints.observe_miss(&rec.key, payer, !hit);
+            }
         }
 
         // First execution: this transaction's effects are now visible to speculators.
@@ -812,25 +969,37 @@ impl<S: FinalSink> Coordinator<S> {
         let was_spec = run.txs[k as usize].running_spec;
 
         // Eager check of this incarnation's own reads while still speculative.
-        if eager && pending > 0 && run.txs[k as usize].spec_incs < max_inc {
-            let stale = out.reads.iter().any(|read| {
+        let can_retry = run.txs[k as usize].spec_incs < max_inc;
+        let stale = eager
+            && pending > 0
+            && (can_retry || rebase_on)
+            && out.reads.iter().any(|read| {
                 let vis = overlay.visible_below(&read.key, k);
                 vis.origin != read.origin && !same_value(&vis.value, &read.value)
             });
-            if stale {
-                run.summary.eager_reexecs += 1;
-                let class = if run.txs[k as usize].is_vote { CLASS_VOTE } else { CLASS_SPEC };
-                run.txs[k as usize].out = Some(out);
-                run.txs[k as usize].out_spec = was_spec;
-                Self::push_ready(&mut self.heap, run, run_id, k, class);
+        if stale && can_retry {
+            run.summary.eager_reexecs += 1;
+            let class = if run.txs[k as usize].is_vote { CLASS_VOTE } else { CLASS_SPEC };
+            run.txs[k as usize].out = Some(out);
+            run.txs[k as usize].out_inc = inc;
+            run.txs[k as usize].out_spec = was_spec;
+            Self::push_ready(&mut self.heap, run, run_id, k, class);
+            if rebase_on {
+                // Its outputs were computed from inputs that have moved on: predict them
+                // from this incarnation's own change and let readers speculate on that.
+                let mut changed = Self::repredict(run, k);
+                changed.extend(new_keys.iter().chain(&prev_keys).copied());
+                self.cascade(run_id, vec![(k, changed)]);
+            } else {
                 self.invalidate_readers(run_id, k, &new_keys, &prev_keys);
-                return;
             }
+            return;
         }
 
         {
             let tx = &mut run.txs[k as usize];
             tx.out = Some(out);
+            tx.out_inc = inc;
             tx.out_spec = was_spec;
             tx.state = St::Executed;
         }
@@ -857,12 +1026,179 @@ impl<S: FinalSink> Coordinator<S> {
             }
         }
 
-        if eager {
+        if rebase_on {
+            let Some(run) = self.runs.get_mut(&run_id) else {
+                return;
+            };
+            // Stale but out of speculative incarnations: still predict its outputs.
+            let mut changed = if stale { Self::repredict(run, k) } else { Vec::new() };
+            changed.extend(new_keys.iter().chain(&prev_keys).copied());
+            self.cascade(run_id, vec![(k, changed)]);
+        } else if eager {
             self.invalidate_readers(run_id, k, &new_keys, &prev_keys);
         }
 
         if pending == 0 {
             self.worklist.push((run_id, k));
+        }
+    }
+
+    /// Delta rebase of transaction `r`'s outputs: for each account its last executed
+    /// incarnation wrote, whose input has changed since, install (as `r`'s version, never
+    /// final) the incarnation's own change re-applied to the input now visible; where the
+    /// input is back to what the incarnation read, reinstall its actual output. Only for
+    /// Executed/Ready transactions (never while an incarnation runs, whose worker installs
+    /// its own writes). Returns the keys whose installed version changed.
+    fn repredict(run: &mut RunS, r: TxIdx) -> Vec<Pubkey> {
+        let sched_run = Arc::clone(&run.run);
+        let overlay = sched_run.overlay();
+        let tx = &run.txs[r as usize];
+        if tx.external || !matches!(tx.state, St::Executed | St::Ready) {
+            return Vec::new();
+        }
+        let Some(out) = tx.out.as_ref() else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        let mut recs = Vec::new();
+        let mut installs = Vec::new();
+        for (key, old_out) in &out.writes {
+            let Some(Some(old_in)) = out
+                .reads
+                .iter()
+                .find(|read| read.key == *key)
+                .map(|read| read.value.as_ref())
+            else {
+                continue;
+            };
+            let vis = overlay.visible_below(key, r);
+            let Some(new_in) = vis.value.as_ref() else {
+                continue;
+            };
+            let (target, predicted) = if accounts_equal(new_in, old_in) {
+                (old_out.clone(), false)
+            } else {
+                match rebase(old_in, old_out, new_in) {
+                    Some(target) => (target, true),
+                    None => continue,
+                }
+            };
+            match overlay.version_of(key, r) {
+                Some((_, current)) if !accounts_equal(&current, &target) => {}
+                _ => continue,
+            }
+            if predicted {
+                recs.push(PredRec {
+                    key: *key,
+                    basis: new_in.clone(),
+                    predicted: target.clone(),
+                });
+            }
+            installs.push((*key, target, predicted));
+        }
+        for (key, target, predicted) in installs {
+            let inc = if predicted {
+                run.pred_seq = (run.pred_seq + 1) & !PRED_INC_BIT;
+                PRED_INC_BIT | run.pred_seq
+            } else {
+                // Restoring the executed value: its prediction record is void.
+                let tx = &mut run.txs[r as usize];
+                if let Some(i) = tx.pred_recs.iter().position(|rec| rec.key == key) {
+                    let bytes = tx.pred_recs.swap_remove(i).bytes();
+                    run.pred_bytes -= bytes;
+                    crate::mem::PRED_BYTES.sub(bytes);
+                }
+                run.txs[r as usize].out_inc
+            };
+            overlay.install(r, inc, &[(key, target)], &[]);
+            changed.push(key);
+        }
+        if !recs.is_empty() {
+            run.summary.predictions += recs.len() as u64;
+            let tx = &mut run.txs[r as usize];
+            tx.rebased += recs.len() as u32;
+            for rec in recs {
+                let bytes = rec.bytes();
+                run.pred_bytes += bytes;
+                crate::mem::PRED_BYTES.add(bytes);
+                if let Some(old) = tx.pred_recs.iter_mut().find(|old| old.key == rec.key) {
+                    let old_bytes = old.bytes();
+                    run.pred_bytes -= old_bytes;
+                    crate::mem::PRED_BYTES.sub(old_bytes);
+                    *old = rec;
+                } else {
+                    tx.pred_recs.push(rec);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Eager invalidation with delta rebase: the versions of `keys` written by transaction
+    /// `j` changed. Every later locker up to the next writer of each key whose last executed
+    /// incarnation read a now-stale value is re-dispatched (as [`Self::invalidate_readers`])
+    /// and its outputs are re-predicted; readers of re-predicted outputs are processed in
+    /// turn, lowest transaction first (a DAG: each step moves to later transactions).
+    fn cascade(&mut self, run_id: RunId, seeds: Vec<(TxIdx, Vec<Pubkey>)>) {
+        let max_inc = self.tunables.max_incarnations();
+        let Some(run) = self.runs.get_mut(&run_id) else {
+            return;
+        };
+        let sched_run = Arc::clone(&run.run);
+        let overlay = sched_run.overlay();
+        let mut work: BTreeMap<TxIdx, Vec<Pubkey>> = BTreeMap::new();
+        for (j, keys) in seeds {
+            work.entry(j).or_default().extend(keys);
+        }
+        let mut budget = CASCADE_BUDGET;
+        while let Some((j, mut keys)) = work.pop_first() {
+            keys.sort_unstable();
+            keys.dedup();
+            let mut stale_readers = BTreeSet::new();
+            for key in &keys {
+                let Some(&a) = run.acct_idx.get(key) else {
+                    continue;
+                };
+                let lockers = &run.accts[a as usize].lockers;
+                let pos = lockers.partition_point(|&(t, _)| t <= j);
+                for &(r, w) in &lockers[pos..] {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
+                    let tx = &run.txs[r as usize];
+                    if matches!(tx.state, St::Executed | St::Ready) && !tx.external {
+                        if let Some(read) = tx
+                            .out
+                            .as_ref()
+                            .and_then(|out| out.reads.iter().find(|read| &read.key == key))
+                        {
+                            let vis = overlay.visible_below(key, r);
+                            if vis.origin != read.origin && !same_value(&vis.value, &read.value) {
+                                stale_readers.insert((r, true));
+                            } else if !tx.pred_recs.is_empty() {
+                                // Input back to what it read: undo its predictions.
+                                stale_readers.insert((r, false));
+                            }
+                        }
+                    }
+                    if w {
+                        break;
+                    }
+                }
+            }
+            for (r, stale) in stale_readers {
+                let tx = &run.txs[r as usize];
+                if stale && tx.state == St::Executed && tx.pending > 0 && tx.spec_incs < max_inc {
+                    run.summary.eager_reexecs += 1;
+                    let class = if tx.is_vote { CLASS_VOTE } else { CLASS_SPEC };
+                    Self::push_ready(&mut self.heap, run, run_id, r, class);
+                }
+                let changed = Self::repredict(run, r);
+                if !changed.is_empty() {
+                    work.entry(r).or_default().extend(changed);
+                }
+            }
         }
     }
 
@@ -921,6 +1257,7 @@ impl<S: FinalSink> Coordinator<S> {
 
     /// `k` is executed and all its preds are final: validate and emit, or retry.
     fn finalize(&mut self, run_id: RunId, k: TxIdx) {
+        let rebase_on = self.rebase_on();
         let Some(run) = self.runs.get_mut(&run_id) else {
             return;
         };
@@ -937,6 +1274,14 @@ impl<S: FinalSink> Coordinator<S> {
         };
         if !valid {
             run.summary.validation_failures += 1;
+            if rebase_on {
+                // Its inputs are final now: keep its versions as predictions, rebased onto
+                // the final inputs, while it re-executes (it cannot become final before).
+                let changed = Self::repredict(run, k);
+                Self::push_ready(&mut self.heap, run, run_id, k, CLASS_RETRY);
+                self.cascade(run_id, vec![(k, changed)]);
+                return;
+            }
             let keys = std::mem::take(&mut run.txs[k as usize].write_keys);
             for key in &keys {
                 overlay.remove_version(key, k);
@@ -950,11 +1295,12 @@ impl<S: FinalSink> Coordinator<S> {
 
         // FINAL.
         let t_final = Instant::now();
-        let (out, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds) = {
+        let (out, out_inc, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds) = {
             let tx = &mut run.txs[k as usize];
             tx.state = St::Final;
             (
                 tx.out.take(),
+                tx.out_inc,
                 tx.out_spec,
                 tx.next_inc,
                 std::mem::take(&mut tx.succs),
@@ -963,12 +1309,27 @@ impl<S: FinalSink> Coordinator<S> {
                 tx.preds.len(),
             )
         };
+        let (t_ready, rebased) = {
+            let tx = &mut run.txs[k as usize];
+            let recs = std::mem::take(&mut tx.pred_recs);
+            let bytes: i64 = recs.iter().map(PredRec::bytes).sum();
+            run.pred_bytes -= bytes;
+            crate::mem::PRED_BYTES.sub(bytes);
+            (tx.t_ready.unwrap_or(t_ingest), tx.rebased)
+        };
         run.n_final += 1;
         run.summary.finals += 1;
-        overlay.mark_final(k, &run.txs[k as usize].write_keys);
         let Some(out) = out else {
+            overlay.mark_final(k, &run.txs[k as usize].write_keys);
             return;
         };
+        // The final versions are exactly the validated incarnation's writes (a prediction
+        // installed after it ran is replaced here; never the case without rebase).
+        let fixed = overlay.commit_final(k, out_inc, &out.writes, &run.txs[k as usize].write_keys);
+        run.summary.final_fixups += fixed.len() as u64;
+        if out.unprocessable {
+            run.summary.unprocessable += 1;
+        }
         // Hints: did each write-locked account actually change? Writes are few; reads are
         // looked up only for written keys.
         for &(a, w) in &run.txs[k as usize].locks {
@@ -1002,11 +1363,18 @@ impl<S: FinalSink> Coordinator<S> {
             payload,
             t_ingest,
             t_first_dispatch,
+            t_ready,
+            rebased,
             t_exec_start: exec_start,
             t_exec_end: exec_end,
             t_final,
             n_preds,
         });
+        // Readers of a replaced prediction: re-dispatch/re-predict them now rather than at
+        // their own validation.
+        if rebase_on && !fixed.is_empty() {
+            self.cascade(run_id, vec![(k, fixed)]);
+        }
         // Release successors.
         let Some(run) = self.runs.get_mut(&run_id) else {
             return;
@@ -1018,6 +1386,7 @@ impl<S: FinalSink> Coordinator<S> {
             }
             tx.pending -= 1;
             if tx.pending == 0 {
+                tx.t_ready = Some(t_final);
                 match tx.state {
                     St::Executed => self.worklist.push((run_id, s)),
                     St::Waiting if tx.external => {}
@@ -1049,7 +1418,7 @@ impl<S: FinalSink> Coordinator<S> {
             if let Some(mut run) = self.runs.remove(&run_id) {
                 run.summary.txs = run.txs.len() as u64;
                 run.run.on_complete(&run.summary);
-                self.sink.on_run_end(run_id, run.summary);
+                self.sink.on_run_end(run_id, std::mem::take(&mut run.summary));
             }
         }
     }

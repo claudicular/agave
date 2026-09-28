@@ -243,12 +243,15 @@ fn start_threads(
         .ok_or("fast lane already started")?;
     safety::install_panic_hook();
     let exit = Arc::new(AtomicBool::new(false));
-    let tunables = Arc::new(Tunables::new(
-        config.speculation,
-        config.eager_reexec,
-        config.theta,
-        config.max_incarnations,
-    ));
+    let tunables = Arc::new(
+        Tunables::new(
+            config.speculation,
+            config.eager_reexec,
+            config.theta,
+            config.max_incarnations,
+        )
+        .with_rebase(config.rebase),
+    );
     let readonly_owners = Arc::new(shared.readonly_owners.get().cloned().unwrap_or_default());
     info!(
         "fast lane: starting {} workers (cores {:?}), readonly owners {:?}",
