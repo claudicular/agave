@@ -24,6 +24,7 @@ pub mod forks;
 pub mod ingest;
 pub mod mv;
 pub mod program_cache;
+pub mod ring;
 pub mod run;
 pub mod safety;
 pub mod sched;
@@ -258,6 +259,7 @@ fn start_threads(
         .clone()
         .unwrap_or_else(|| deps.ledger_path.join("fast_lane.ctl"));
     let spin = Duration::from_micros(config.spin_us);
+    let worker_spin = Duration::from_micros(config.worker_spin_us);
 
     let (coord_tx, coord_rx) = unbounded::<CoordMsg>();
     let (task_tx, task_rx) = unbounded();
@@ -278,7 +280,7 @@ fn start_threads(
         let exit = exit.clone();
         threads.push(
             safety::spawn(&format!("solFlExec{i:02}"), place, move || {
-                worker_loop(task_rx, coord_tx, exit, spin)
+                worker_loop(task_rx, coord_tx, exit, worker_spin)
             })
             .map_err(spawn_err)?,
         );

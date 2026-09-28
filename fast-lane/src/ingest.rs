@@ -173,20 +173,53 @@ impl Ingest {
         exit: Arc<AtomicBool>,
     ) {
         let mut last_housekeeping = Instant::now();
+        let spin = Duration::from_micros(self.config.ingest_spin_us);
+        let mut idle_since = Instant::now();
         loop {
             if exit.load(Ordering::Relaxed) {
                 return;
             }
-            select! {
-                recv(tap_rx) -> msg => match msg {
-                    Ok(batch) => self.on_tap(batch),
-                    Err(_) => return,
-                },
-                recv(event_rx) -> msg => match msg {
-                    Ok(event) => self.on_event(event),
-                    Err(_) => return,
-                },
-                default(Duration::from_millis(20)) => {},
+            if spin.is_zero() || idle_since.elapsed() >= spin && spin < crate::sched::SPIN_FOREVER
+            {
+                select! {
+                    recv(tap_rx) -> msg => match msg {
+                        Ok(batch) => self.on_tap(batch),
+                        Err(_) => return,
+                    },
+                    recv(event_rx) -> msg => match msg {
+                        Ok(event) => self.on_event(event),
+                        Err(_) => return,
+                    },
+                    default(Duration::from_millis(20)) => {},
+                }
+                idle_since = Instant::now();
+            } else {
+                // Busy-poll (dedicated core): taps first, they carry the work.
+                let mut worked = false;
+                match tap_rx.try_recv() {
+                    Ok(batch) => {
+                        self.on_tap(batch);
+                        worked = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+                match event_rx.try_recv() {
+                    Ok(event) => {
+                        self.on_event(event);
+                        worked = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                }
+                if worked {
+                    idle_since = Instant::now();
+                } else {
+                    std::hint::spin_loop();
+                    if last_housekeeping.elapsed() < Duration::from_millis(20) {
+                        continue;
+                    }
+                }
             }
             if !crate::control::is_active() {
                 self.abort_all("disabled");
@@ -525,24 +558,32 @@ impl Ingest {
         let released = std::mem::take(&mut state.released);
         let mut ordinal = state.next_ordinal;
         let mut failure = None;
-        for set in released {
-            let t0 = Instant::now();
-            let first = ordinal;
-            let (metas, set_failure) = run.push_entries(set.entries, set.t_tap, set.t_tap_unix_ns);
-            self.stats.sanitize_us += t0.elapsed().as_micros() as u64;
-            self.stats.txs += metas.len() as u64;
-            ordinal += metas.len() as TxIdx;
-            if !metas.is_empty() {
-                let _ = self.coord_tx.send(CoordMsg::Txs {
-                    run_id,
-                    first,
-                    metas,
-                    t_ingest: Instant::now(),
-                });
-            }
-            if set_failure.is_some() {
-                failure = set_failure;
-                break;
+        'sets: for set in released {
+            // Stream entry by entry: a set's first transactions reach the coordinator
+            // without waiting for the whole set to be sanitized.
+            for entry in set.entries {
+                if entry.transactions.is_empty() {
+                    continue;
+                }
+                let t0 = Instant::now();
+                let first = ordinal;
+                let (metas, entry_failure) =
+                    run.push_entries(vec![entry], set.t_tap, set.t_tap_unix_ns);
+                self.stats.sanitize_us += t0.elapsed().as_micros() as u64;
+                self.stats.txs += metas.len() as u64;
+                ordinal += metas.len() as TxIdx;
+                if !metas.is_empty() {
+                    let _ = self.coord_tx.send(CoordMsg::Txs {
+                        run_id,
+                        first,
+                        metas,
+                        t_ingest: Instant::now(),
+                    });
+                }
+                if entry_failure.is_some() {
+                    failure = entry_failure;
+                    break 'sets;
+                }
             }
         }
         if let Some(reason) = failure {

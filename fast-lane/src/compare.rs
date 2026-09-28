@@ -48,6 +48,7 @@ pub struct FinalRecord {
     pub speculative: bool,
     pub n_preds: usize,
     pub t_ingest: Instant,
+    pub t_first_dispatch: Instant,
     pub t_exec_start: Instant,
     pub t_exec_end: Instant,
     pub t_final: Instant,
@@ -99,6 +100,7 @@ impl FinalSink for CmpSink {
             speculative: f.speculative,
             n_preds: f.n_preds,
             t_ingest: f.t_ingest,
+            t_first_dispatch: f.t_first_dispatch,
             t_exec_start: f.t_exec_start,
             t_exec_end: f.t_exec_end,
             t_final: f.t_final,
@@ -202,7 +204,8 @@ impl Comparator {
             Some(
                 "slot,ordinal,signature,vote,token,outcome,class,fl_final_unix_ns,\
                  agave_unix_ns,tap_unix_ns,lead_us,fl_latency_us,agave_latency_us,\
-                 incarnations,spec,exec_us,n_preds,kind,ok,parent_slot",
+                 incarnations,spec,exec_us,n_preds,kind,ok,parent_slot,ingest_us,\
+                 first_dispatch_us,exec_start_us,exec_end_us",
             ),
             mb,
             config.export_files,
@@ -497,8 +500,9 @@ impl Comparator {
                 .t_exec_end
                 .saturating_duration_since(record.t_exec_start)
                 .as_micros();
+            let since_tap = |t: Instant| t.saturating_duration_since(outcome.t_tap).as_micros();
             let line = format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:?},{},{},{},{},{},{}",
                 outcome.slot,
                 outcome.ordinal,
                 outcome.signature,
@@ -519,6 +523,10 @@ impl Comparator {
                 outcome.kind,
                 u8::from(outcome.status.is_ok()),
                 outcome.parent_slot,
+                since_tap(record.t_ingest),
+                since_tap(record.t_first_dispatch),
+                since_tap(record.t_exec_start),
+                since_tap(record.t_exec_end),
             );
             export.write_line(&line);
         }
@@ -777,6 +785,37 @@ impl Comparator {
             iv.slot_checks_ok,
             iv.slot_check_mismatch_keys,
             self.sink_drops.load(Ordering::Relaxed),
+        );
+        solana_metrics::datapoint_info!(
+            "fast_lane",
+            ("match", iv.matched as i64, i64),
+            ("mismatch", iv.mismatched as i64, i64),
+            ("noframe", iv.noframe as i64, i64),
+            ("fl_only", iv.fl_only as i64, i64),
+            ("agave_only_ran", iv.agave_only_ran as i64, i64),
+            ("agave_only_skipped", iv.agave_only_skipped as i64, i64),
+            ("late_fl", iv.late_fl as i64, i64),
+            ("token_lead_us_p50", pct(&iv.lead_us_token, 0.5), i64),
+            ("token_lead_us_p90", pct(&iv.lead_us_token, 0.9), i64),
+            ("token_fl_latency_us_p50", pct(&iv.fl_latency_us_token, 0.5), i64),
+            ("token_fl_latency_us_p90", pct(&iv.fl_latency_us_token, 0.9), i64),
+            ("token_fl_latency_us_p99", pct(&iv.fl_latency_us_token, 0.99), i64),
+            ("token_agave_latency_us_p50", pct(&iv.agave_latency_us_token, 0.5), i64),
+            ("token_agave_latency_us_p90", pct(&iv.agave_latency_us_token, 0.9), i64),
+            ("token_agave_latency_us_p99", pct(&iv.agave_latency_us_token, 0.99), i64),
+            ("finals", iv.finals as i64, i64),
+            ("spec_finals", iv.spec_finals as i64, i64),
+            ("incarnations", iv.incarnations as i64, i64),
+            ("validation_failures", iv.validation_failures as i64, i64),
+            ("eager_reexecs", iv.eager_reexecs as i64, i64),
+            ("runs_started", iv.runs_started as i64, i64),
+            ("runs_completed", iv.runs_completed as i64, i64),
+            ("parent_waited", iv.parent_waited as i64, i64),
+            ("slot_checks_ok", iv.slot_checks_ok as i64, i64),
+            ("slot_check_bad_keys", iv.slot_check_mismatch_keys as i64, i64),
+            ("exec_us", iv.exec_us as i64, i64),
+            ("tap_drops", tap_drops as i64, i64),
+            ("frame_drops", frame_drops as i64, i64),
         );
         if let Some(w) = self.summaries.as_mut() {
             let line = format!(

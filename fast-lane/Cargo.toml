@@ -29,6 +29,7 @@ dev-context-only-utils = [
 
 [dependencies]
 agave-feature-set = { workspace = true }
+ahash = { workspace = true }
 bs58 = { workspace = true, features = ["alloc"] }
 crossbeam-channel = { workspace = true }
 dashmap = { workspace = true }
@@ -43,6 +44,7 @@ solana-geyser-plugin-manager = { workspace = true }
 solana-hash = { workspace = true }
 solana-ledger = { workspace = true }
 solana-message = { workspace = true }
+solana-metrics = { workspace = true }
 solana-precompile-error = { workspace = true }
 solana-program-runtime = { workspace = true }
 solana-pubkey = { workspace = true }

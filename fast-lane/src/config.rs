@@ -31,8 +31,14 @@ pub struct Config {
     pub nice: i32,
     /// Nice value for auxiliary threads (comparator, control).
     pub aux_nice: i32,
-    /// Busy-poll time before parking, in microseconds, for the coordinator and workers.
+    /// Busy-poll time before parking, in microseconds, for the coordinator.
+    /// Values >= 1_000_000 spin forever (never park): use only on a dedicated core.
     pub spin_us: u64,
+    /// Busy-poll time before parking for executor threads (raise when they own their cores).
+    /// Values >= 1_000_000 spin forever (never park).
+    pub worker_spin_us: u64,
+    /// Busy-poll time before parking for the ingest thread (0 = block). >= 1_000_000: forever.
+    pub ingest_spin_us: u64,
     /// Optimistic (speculative) execution. false = pure MVCC (dispatch only when every
     /// predecessor is final).
     pub speculation: bool,
@@ -84,6 +90,8 @@ impl Default for Config {
             nice: 5,
             aux_nice: 10,
             spin_us: 50,
+            worker_spin_us: 50,
+            ingest_spin_us: 0,
             speculation: true,
             theta: 0.2,
             hint_alpha: 1.0 / 32.0,
@@ -200,6 +208,8 @@ impl Config {
             "nice" => self.nice = parse_scalar(key, value)?,
             "aux_nice" => self.aux_nice = parse_scalar(key, value)?,
             "spin_us" => self.spin_us = parse_scalar(key, value)?,
+            "worker_spin_us" => self.worker_spin_us = parse_scalar(key, value)?,
+            "ingest_spin_us" => self.ingest_spin_us = parse_scalar(key, value)?,
             "speculation" => self.speculation = parse_bool(key, value)?,
             "theta" => self.theta = parse_scalar(key, value)?,
             "hint_alpha" => self.hint_alpha = parse_scalar(key, value)?,

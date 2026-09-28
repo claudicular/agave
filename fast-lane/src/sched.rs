@@ -36,6 +36,8 @@ use {
     },
 };
 
+type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
 /// A run the scheduler can execute: an overlay plus a way to execute one incarnation.
 pub trait SchedRun: Send + Sync + 'static {
     fn overlay(&self) -> &Overlay;
@@ -108,6 +110,8 @@ pub struct Finalized {
     pub speculative: bool,
     pub payload: Box<dyn Any + Send>,
     pub t_ingest: Instant,
+    /// First dispatch of any incarnation to a worker.
+    pub t_first_dispatch: Instant,
     pub t_exec_start: Instant,
     pub t_exec_end: Instant,
     pub t_final: Instant,
@@ -158,6 +162,7 @@ struct TxS {
     token: u32,
     executed_once: bool,
     t_ingest: Instant,
+    t_first_dispatch: Option<Instant>,
 }
 
 struct AcctS {
@@ -172,7 +177,7 @@ struct RunS {
     run: Arc<dyn SchedRun>,
     order: u64,
     txs: Vec<TxS>,
-    acct_idx: HashMap<Pubkey, u32>,
+    acct_idx: FastMap<Pubkey, u32>,
     accts: Vec<AcctS>,
     n_final: u32,
     total: Option<TxIdx>,
@@ -190,7 +195,7 @@ type HeapKey = Reverse<(u8, u64, TxIdx, u32, RunId)>;
 
 /// Global per-account change-probability hints (EWMA over FINAL write-lockers).
 pub struct Hints {
-    phat: HashMap<Pubkey, f32>,
+    phat: FastMap<Pubkey, f32>,
     alpha: f32,
     prior: f32,
     cap: usize,
@@ -199,7 +204,7 @@ pub struct Hints {
 impl Hints {
     pub fn new(alpha: f32) -> Self {
         Self {
-            phat: HashMap::new(),
+            phat: FastMap::default(),
             alpha,
             prior: 0.5,
             cap: 262_144,
@@ -263,8 +268,27 @@ pub fn worker_loop(
     }
 }
 
-/// Receive with a bounded busy-poll before parking; `None` on exit/disconnect.
+/// Spin durations at or above this never park (for threads that own their core).
+pub const SPIN_FOREVER: Duration = Duration::from_secs(1);
+
+/// Receive with a bounded busy-poll before parking; `None` on exit/disconnect. A spin of
+/// [`SPIN_FOREVER`] or more busy-polls without ever parking.
 pub fn recv_spin<T>(rx: &Receiver<T>, spin: Duration, exit: &AtomicBool) -> Option<T> {
+    if spin >= SPIN_FOREVER {
+        let mut polls = 0u32;
+        loop {
+            match rx.try_recv() {
+                Ok(v) => return Some(v),
+                Err(TryRecvError::Disconnected) => return None,
+                Err(TryRecvError::Empty) => {}
+            }
+            polls = polls.wrapping_add(1);
+            if polls % 4096 == 0 && exit.load(Ordering::Relaxed) {
+                return None;
+            }
+            std::hint::spin_loop();
+        }
+    }
     let start = Instant::now();
     loop {
         match rx.try_recv() {
@@ -369,7 +393,7 @@ impl<S: FinalSink> Coordinator<S> {
                         run,
                         order,
                         txs: Vec::new(),
-                        acct_idx: HashMap::new(),
+                        acct_idx: FastMap::default(),
                         accts: Vec::new(),
                         n_final: 0,
                         total: None,
@@ -503,6 +527,7 @@ impl<S: FinalSink> Coordinator<S> {
                 token: 0,
                 executed_once: false,
                 t_ingest,
+                t_first_dispatch: None,
             });
             new_ready.push(k);
         }
@@ -578,6 +603,7 @@ impl<S: FinalSink> Coordinator<S> {
                 continue;
             }
             tx.state = St::Running;
+            tx.t_first_dispatch.get_or_insert_with(Instant::now);
             tx.running_spec = tx.pending > 0;
             if tx.running_spec {
                 tx.spec_incs += 1;
@@ -625,11 +651,13 @@ impl<S: FinalSink> Coordinator<S> {
         // First execution: this transaction's effects are now visible to speculators.
         let first_exec = !run.txs[k as usize].executed_once;
         if first_exec {
-            run.txs[k as usize].executed_once = true;
-            let locks = run.txs[k as usize].locks.clone();
-            for &(a, w) in &locks {
+            let txs = &mut run.txs;
+            let accts = &mut run.accts;
+            let tx = &mut txs[k as usize];
+            tx.executed_once = true;
+            for &(a, w) in &tx.locks {
                 if w {
-                    let acct = &mut run.accts[a as usize];
+                    let acct = &mut accts[a as usize];
                     acct.unexec_w.remove(&k);
                     acct.unexec_certain.remove(&k);
                 }
@@ -687,15 +715,14 @@ impl<S: FinalSink> Coordinator<S> {
 
         // Wake waiting transactions whose speculation condition may have flipped.
         if first_exec && self.tunables.speculation() {
-            let locks = run.txs[k as usize].locks.clone();
             let mut wake = Vec::new();
-            for &(a, w) in &locks {
+            for &(a, w) in &run.txs[k as usize].locks {
                 if !w {
                     continue;
                 }
                 let lockers = &run.accts[a as usize].lockers;
                 let pos = lockers.partition_point(|&(t, _)| t <= k);
-                for &(r, _) in lockers[pos..].iter().take(64) {
+                for &(r, _) in lockers[pos..].iter().take(16) {
                     if run.txs[r as usize].state == St::Waiting {
                         wake.push(r);
                     }
@@ -801,47 +828,43 @@ impl<S: FinalSink> Coordinator<S> {
 
         // FINAL.
         let t_final = Instant::now();
-        let (out, out_spec, incarnations, write_keys, locks, succs, t_ingest, n_preds) = {
+        let (out, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds) = {
             let tx = &mut run.txs[k as usize];
             tx.state = St::Final;
             (
                 tx.out.take(),
                 tx.out_spec,
                 tx.next_inc,
-                tx.write_keys.clone(),
-                tx.locks.clone(),
                 std::mem::take(&mut tx.succs),
                 tx.t_ingest,
+                tx.t_first_dispatch.unwrap_or(tx.t_ingest),
                 tx.preds.len(),
             )
         };
         run.n_final += 1;
         run.summary.finals += 1;
-        overlay.mark_final(k, &write_keys);
+        overlay.mark_final(k, &run.txs[k as usize].write_keys);
         let Some(out) = out else {
             return;
         };
-        // Hints: did each write-locked account actually change?
-        for &(a, w) in &locks {
+        // Hints: did each write-locked account actually change? Writes are few; reads are
+        // looked up only for written keys.
+        for &(a, w) in &run.txs[k as usize].locks {
             if !w {
                 continue;
             }
-            let key = run.accts[a as usize].key;
-            let read_value = out
-                .reads
-                .iter()
-                .find(|read| read.key == key)
-                .map(|read| &read.value);
-            let written = out.writes.iter().find(|(wk, _)| *wk == key);
-            let changed = match (written, read_value) {
-                (None, _) => false,
-                (Some((_, account)), Some(read_value)) => {
-                    !same_value(&Some(account.clone()), read_value)
-                        && !(account.lamports_is_zero() && read_value.is_none())
+            let key = &run.accts[a as usize].key;
+            let changed = match out.writes.iter().find(|(wk, _)| wk == key) {
+                None => false,
+                Some((_, account)) => {
+                    match out.reads.iter().find(|read| &read.key == key).map(|r| &r.value) {
+                        Some(Some(read)) => !crate::mv::accounts_equal(account, read),
+                        Some(None) => !account.lamports_is_zero(),
+                        None => true,
+                    }
                 }
-                (Some(_), None) => true,
             };
-            self.hints.observe(&key, changed);
+            self.hints.observe(key, changed);
         }
         let ExecOutput {
             payload,
@@ -856,13 +879,16 @@ impl<S: FinalSink> Coordinator<S> {
             speculative: out_spec,
             payload,
             t_ingest,
+            t_first_dispatch,
             t_exec_start: exec_start,
             t_exec_end: exec_end,
             t_final,
             n_preds,
         });
         // Release successors.
-        let run = self.runs.get_mut(&run_id).expect("run exists");
+        let Some(run) = self.runs.get_mut(&run_id) else {
+            return;
+        };
         for s in succs {
             let tx = &mut run.txs[s as usize];
             if tx.state == St::Final {
