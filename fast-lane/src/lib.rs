@@ -14,8 +14,11 @@
 //! - `window_service::run_insert` calls [`tap::on_completed_data_sets`];
 //! - `Validator::new` wraps the geyser notifiers with [`FastLane::tee_accounts_update`],
 //!   [`FastLane::tee_block_metadata`] and [`FastLane::tee_slot_status`], then calls
-//!   [`FastLane::start`] once `bank_forks` and the blockstore exist.
+//!   [`FastLane::start`] once `bank_forks` and the blockstore exist;
+//! - `cluster_slot_state_verifier` and the vote listener call [`cluster_check`], which poisons
+//!   the fast lane when the cluster's bank hash for a slot differs from ours.
 
+pub mod cluster_check;
 pub mod compare;
 pub mod config;
 pub mod control;

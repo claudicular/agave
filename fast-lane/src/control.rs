@@ -1,15 +1,16 @@
 //! Process-wide on/off state, runtime tunables and the control file.
 //!
 //! `FL_ACTIVE` is checked (relaxed) by every tap and tee: when false they are no-ops.
-//! `FL_POISONED` is set by a contained panic and keeps the fast lane off until the process
-//! restarts (phase 1 never re-arms itself).
+//! `FL_POISONED` is set by a contained panic or by a cluster bank-hash disagreement
+//! ([`crate::cluster_check`]) and keeps the fast lane off until the process restarts (it never
+//! re-arms itself; the control file's `enable` is refused). The first poison reason is kept.
 
 use {
     log::{error, info, warn},
     std::{
         path::Path,
         sync::{
-            OnceLock,
+            Mutex, OnceLock,
             atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
         },
     },
@@ -18,6 +19,7 @@ use {
 static FL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FL_POISONED: AtomicBool = AtomicBool::new(false);
 static FL_VM_OPTS: AtomicBool = AtomicBool::new(false);
+static POISON_REASON: Mutex<Option<String>> = Mutex::new(None);
 static FL_COMMIT_MODE: AtomicU8 = AtomicU8::new(COMMIT_OFF);
 
 /// `commit = off`: FL results stay inside FL (shadow comparator, output ring).
@@ -56,12 +58,22 @@ pub fn set_commit_mode(mode: u8) {
 /// Agave's side of the commit mode: the fast lane's mode while it is active and not
 /// poisoned, else off (agave stops capturing immediately).
 fn sync_runtime_mode() {
-    let mode = if FL_ACTIVE.load(Ordering::SeqCst) && !FL_POISONED.load(Ordering::SeqCst) {
-        commit_mode()
-    } else {
-        COMMIT_OFF
+    let desired = || {
+        if FL_ACTIVE.load(Ordering::SeqCst) && !FL_POISONED.load(Ordering::SeqCst) {
+            commit_mode()
+        } else {
+            COMMIT_OFF
+        }
     };
-    solana_runtime::fast_lane_commit::set_mode(mode);
+    // Re-check after setting: a concurrent poison/disable/mode change that ran between our
+    // read and our store would otherwise be overwritten by our stale mode.
+    loop {
+        let mode = desired();
+        solana_runtime::fast_lane_commit::set_mode(mode);
+        if desired() == mode {
+            break;
+        }
+    }
 }
 
 /// How agave's replay executes transactions: with a `TransactionStatusSender` it records
@@ -113,21 +125,49 @@ pub fn is_poisoned() -> bool {
 
 /// Turn the fast lane on or off. Refused (returns false) once poisoned.
 pub fn set_active(active: bool) -> bool {
-    if active && is_poisoned() {
+    if active && FL_POISONED.load(Ordering::SeqCst) {
         return false;
     }
     FL_ACTIVE.store(active, Ordering::SeqCst);
+    // A poison that raced with this enable wins: `poison` stores POISONED before clearing
+    // ACTIVE, so either it clears our store or we see POISONED here and undo it.
+    if active && FL_POISONED.load(Ordering::SeqCst) {
+        FL_ACTIVE.store(false, Ordering::SeqCst);
+        sync_runtime_mode();
+        return false;
+    }
     sync_runtime_mode();
     true
 }
 
-/// Permanently disable the fast lane (contained panic, fatal internal error, a safety check).
-/// Agave's side stops at once: no more captures, and (commit mode) no more waiting on FL.
+/// Permanently disable the fast lane (contained panic, cluster bank-hash disagreement, fatal
+/// internal error). Sticky until the process restarts; the first reason is kept. Agave's side
+/// stops at once: no more captures, and (commit mode) no more waiting on FL.
 pub fn poison(reason: &str) {
     FL_POISONED.store(true, Ordering::SeqCst);
     FL_ACTIVE.store(false, Ordering::SeqCst);
     sync_runtime_mode();
+    let first = {
+        let mut stored = POISON_REASON.lock().unwrap_or_else(|e| e.into_inner());
+        if stored.is_none() {
+            *stored = Some(reason.to_string());
+            true
+        } else {
+            false
+        }
+    };
     error!("fast lane: disabled permanently: {reason}");
+    if first {
+        solana_metrics::datapoint_error!("fast_lane_poisoned", ("reason", reason, String));
+    }
+}
+
+/// Why the fast lane was poisoned (the first reason), if it was.
+pub fn poison_reason() -> Option<String> {
+    POISON_REASON
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Runtime-tunable scheduler knobs (control file `key=value`).
@@ -244,7 +284,10 @@ pub fn poll_control_file(
                 if set_active(true) {
                     info!("fast lane: enabled by control file");
                 } else {
-                    warn!("fast lane: enable refused (poisoned; restart required)");
+                    warn!(
+                        "fast lane: enable refused (poisoned: {}; restart required)",
+                        poison_reason().unwrap_or_default()
+                    );
                 }
             }
             Command::Disable => {

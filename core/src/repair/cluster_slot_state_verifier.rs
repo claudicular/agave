@@ -380,6 +380,13 @@ fn check_duplicate_confirmed_hash_against_bank_status(
                 "Cluster duplicate confirmed slot {slot} with hash {duplicate_confirmed_hash}, \
                  but we marked slot dead"
             );
+            // Fast lane: stop using its results before the slot is dumped and replayed.
+            agave_fast_lane::cluster_check::on_cluster_mismatch(
+                slot,
+                None,
+                duplicate_confirmed_hash,
+                "duplicate_confirmed",
+            );
             state_changes.push(ResultingStateChange::RepairDuplicateConfirmedVersion(
                 duplicate_confirmed_hash,
             ));
@@ -388,6 +395,7 @@ fn check_duplicate_confirmed_hash_against_bank_status(
             // If the versions match, then add the slot to the candidate
             // set to account for the case where it was removed earlier
             // by the `on_duplicate_slot()` handler
+            agave_fast_lane::cluster_check::on_cluster_match(slot, bank_frozen_hash);
             state_changes.push(ResultingStateChange::DuplicateConfirmedSlotMatchesCluster(
                 bank_frozen_hash,
             ));
@@ -399,6 +407,13 @@ fn check_duplicate_confirmed_hash_against_bank_status(
             warn!(
                 "Cluster duplicate confirmed slot {slot} with hash {duplicate_confirmed_hash}, \
                  but our version has hash {bank_frozen_hash}"
+            );
+            // Fast lane: poison it before the slot is dumped, so the re-replay runs without it.
+            agave_fast_lane::cluster_check::on_cluster_mismatch(
+                slot,
+                Some(bank_frozen_hash),
+                duplicate_confirmed_hash,
+                "duplicate_confirmed",
             );
             state_changes.push(ResultingStateChange::MarkSlotDuplicate(bank_frozen_hash));
             state_changes.push(ResultingStateChange::RepairDuplicateConfirmedVersion(
@@ -438,6 +453,12 @@ fn check_epoch_slots_hash_against_bank_status(
                 "EpochSlots sample returned slot {slot} with hash {epoch_slots_frozen_hash}, but \
                  our version has hash {bank_frozen_hash:?}",
             );
+            agave_fast_lane::cluster_check::on_cluster_mismatch(
+                slot,
+                Some(bank_frozen_hash),
+                epoch_slots_frozen_hash,
+                "epoch_slots_sample",
+            );
             if !is_popular_pruned {
                 // If the slot is not already pruned notify fork choice to mark as invalid
                 state_changes.push(ResultingStateChange::MarkSlotDuplicate(bank_frozen_hash));
@@ -448,6 +469,12 @@ fn check_epoch_slots_hash_against_bank_status(
             warn!(
                 "EpochSlots sample returned slot {slot} with hash {epoch_slots_frozen_hash}, but \
                  we marked slot dead",
+            );
+            agave_fast_lane::cluster_check::on_cluster_mismatch(
+                slot,
+                None,
+                epoch_slots_frozen_hash,
+                "epoch_slots_sample",
             );
         }
         BankStatus::Unprocessed => {
@@ -516,6 +543,7 @@ fn on_frozen_slot(slot: Slot, bank_frozen_state: BankFrozenState) -> Vec<Resulti
         cluster_confirmed_hash,
         is_slot_duplicate,
     } = bank_frozen_state;
+    agave_fast_lane::cluster_check::on_bank_frozen(slot, frozen_hash);
     let mut state_changes = vec![ResultingStateChange::BankFrozen(frozen_hash)];
     if let Some(cluster_confirmed_hash) = cluster_confirmed_hash {
         match cluster_confirmed_hash {

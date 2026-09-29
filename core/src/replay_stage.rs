@@ -4173,6 +4173,12 @@ impl ReplayStage {
                         "For slot {bank_slot} the leader said the bank hash should be: \
                          {expected_hash} however we computed: {computed_hash}",
                     );
+                    agave_fast_lane::cluster_check::on_cluster_mismatch(
+                        bank_slot,
+                        Some(computed_hash),
+                        expected_hash,
+                        "block_footer",
+                    );
 
                     datapoint_warn!(
                         "bank_hash_mismatch",
@@ -5734,3 +5740,6 @@ impl ReplayStage {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod fast_lane_safety_tests;

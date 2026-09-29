@@ -813,6 +813,16 @@ impl ClusterInfoVoteListener {
             stake,
             total_stake,
         );
+        // Fast lane safety net: each vote carries the bank hash of its last voted slot.
+        agave_fast_lane::cluster_check::on_vote(
+            last_vote_slot,
+            last_vote_hash,
+            vote_pubkey,
+            stake,
+            total_stake,
+            is_gossip_vote,
+            is_new,
+        );
 
         if is_gossip_vote && is_new && stake > 0 {
             let _ = notifiers.gossip_verified_vote_hash_sender.send((
