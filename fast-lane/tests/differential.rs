@@ -51,7 +51,11 @@ use {
     },
     solana_signature::Signature,
     solana_signer::Signer,
-    solana_svm::transaction_processor::ExecutionRecordingConfig,
+    solana_runtime::fast_lane_commit::{TxBalances, clone_processing_result, tx_balances},
+    solana_svm::{
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
+        transaction_processor::ExecutionRecordingConfig,
+    },
     solana_svm_timings::ExecuteTimings,
     solana_system_interface::{instruction as system_instruction, program as system_program},
     solana_transaction::{Transaction, TransactionVerificationMode, versioned::VersionedTransaction},
@@ -630,6 +634,121 @@ fn test_differential_against_agave() {
     let _ = child.slot();
     let _ = w.keys.len();
     let _ = ReadableAccount::lamports(&AccountSharedData::default());
+}
+
+/// Agave, serially, with replay's recording on (a `TransactionStatusSender` exists): each
+/// transaction's full processing result and balances, captured just before its commit.
+fn execute_serially_full(
+    child: &Bank,
+    txs: &[VersionedTransaction],
+) -> HashMap<Signature, (TransactionProcessingResult, Option<TxBalances>)> {
+    let mut out = HashMap::new();
+    for tx in txs {
+        let rtx = child
+            .verify_transaction(tx.clone(), TransactionVerificationMode::HashOnly)
+            .unwrap();
+        let batch = child.prepare_sanitized_batch(std::slice::from_ref(&rtx));
+        let mut timings = ExecuteTimings::default();
+        let output = child.load_and_execute_transactions(
+            &batch,
+            child.max_processing_age(),
+            &mut timings,
+            &mut Default::default(),
+            solana_svm::transaction_processor::TransactionProcessingConfig {
+                log_messages_bytes_limit: Some(LOG_LIMIT),
+                recording_config: ExecutionRecordingConfig::new_single_setting(true),
+                ..Default::default()
+            },
+        );
+        let captured = clone_processing_result(&output.processing_results[0]);
+        let balances = output
+            .balance_collector
+            .and_then(|b| tx_balances(b).into_iter().next());
+        child.commit_transactions(
+            batch.sanitized_transactions(),
+            output.processing_results,
+            &output.processed_counts,
+            &mut timings,
+        );
+        out.insert(tx.signatures[0], (captured, balances));
+    }
+    out
+}
+
+const LOG_LIMIT: usize = 100 * 1000;
+
+/// Milestone 1: with `commit = shadow`, every field of FL's full processing result (what
+/// agave's commit consumes: post accounts, fees, rollback accounts, status, logs, inner
+/// instructions, return data, units, deltas, loaded size, programs, balances) equals
+/// agave's, for every schedule.
+#[test]
+fn test_full_processing_result_against_agave() {
+    agave_fast_lane::control::set_agave_execution(agave_fast_lane::control::AgaveExecution {
+        record: true,
+        log_messages_bytes_limit: Some(LOG_LIMIT),
+    });
+    agave_fast_lane::control::set_commit_mode(agave_fast_lane::control::COMMIT_SHADOW);
+    let w = world();
+    let txs = transactions(&w, 11);
+    let child = Bank::new_from_parent_with_bank_forks(
+        &w.bank_forks,
+        w.parent.clone(),
+        SlotLeader::default(),
+        2,
+    );
+    let agave = execute_serially_full(&child, &txs);
+    let with_logs = agave
+        .values()
+        .filter(|(r, _)| match r {
+            Ok(ProcessedTransaction::Executed(e)) => e
+                .execution_details
+                .log_messages
+                .as_ref()
+                .is_some_and(|l| !l.is_empty()),
+            _ => false,
+        })
+        .count();
+    assert!(with_logs > 100, "agave recorded logs for {with_logs} txs");
+    assert!(agave.values().all(|(_, b)| b.is_some()), "balances recorded");
+    for (workers, speculation, theta, rebase) in [
+        (1usize, false, 0.2f32, false),
+        (6, true, 1000.0, false),
+        (8, true, 0.5, true),
+    ] {
+        let what = format!("full K={workers} spec={speculation} theta={theta} rebase={rebase}");
+        let (outcomes, _summary, _run) =
+            run_fast_lane(&w, &txs, workers, speculation, theta, rebase);
+        assert_eq!(outcomes.len(), txs.len(), "{what}");
+        for outcome in outcomes {
+            let sig = outcome.signature;
+            let processed = outcome.processed.expect("kept with commit = shadow");
+            assert!(processed.recorded, "{what}");
+            let fl = agave_fast_lane::full_cmp::FlFull::new(
+                outcome.slot,
+                outcome.parent_slot,
+                outcome.ordinal,
+                sig,
+                *processed,
+            );
+            let (agave_result, agave_balances) = &agave[&sig];
+            let mut fields = Vec::new();
+            agave_fast_lane::full_cmp::diff(
+                &fl.result,
+                fl.balances.as_ref(),
+                true,
+                agave_result,
+                agave_balances.as_ref(),
+                &mut fields,
+            );
+            assert!(
+                fields.is_empty(),
+                "{what}: {sig} differs in {fields:?}: fl {:?} agave {:?}",
+                fl.result.as_ref().map(|r| r.status()),
+                agave_result.as_ref().map(|r| r.status())
+            );
+        }
+    }
+    agave_fast_lane::control::set_commit_mode(agave_fast_lane::control::COMMIT_OFF);
 }
 
 /// Transactions of the chained child C that depend on P's freeze or on C's SlotHashes, on

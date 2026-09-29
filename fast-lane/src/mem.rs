@@ -79,6 +79,10 @@ pub static VM_POOL_BYTES: Gauge = Gauge::new();
 /// next incarnation verifies them (record + predicted account data; released with the run).
 pub static PRED_BYTES: Gauge = Gauge::new();
 
+/// Full processing results of the commit-mode shadow check (`full_cmp`): agave captures
+/// queued from replay to the comparator and both sides held while waiting for the other.
+pub static FULL_BYTES: Gauge = Gauge::new();
+
 /// Times the cap made the fast lane disable itself.
 pub static CAP_TRIPS: AtomicU64 = AtomicU64::new(0);
 
@@ -96,6 +100,7 @@ pub struct Snapshot {
     pub hints: i64,
     pub pred: i64,
     pub vm_pool: i64,
+    pub full: i64,
 }
 
 impl Snapshot {
@@ -113,6 +118,7 @@ impl Snapshot {
             hints: HINT_BYTES.get(),
             pred: PRED_BYTES.get(),
             vm_pool: VM_POOL_BYTES.get(),
+            full: FULL_BYTES.get(),
         }
     }
 
@@ -126,6 +132,7 @@ impl Snapshot {
             + self.hints
             + self.pred
             + self.vm_pool
+            + self.full
     }
 }
 

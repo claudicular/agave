@@ -1445,6 +1445,14 @@ impl Validator {
             blockstore: blockstore.clone(),
             exit: exit.clone(),
             ledger_path: ledger_path.to_path_buf(),
+            // Exactly what the unified scheduler's handlers get (`DefaultSchedulerPool::new`
+            // above), so FL executes and commits with replay's configuration.
+            replay: agave_fast_lane::ReplayServices {
+                transaction_status_sender: transaction_status_sender.clone(),
+                replay_vote_sender: Some(replay_vote_sender.clone()),
+                prioritization_fee_cache: prioritization_fee_cache.clone(),
+                log_messages_bytes_limit: config.runtime_config.log_messages_bytes_limit,
+            },
         });
 
         let ip_echo_server = match node.sockets.ip_echo {

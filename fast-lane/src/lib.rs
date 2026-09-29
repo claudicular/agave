@@ -21,6 +21,7 @@ pub mod config;
 pub mod control;
 pub mod export;
 pub mod forks;
+pub mod full_cmp;
 pub mod gate;
 pub mod ingest;
 pub mod mem;
@@ -53,7 +54,13 @@ use {
     solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
     solana_rpc::slot_status_notifier::SlotStatusNotifier,
-    solana_runtime::bank_forks::BankForks,
+    solana_runtime::{
+        bank_forks::BankForks,
+        fast_lane_commit::{AgaveProcessed, FastLaneHooks},
+        prioritization_fee_cache::PrioritizationFeeCache,
+        transaction_execution::TransactionStatusSender,
+        vote_sender_types::ReplayVoteSender,
+    },
     std::{
         path::PathBuf,
         sync::{
@@ -100,6 +107,40 @@ pub struct FastLaneDeps {
     pub blockstore: Arc<Blockstore>,
     pub exit: Arc<AtomicBool>,
     pub ledger_path: PathBuf,
+    /// The services replay's commit feeds (the unified scheduler's handler context): FL
+    /// executes with the same recording configuration.
+    pub replay: ReplayServices,
+}
+
+/// What agave's replay hands each committed transaction to (the handler context of the
+/// unified scheduler, `DefaultTaskHandler`).
+#[derive(Clone, Default)]
+pub struct ReplayServices {
+    pub transaction_status_sender: Option<TransactionStatusSender>,
+    pub replay_vote_sender: Option<ReplayVoteSender>,
+    pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    pub log_messages_bytes_limit: Option<usize>,
+}
+
+/// The fast lane's side of agave's replay hooks (`solana_runtime::fast_lane_commit`). Runs on
+/// agave's replay handler threads: wait-free (`try_send`), never panics.
+struct FlHooks {
+    full_tx: Sender<Box<AgaveProcessed>>,
+    full_drops: Arc<AtomicU64>,
+}
+
+impl FastLaneHooks for FlHooks {
+    fn on_agave_processed(&self, processed: AgaveProcessed) {
+        if !control::is_active() || !control::keep_processed() {
+            return;
+        }
+        let bytes = full_cmp::agave_bytes(&processed);
+        mem::FULL_BYTES.add(bytes);
+        if self.full_tx.try_send(Box::new(processed)).is_err() {
+            mem::FULL_BYTES.sub(bytes);
+            self.full_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct FastLaneHandle {
@@ -112,6 +153,7 @@ impl FastLaneHandle {
     pub fn join(self) {
         self.exit.store(true, Ordering::SeqCst);
         control::set_active(false);
+        solana_runtime::fast_lane_commit::uninstall_hooks();
         let deadline = Instant::now() + Duration::from_secs(2);
         for thread in self.threads {
             while !thread.is_finished() && Instant::now() < deadline {
@@ -253,6 +295,10 @@ fn start_threads(
         .with_rebase(config.rebase),
     );
     control::set_vm_opts(config.vm_opts);
+    control::set_agave_execution(control::AgaveExecution {
+        record: deps.replay.transaction_status_sender.is_some(),
+        log_messages_bytes_limit: deps.replay.log_messages_bytes_limit,
+    });
     let readonly_owners = Arc::new(shared.readonly_owners.get().cloned().unwrap_or_default());
     info!(
         "fast lane: starting {} workers (cores {:?}), readonly owners {:?}",
@@ -272,6 +318,8 @@ fn start_threads(
     let (coord_tx, coord_rx) = unbounded::<CoordMsg>();
     let (task_tx, task_rx) = unbounded();
     let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(65_536);
+    let (full_tx, full_rx) = bounded::<Box<AgaveProcessed>>(65_536);
+    let full_drops = Arc::new(AtomicU64::new(0));
     let sink_drops = Arc::new(AtomicU64::new(0));
     // Phase-3 output ring (created before any thread so its failure only disables it).
     let out_stats = Arc::new(output::OutStats::default());
@@ -381,15 +429,17 @@ fn start_threads(
         let config_c = config.clone();
         let bank_forks = deps.bank_forks.clone();
         let shared_c = shared.clone();
+        let full_drops_c = full_drops.clone();
         threads.push(
             safety::spawn("solFlCmp", Placement::Niced(config.aux_nice, config.shared_cores.clone()), move || {
                 let mut comparator =
                     Comparator::new(config_c, bank_forks, export_dir, sink_drops);
                 comparator.tap_stats = Some(shared_c);
+                comparator.full_drops = full_drops_c;
                 if out_enabled {
                     comparator.out_stats = Some(out_stats);
                 }
-                comparator.run_loop(cmp_rx, frame_rx, exit);
+                comparator.run_loop(cmp_rx, frame_rx, full_rx, exit);
             })
             .map_err(spawn_err)?,
         );
@@ -432,7 +482,16 @@ fn start_threads(
         );
     }
 
+    solana_runtime::fast_lane_commit::install_hooks(Arc::new(FlHooks {
+        full_tx,
+        full_drops,
+    }));
     control::set_active(true);
-    info!("fast lane: active");
+    control::set_commit_mode(config.commit);
+    info!(
+        "fast lane: active (commit={}, agave records statuses: {})",
+        control::commit_mode_name(config.commit),
+        control::agave_execution().record
+    );
     Ok(FastLaneHandle { exit, threads })
 }

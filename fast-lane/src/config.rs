@@ -114,6 +114,11 @@ pub struct Config {
     pub out_token: bool,
     /// Further owners (programs) whose accounts are published.
     pub out_owners: Vec<Pubkey>,
+    /// Commit mode (`crate::control::COMMIT_*`): `off`, or `shadow` (milestone 1: FL keeps
+    /// every transaction's full processing result, executed with agave's recording
+    /// configuration, and the comparator checks it field by field against agave's own).
+    /// Runtime toggle: `commit=off|shadow` in the control file.
+    pub commit: u8,
 }
 
 impl Default for Config {
@@ -158,6 +163,7 @@ impl Default for Config {
             out_ring_mb: 256,
             out_token: true,
             out_owners: Vec::new(),
+            commit: crate::control::COMMIT_OFF,
         }
     }
 }
@@ -314,6 +320,10 @@ impl Config {
             "out_ring_mb" => self.out_ring_mb = parse_scalar(key, value)?,
             "out_token" => self.out_token = parse_bool(key, value)?,
             "out_owners" => self.out_owners = parse_pubkeys(key, value)?,
+            "commit" => {
+                self.commit = crate::control::parse_commit_mode(value)
+                    .ok_or_else(|| ConfigError(format!("bad commit mode {value}")))?
+            }
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())
@@ -444,6 +454,20 @@ mod tests {
         assert_eq!(config.mem_cap_mb, 4096);
         assert!(!Config::parse("").unwrap().rebase);
         assert!(Config::parse("rebase = maybe").is_err());
+    }
+
+    /// The staged FRA config for execute-once milestone 1 (`fast_lane.commit_shadow.toml`).
+    #[test]
+    fn test_parse_fra_commit_shadow_config() {
+        let config = Config::parse(include_str!("fra_commit_shadow.toml")).unwrap();
+        assert_eq!(config.commit, crate::control::COMMIT_SHADOW);
+        assert!(config.rebase && config.vm_opts && config.chain && config.out_ring);
+        assert_eq!(Config::parse("").unwrap().commit, crate::control::COMMIT_OFF);
+        assert!(Config::parse("commit = maybe").is_err());
+        assert_eq!(
+            Config::parse("commit = off").unwrap().commit,
+            crate::control::COMMIT_OFF
+        );
     }
 
     const FRA_REBASE_TOML: &str = r#"

@@ -71,7 +71,16 @@ pub fn execute_batch<'a>(
 
     let transaction_indexes = Cow::from(transaction_indexes);
 
-    let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
+    // Fast-lane shadow check: a copy of what the commit consumes (see `fast_lane_commit`).
+    let capture = crate::fast_lane_commit::capture_enabled();
+    let mut captured = Vec::new();
+    let pre_commit_callback = |processing_results: &[_]| -> TransactionResult<()> {
+        if capture {
+            captured = processing_results
+                .iter()
+                .map(crate::fast_lane_commit::clone_processing_result)
+                .collect();
+        }
         // We're entering into one of the block-verification methods.
         get_first_error(batch, processing_results)
     };
@@ -113,6 +122,21 @@ pub fn execute_batch<'a>(
             .filter_map(|(commit_result, tx)| commit_result.was_fee_paying().then_some(tx));
         prioritization_fee_cache.update(bank, fee_paying_transactions);
     }
+    let capture = capture && !captured.is_empty();
+    let captured_costs: Vec<Option<u64>> = if capture {
+        tx_costs
+            .iter()
+            .map(|cost| cost.as_ref().map(|cost| cost.sum()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let captured_indexes: Vec<usize> = if capture {
+        transaction_indexes.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut captured_balances = None;
     if let Some(transaction_status_sender) = transaction_status_sender {
         let transactions: Vec<SanitizedTransaction> = batch
             .sanitized_transactions()
@@ -130,6 +154,29 @@ pub fn execute_batch<'a>(
 
         let (balances, token_balances) =
             compile_collected_balances(balance_collector.unwrap_or_default());
+        if capture {
+            captured_balances = Some(
+                balances
+                    .pre_balances
+                    .iter()
+                    .zip(&balances.post_balances)
+                    .zip(
+                        token_balances
+                            .pre_token_balances
+                            .iter()
+                            .zip(&token_balances.post_token_balances),
+                    )
+                    .map(|((pre, post), (token_pre, token_post))| {
+                        crate::fast_lane_commit::TxBalances {
+                            pre: pre.clone(),
+                            post: post.clone(),
+                            token_pre: token_pre.clone(),
+                            token_post: token_post.clone(),
+                        }
+                    })
+                    .collect(),
+            );
+        }
 
         // The length of costs vector needs to be consistent with all other
         // vectors that are sent over (such as `transactions`). So, replace the
@@ -148,6 +195,16 @@ pub fn execute_batch<'a>(
             token_balances,
             tx_costs,
             transaction_indexes.into_owned(),
+        );
+    }
+    if capture {
+        crate::fast_lane_commit::send_captures(
+            bank,
+            batch.sanitized_transactions(),
+            &captured_indexes,
+            captured,
+            captured_balances,
+            captured_costs,
         );
     }
 

@@ -11,6 +11,7 @@ use {
     crate::{
         config::Config,
         export::RotatingWriter,
+        full_cmp::{FlFull, FullCompare},
         mv::{accounts_equal, same_value},
         run::{OutcomeKind, Run, TxOutcome},
         sched::{FinalSink, Finalized, RunId, RunSummary},
@@ -22,7 +23,7 @@ use {
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{BankId, Slot},
     solana_pubkey::Pubkey,
-    solana_runtime::bank_forks::BankForks,
+    solana_runtime::{bank_forks::BankForks, fast_lane_commit::AgaveProcessed},
     solana_sdk_ids::incinerator,
     solana_signature::Signature,
     std::{
@@ -150,7 +151,7 @@ pub fn agave_frame_bytes(frame: &AgaveFrame) -> i64 {
     crate::mem::frame_bytes(frame.accounts.iter().map(|(_, a)| a)) + 256
 }
 
-/// Bytes a FINAL record holds (its outcome's frame).
+/// Bytes a FINAL record holds (its outcome's frame and full processing result).
 pub fn record_bytes(record: &FinalRecord) -> i64 {
     record
         .outcome
@@ -158,6 +159,12 @@ pub fn record_bytes(record: &FinalRecord) -> i64 {
         .as_ref()
         .map(|f| crate::mem::frame_bytes(f.iter().map(|(_, a)| a)))
         .unwrap_or(0)
+        + record
+            .outcome
+            .processed
+            .as_ref()
+            .map(|p| crate::full_cmp::processing_result_bytes(&p.result))
+            .unwrap_or(0)
         + 256
 }
 
@@ -248,6 +255,10 @@ pub struct Comparator {
     pub out_stats: Option<Arc<crate::output::OutStats>>,
     out_prev: [u64; 16],
     totals: Interval,
+    /// Commit-mode shadow check (full processing results, `full_cmp`).
+    pub full: FullCompare,
+    /// Agave captures dropped because the queue to the comparator was full.
+    pub full_drops: Arc<AtomicU64>,
 }
 
 impl Comparator {
@@ -302,6 +313,8 @@ impl Comparator {
             out_stats: None,
             out_prev: [0; 16],
             totals: Interval::default(),
+            full: FullCompare::default(),
+            full_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -309,6 +322,7 @@ impl Comparator {
         &mut self,
         cmp_rx: Receiver<CmpMsg>,
         frame_rx: Receiver<AgaveFrame>,
+        full_rx: Receiver<Box<AgaveProcessed>>,
         exit: Arc<AtomicBool>,
     ) {
         let mut last_gc = Instant::now();
@@ -326,6 +340,13 @@ impl Comparator {
                     Ok(frame) => {
                         crate::mem::FRAME_QUEUE_BYTES.sub(agave_frame_bytes(&frame));
                         self.on_agave(frame);
+                    }
+                    Err(_) => { self.flush(); return; }
+                },
+                recv(full_rx) -> msg => match msg {
+                    Ok(processed) => {
+                        crate::mem::FULL_BYTES.sub(crate::full_cmp::agave_bytes(&processed));
+                        self.on_agave_processed(processed);
                     }
                     Err(_) => { self.flush(); return; }
                 },
@@ -348,6 +369,9 @@ impl Comparator {
 
     /// Drop everything held (the fast lane is off): pending frames and records, and runs.
     fn release(&mut self) {
+        if self.full.fl_len() + self.full.agave_len() > 0 {
+            self.full.release();
+        }
         if self.fl.is_empty() && self.agave.is_empty() && self.runs.is_empty() {
             return;
         }
@@ -453,7 +477,51 @@ impl Comparator {
         }
     }
 
-    fn on_final(&mut self, record: FinalRecord) {
+    /// Agave's processing result of a replayed transaction (commit mode shadow).
+    pub fn on_agave_processed(&mut self, processed: Box<AgaveProcessed>) {
+        if !crate::control::is_active() || !crate::control::keep_processed() {
+            return;
+        }
+        if self.skipped.contains_key(&processed.slot) {
+            // FL has no result for this slot.
+            self.full.interval.unjoined_agave += 1;
+            return;
+        }
+        if let Some(mismatch) = self.full.on_agave(processed) {
+            self.write_sample(mismatch.json);
+        }
+    }
+
+    fn write_sample(&mut self, line: String) {
+        if self.minute_start.elapsed() >= Duration::from_secs(60) {
+            self.minute_start = Instant::now();
+            self.samples_this_minute = 0;
+        }
+        if self.samples_this_minute >= self.config.mismatch_samples_per_min {
+            return;
+        }
+        self.samples_this_minute += 1;
+        if let Some(w) = self.mismatches.as_mut() {
+            w.write_line(&line);
+        }
+    }
+
+    fn on_final(&mut self, mut record: FinalRecord) {
+        if let Some(processed) = record.outcome.processed.take() {
+            if crate::control::keep_processed() {
+                let outcome = &record.outcome;
+                let fl = FlFull::new(
+                    outcome.slot,
+                    outcome.parent_slot,
+                    outcome.ordinal,
+                    outcome.signature,
+                    *processed,
+                );
+                if let Some(mismatch) = self.full.on_fl(fl) {
+                    self.write_sample(mismatch.json);
+                }
+            }
+        }
         let interval = &mut self.interval;
         interval.finals += 1;
         interval.incarnations += u64::from(record.incarnations);
@@ -815,6 +883,10 @@ impl Comparator {
 
     fn gc(&mut self) {
         let horizon = Duration::from_secs(3);
+        self.full.gc(horizon);
+        if !crate::control::keep_processed() && self.full.fl_len() + self.full.agave_len() > 0 {
+            self.full.release();
+        }
         let now = Instant::now();
         let stale_fl: Vec<(Slot, Signature)> = self
             .fl
@@ -868,6 +940,9 @@ impl Comparator {
     fn summary(&mut self) {
         let secs = self.interval_start.elapsed().as_secs_f64();
         let mut iv = std::mem::take(&mut self.interval);
+        let fiv = self.full.take_interval();
+        let full_fields = fiv.fields_sorted();
+        let full_drops = self.full_drops.swap(0, Ordering::Relaxed);
         self.interval_start = Instant::now();
         for v in [
             &mut iv.lead_us,
@@ -918,7 +993,10 @@ impl Comparator {
              mem_cmp_queue_mb={} mem_cmp_held_mb={} cmp_fl={} cmp_agave={} cmp_runs={} \
              mem_ingest_pending_kb={} banks_held={} program_entries={} program_mb={} \
              hints_kb={} mem_pred_kb={} mem_vm_pool_kb={} cap_trips={} rebase_preds={} rebase_shadow={} \
-             rebase_hit={} rebase_miss={} spec_relaxed={} final_fixups={}",
+             rebase_hit={} rebase_miss={} spec_relaxed={} final_fixups={} commit={} \
+             full_cmp={} full_match={} full_mismatch={} full_fields={full_fields:?} \
+             full_unjoined_fl={} full_unjoined_agave={} full_unrecorded={} \
+             full_drops={full_drops} mem_full_kb={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -981,6 +1059,25 @@ impl Comparator {
             iv.pred_misses,
             iv.spec_relaxed,
             iv.final_fixups,
+            crate::control::commit_mode_name(crate::control::commit_mode()),
+            fiv.compared,
+            fiv.matched,
+            fiv.mismatched,
+            fiv.unjoined_fl,
+            fiv.unjoined_agave,
+            fiv.unrecorded,
+            mem.full >> 10,
+        );
+        solana_metrics::datapoint_info!(
+            "fast_lane_full",
+            ("compared", fiv.compared as i64, i64),
+            ("matched", fiv.matched as i64, i64),
+            ("mismatched", fiv.mismatched as i64, i64),
+            ("unjoined_fl", fiv.unjoined_fl as i64, i64),
+            ("unjoined_agave", fiv.unjoined_agave as i64, i64),
+            ("unrecorded", fiv.unrecorded as i64, i64),
+            ("drops", full_drops as i64, i64),
+            ("full_bytes", mem.full, i64),
         );
         solana_metrics::datapoint_info!(
             "fast_lane",
@@ -1059,7 +1156,10 @@ impl Comparator {
                  \"overlay\":{},\"live_runs\":{},\"frame_queue\":{},\"cmp_queue\":{},\"cmp_held\":{},\
                  \"ingest_pending\":{},\"banks_held\":{},\"program_entries\":{},\"program\":{},\
                  \"hints\":{},\"pred\":{},\"vm_pool\":{},\"cap_trips\":{}}},\"rebase\":{{\"predictions\":{},\
-                 \"shadow\":{},\"hits\":{},\"misses\":{},\"spec_relaxed\":{},\"final_fixups\":{}}}}}",
+                 \"shadow\":{},\"hits\":{},\"misses\":{},\"spec_relaxed\":{},\"final_fixups\":{}}},\
+                 \"full\":{{\"compared\":{},\"matched\":{},\"mismatched\":{},\"fields\":{},\
+                 \"unjoined_fl\":{},\"unjoined_agave\":{},\"unrecorded\":{},\"drops\":{full_drops},\
+                 \"bytes\":{}}}}}",
                 unix_ns(),
                 iv.matched,
                 iv.mismatched,
@@ -1121,6 +1221,21 @@ impl Comparator {
                 iv.pred_misses,
                 iv.spec_relaxed,
                 iv.final_fixups,
+                fiv.compared,
+                fiv.matched,
+                fiv.mismatched,
+                {
+                    let mut fields = String::from("{");
+                    for (i, (field, n)) in full_fields.iter().enumerate() {
+                        let _ = write!(fields, "{}\"{field}\":{n}", if i > 0 { "," } else { "" });
+                    }
+                    fields.push('}');
+                    fields
+                },
+                fiv.unjoined_fl,
+                fiv.unjoined_agave,
+                fiv.unrecorded,
+                mem.full,
             );
             w.write_line(&line);
         }

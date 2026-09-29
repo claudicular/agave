@@ -272,6 +272,7 @@ mod tests {
             t_tap: Instant::now(),
             t_tap_unix_ns: 1,
             from_ring: true,
+            processed: None,
         }
     }
 

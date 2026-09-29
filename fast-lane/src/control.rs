@@ -8,13 +8,86 @@ use {
     log::{error, info, warn},
     std::{
         path::Path,
-        sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        sync::{
+            OnceLock,
+            atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        },
     },
 };
 
 static FL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FL_POISONED: AtomicBool = AtomicBool::new(false);
 static FL_VM_OPTS: AtomicBool = AtomicBool::new(false);
+static FL_COMMIT_MODE: AtomicU8 = AtomicU8::new(COMMIT_OFF);
+
+/// `commit = off`: FL results stay inside FL (shadow comparator, output ring).
+pub const COMMIT_OFF: u8 = 0;
+/// `commit = shadow` (milestone 1): FL keeps each transaction's full processing result and
+/// agave hands the fast lane a copy of its own (`solana_runtime::fast_lane_commit`); the
+/// comparator checks them field by field. Nothing is committed.
+pub const COMMIT_SHADOW: u8 = 1;
+
+pub fn parse_commit_mode(value: &str) -> Option<u8> {
+    match value {
+        "off" => Some(COMMIT_OFF),
+        "shadow" => Some(COMMIT_SHADOW),
+        _ => None,
+    }
+}
+
+pub fn commit_mode_name(mode: u8) -> &'static str {
+    match mode {
+        COMMIT_SHADOW => "shadow",
+        _ => "off",
+    }
+}
+
+#[inline]
+pub fn commit_mode() -> u8 {
+    FL_COMMIT_MODE.load(Ordering::Relaxed)
+}
+
+/// Set the commit mode; agave's side follows while the fast lane is active.
+pub fn set_commit_mode(mode: u8) {
+    FL_COMMIT_MODE.store(mode, Ordering::SeqCst);
+    sync_runtime_mode();
+}
+
+/// Agave's side of the commit mode: the fast lane's mode while it is active and not
+/// poisoned, else off (agave stops capturing immediately).
+fn sync_runtime_mode() {
+    let mode = if FL_ACTIVE.load(Ordering::SeqCst) && !FL_POISONED.load(Ordering::SeqCst) {
+        commit_mode()
+    } else {
+        COMMIT_OFF
+    };
+    solana_runtime::fast_lane_commit::set_mode(mode);
+}
+
+/// How agave's replay executes transactions: with a `TransactionStatusSender` it records
+/// logs, inner instructions, return data and balances, and caps logs at
+/// `log_messages_bytes_limit`. FL executes identically when it keeps processing results.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgaveExecution {
+    pub record: bool,
+    pub log_messages_bytes_limit: Option<usize>,
+}
+
+static AGAVE_EXECUTION: OnceLock<AgaveExecution> = OnceLock::new();
+
+pub fn set_agave_execution(execution: AgaveExecution) {
+    let _ = AGAVE_EXECUTION.set(execution);
+}
+
+pub fn agave_execution() -> AgaveExecution {
+    AGAVE_EXECUTION.get().copied().unwrap_or_default()
+}
+
+/// Whether FL keeps each transaction's full processing result (shadow check or commit).
+#[inline]
+pub fn keep_processed() -> bool {
+    commit_mode() != COMMIT_OFF
+}
 
 /// Result-identical VM shortcuts (`solana_program_runtime::vm_opts`: mapped-prefix heap reset,
 /// PDA on-curve cache, pooled program-input buffers) on the fast lane's executor threads only;
@@ -44,13 +117,16 @@ pub fn set_active(active: bool) -> bool {
         return false;
     }
     FL_ACTIVE.store(active, Ordering::SeqCst);
+    sync_runtime_mode();
     true
 }
 
-/// Permanently disable the fast lane (contained panic, fatal internal error).
+/// Permanently disable the fast lane (contained panic, fatal internal error, a safety check).
+/// Agave's side stops at once: no more captures, and (commit mode) no more waiting on FL.
 pub fn poison(reason: &str) {
     FL_POISONED.store(true, Ordering::SeqCst);
     FL_ACTIVE.store(false, Ordering::SeqCst);
+    sync_runtime_mode();
     error!("fast lane: disabled permanently: {reason}");
 }
 
@@ -188,6 +264,13 @@ pub fn poll_control_file(
                 }
                 "rebase" => tunables.set_rebase(matches!(value.as_str(), "true" | "on" | "1")),
                 "vm_opts" => set_vm_opts(matches!(value.as_str(), "true" | "on" | "1")),
+                "commit" => match parse_commit_mode(value.as_str()) {
+                    Some(mode) => {
+                        set_commit_mode(mode);
+                        info!("fast lane: commit={} by control file", commit_mode_name(mode));
+                    }
+                    None => warn!("fast lane: bad commit mode {value}"),
+                },
                 "theta" => match value.parse::<f32>() {
                     Ok(theta) if (0.0..=1000.0).contains(&theta) => tunables.set_theta(theta),
                     _ => warn!("fast lane: bad theta {value}"),
@@ -237,6 +320,15 @@ mod tests {
         assert!(vm_opts());
         set_vm_opts(before);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_commit_mode_control_command() {
+        assert_eq!(parse_commit_mode("shadow"), Some(COMMIT_SHADOW));
+        assert_eq!(parse_commit_mode("off"), Some(COMMIT_OFF));
+        assert_eq!(parse_commit_mode("bogus"), None);
+        let cmds = parse_commands("commit=shadow\n");
+        assert_eq!(cmds, vec![Command::Set("commit".into(), "shadow".into())]);
     }
 
     #[test]

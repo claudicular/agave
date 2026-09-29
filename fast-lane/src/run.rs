@@ -29,9 +29,11 @@ use {
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_signature::Signature,
     solana_svm::{
-        transaction_processing_result::ProcessedTransaction,
+        account_loader::TransactionCheckResult,
+        transaction_balances::BalanceCollector,
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
         transaction_processor::{
-            TransactionBatchProcessor, TransactionProcessingConfig,
+            ExecutionRecordingConfig, TransactionBatchProcessor, TransactionProcessingConfig,
             TransactionProcessingEnvironment,
         },
     },
@@ -71,6 +73,20 @@ pub enum OutcomeKind {
     Unprocessable,
 }
 
+/// A transaction's full processing result as FL computed it: everything agave's commit
+/// consumes (`Bank::commit_transactions` and the rest of `execute_batch`). Kept only while
+/// `control::keep_processed()` (commit mode shadow or on).
+pub struct FlProcessed {
+    pub result: TransactionProcessingResult,
+    /// Balances collected by the SVM (with agave's recording configuration).
+    pub balances: Option<BalanceCollector>,
+    /// The runtime-check result the transaction was executed with.
+    pub check: TransactionCheckResult,
+    /// Executed with agave's recording configuration (logs, inner instructions, return
+    /// data, balances); without it those fields are empty and not comparable.
+    pub recorded: bool,
+}
+
 /// Per-transaction result carried to the comparator at FINAL.
 pub struct TxOutcome {
     pub slot: Slot,
@@ -94,6 +110,8 @@ pub struct TxOutcome {
     pub t_tap: Instant,
     pub t_tap_unix_ns: u64,
     pub from_ring: bool,
+    /// The full processing result (see [`FlProcessed`]).
+    pub processed: Option<Box<FlProcessed>>,
 }
 
 /// A chained run's link to its unfrozen parent.
@@ -559,16 +577,21 @@ impl Run {
     }
 }
 
-fn processing_config() -> TransactionProcessingConfig<'static> {
+fn processing_config(
+    record: bool,
+    log_messages_bytes_limit: Option<usize>,
+) -> TransactionProcessingConfig<'static> {
     // Replay's configuration (`Bank::do_load_execute_and_commit_...`), except that program
     // deployment slots are checked (the private cache is seeded from agave's rooted entries
-    // and must never hand out an entry older than the program data it reads).
+    // and must never hand out an entry older than the program data it reads). With `record`,
+    // replay's recording (`execute_batch`: all on when a `TransactionStatusSender` exists)
+    // and log limit.
     TransactionProcessingConfig {
         account_overrides: None,
         check_program_deployment_slot: true,
-        log_messages_bytes_limit: None,
+        log_messages_bytes_limit,
         limit_to_load_programs: false,
-        recording_config: Default::default(),
+        recording_config: ExecutionRecordingConfig::new_single_setting(record),
         drop_on_failure: false,
         all_or_nothing: false,
         strict_nonce_size_check: false,
@@ -626,13 +649,18 @@ impl SchedRun for Run {
             }
             FastLaneStaticCheck::Err(err) => Err(err.clone()),
         };
+        let keep = crate::control::keep_processed();
+        let agave_exec = crate::control::agave_execution();
+        let record = keep && agave_exec.record;
+        let kept_check = keep.then(|| check_result.clone());
         let output = self.processor.load_and_execute_sanitized_transactions(
             &callback,
             std::slice::from_ref(&entry.rtx),
             vec![check_result],
             &self.env,
-            &processing_config(),
+            &processing_config(record, agave_exec.log_messages_bytes_limit),
         );
+        let balances = output.balance_collector;
         let result = output.processing_results.into_iter().next();
         // A chained run's SlotHashes is provisional: an execution that read it through the
         // sysvar cache (syscall, builtin) records it as a read of the SlotHashes account.
@@ -687,10 +715,11 @@ impl SchedRun for Run {
             t_tap: entry.t_tap,
             t_tap_unix_ns: entry.t_tap_unix_ns,
             from_ring: entry.from_ring,
+            processed: None,
         };
         let mut writes = Vec::new();
         let mut unprocessable = false;
-        match result {
+        match &result {
             Some(Ok(ProcessedTransaction::Executed(executed))) => {
                 outcome.kind = OutcomeKind::Executed;
                 outcome.status = executed.execution_details.status.clone();
@@ -738,12 +767,20 @@ impl SchedRun for Run {
                 outcome.status = Err(no_op.validation_error.clone());
             }
             Some(Err(err)) => {
-                outcome.status = Err(err);
+                outcome.status = Err(err.clone());
                 unprocessable = true;
             }
             None => {
                 unprocessable = true;
             }
+        }
+        if let (Some(result), Some(check)) = (result, kept_check) {
+            outcome.processed = Some(Box::new(FlProcessed {
+                result,
+                balances,
+                check,
+                recorded: record,
+            }));
         }
         ExecOutput {
             reads: callback.reads.into_inner(),
