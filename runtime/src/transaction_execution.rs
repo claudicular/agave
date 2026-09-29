@@ -79,6 +79,7 @@ pub fn execute_batch<'a>(
     let sampled = transaction_indexes.len() == 1
         && crate::fast_lane_commit::is_sample(
             bank,
+            transaction_indexes[0],
             &batch.sanitized_transactions()[0],
         );
     let pre_commit_callback = |processing_results: &[_]| -> TransactionResult<()> {

@@ -77,6 +77,38 @@ pub fn set_verify_sample_ppm(ppm: u32) {
     solana_runtime::fast_lane_commit::set_sample_ppm(ppm);
 }
 
+static COMMIT_ON_WORKERS: AtomicBool = AtomicBool::new(false);
+static COMMIT_CSV_PPM: AtomicU32 = AtomicU32::new(100_000);
+static COMMIT_SPIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Commit on FL's executor threads (`commit_on = workers`) instead of the commit threads.
+pub fn commit_on_workers() -> bool {
+    COMMIT_ON_WORKERS.load(Ordering::Relaxed)
+}
+
+pub fn set_commit_on_workers(on: bool) {
+    COMMIT_ON_WORKERS.store(on, Ordering::Relaxed);
+}
+
+/// Parts per million of committed transactions written to `fl_commit.*.csv`.
+pub fn commit_csv_ppm() -> u32 {
+    COMMIT_CSV_PPM.load(Ordering::Relaxed)
+}
+
+pub fn set_commit_csv_ppm(ppm: u32) {
+    COMMIT_CSV_PPM.store(ppm.min(1_000_000), Ordering::Relaxed);
+}
+
+/// Commit threads' busy-poll before parking, µs (>= 1_000_000: never park). `u64::MAX` until
+/// set.
+pub fn commit_spin_us() -> u64 {
+    COMMIT_SPIN_US.load(Ordering::Relaxed)
+}
+
+pub fn set_commit_spin_us(us: u64) {
+    COMMIT_SPIN_US.store(us, Ordering::Relaxed);
+}
+
 /// How long agave's replay waits for FL to claim a transaction before executing it itself
 /// (`follow_wait_ms`).
 pub fn set_follow_wait_ms(ms: u64) {
@@ -509,6 +541,34 @@ pub fn poll_control_file(
                     Ok(ms) if ms <= 10_000 => set_follow_wait_ms(ms),
                     _ => warn!("fast lane: bad follow_wait_ms {value}"),
                 },
+                "commit_on" => match value.as_str() {
+                    "workers" => set_commit_on_workers(true),
+                    "threads" => set_commit_on_workers(false),
+                    _ => warn!("fast lane: bad commit_on {value}"),
+                },
+                "commit_spin_us" => match value.parse::<u64>() {
+                    Ok(us) => set_commit_spin_us(us),
+                    _ => warn!("fast lane: bad commit_spin_us {value}"),
+                },
+                "commit_csv_ppm" => match value.parse::<u32>() {
+                    Ok(ppm) if ppm <= 1_000_000 => set_commit_csv_ppm(ppm),
+                    _ => warn!("fast lane: bad commit_csv_ppm {value}"),
+                },
+                "sample_mode" => match value.as_str() {
+                    "fl" => solana_runtime::fast_lane_commit::set_sample_mode(
+                        solana_runtime::fast_lane_commit::SAMPLE_FL,
+                    ),
+                    "hash" => solana_runtime::fast_lane_commit::set_sample_mode(
+                        solana_runtime::fast_lane_commit::SAMPLE_HASH,
+                    ),
+                    _ => warn!("fast lane: bad sample_mode {value}"),
+                },
+                "bind_wait_us" => match value.parse::<u64>() {
+                    Ok(us) if us <= 100_000 => solana_runtime::fast_lane_commit::set_bind_wait(
+                        std::time::Duration::from_micros(us),
+                    ),
+                    _ => warn!("fast lane: bad bind_wait_us {value}"),
+                },
                 "follow_spin_us" => match value.parse::<u64>() {
                     Ok(us) if us <= 1_000_000 => solana_runtime::fast_lane_commit::set_follow_spin(
                         std::time::Duration::from_micros(us),
@@ -571,6 +631,8 @@ mod tests {
         assert_eq!(parse_commit_mode("shadow"), Some(COMMIT_SHADOW));
         assert_eq!(parse_commit_mode("off"), Some(COMMIT_OFF));
         assert_eq!(parse_commit_mode("on"), Some(COMMIT_ON));
+        let cmds = parse_commands("commit_on=workers\nsample_mode=fl\nbind_wait_us=500\n");
+        assert_eq!(cmds.len(), 3);
         assert_eq!(parse_commit_mode("bogus"), None);
         let cmds = parse_commands("commit=shadow\n");
         assert_eq!(cmds, vec![Command::Set("commit".into(), "shadow".into())]);

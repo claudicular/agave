@@ -5,15 +5,25 @@
 //! The [`Committer`] runs on the coordinator thread (inside the FINAL sink). For each run it
 //! binds to agave's bank of the run's slot once agave inserted it into bank forks (same
 //! parent slot and bank id as the run), takes each FINAL transaction's full processing result
-//! and hands it to a commit thread as soon as the transaction's commit-order predecessors
+//! and hands it to a commit thread (or, with `commit_on = workers`, to FL's executor threads,
+//! which are already spinning) as soon as the transaction's commit-order predecessors
 //! (`Finalized::cpreds`: every earlier transaction it conflicts with the way agave's
 //! scheduler orders them) are in the bank, committed by FL or by agave. Commits of
-//! non-conflicting transactions run in parallel on `commit_threads` threads.
+//! non-conflicting transactions run in parallel.
 //!
 //! FL declines (agave executes) what it must not commit: transactions touching a program
 //! loader, results that modified programs, unprocessable results, results executed without
 //! agave's recording configuration, and the verification sample (whose FL result is
-//! deposited for agave's handler to compare before committing its own).
+//! deposited for agave's handler to compare before committing its own). With
+//! `sample_mode = fl` FL picks the sample among transactions no later transaction conflicts
+//! with, so a sample never delays another commit.
+//!
+//! Every committed transaction's FINAL → committed time is attributed (histograms in the
+//! `fast_lane_commit` line, a sampled per-transaction `fl_commit.*.csv`): waiting for bank N,
+//! waiting for commit-order predecessors by who owns the predecessor (FL's own commit, a
+//! predecessor FL had not finalized yet, agave's execution of a sample / a declined
+//! transaction / a transaction agave claimed first) and whether only the readers-since rule
+//! made it a predecessor, queueing for a commit thread, and the commit itself.
 
 use {
     crate::{
@@ -22,7 +32,7 @@ use {
         mem,
         mv::TxIdx,
         run::{FlProcessed, OutcomeKind, Run, TxEntry, TxOutcome},
-        sched::{CoordMsg, RunId, RunSummary, recv_spin},
+        sched::{CoordMsg, RunId, RunSummary, SideJob, recv_spin},
     },
     crossbeam_channel::{Receiver, Sender},
     log::{info, warn},
@@ -33,10 +43,11 @@ use {
         fast_lane_commit::{self, Board, SampleDeposit},
         transaction_execution::{CommitServices, ExternalCommit, commit_external},
     },
+    solana_signature::Signature,
     solana_svm::transaction_processing_result::ProcessedTransaction,
     solana_svm_timings::ExecuteTimings,
     std::{
-        collections::{HashMap, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Mutex, RwLock,
@@ -54,13 +65,12 @@ pub enum CommitEvent {
     BankInserted(Arc<Bank>),
     /// Agave's replay executed and committed transaction `index` of `bank_id` itself.
     AgaveDone { bank_id: BankId, index: usize },
-    /// A commit thread finished a job.
+    /// A commit job finished.
     Done {
         run_id: RunId,
         k: TxIdx,
         outcome: CommitOutcome,
-        t_final: Instant,
-        t_done: Instant,
+        timing: Box<CommitTiming>,
     },
 }
 
@@ -75,6 +85,114 @@ pub enum CommitOutcome {
     Failed,
 }
 
+/// Why a commit waited for a predecessor: who owns (commits) that predecessor.
+pub const WAIT_CLASSES: [&str; 6] = [
+    // FL commits it (queued behind its own predecessors, or its commit in progress).
+    "fl_commit",
+    // FL had not finalized (or decided) it yet.
+    "fl_unfinal",
+    // Agave executes it: the verification sample.
+    "agave_sample",
+    // Agave executes it: FL declined it (loader, check, lost claim, ...).
+    "agave_declined",
+    // Agave executes it: agave claimed it before FL (unbound bank, follow timeout).
+    "agave_first",
+    // Agave executes it for another reason.
+    "agave_other",
+];
+const W_FL: usize = 0;
+const W_UNFINAL: usize = 1;
+const W_SAMPLE: usize = 2;
+const W_DECLINED: usize = 3;
+const W_FIRST: usize = 4;
+
+/// Where one transaction's FINAL → committed time went.
+#[derive(Clone, Debug, Default)]
+pub struct CommitTiming {
+    pub slot: Slot,
+    pub ordinal: u32,
+    pub signature: Signature,
+    pub is_vote: bool,
+    pub t_final: Option<Instant>,
+    /// Waiting for agave to create bank N (FL bound the run after this FINAL).
+    pub bank_wait: Duration,
+    /// Waiting for commit-order predecessors, by [`WAIT_CLASSES`].
+    pub wait: [Duration; 6],
+    /// Part of `wait` on predecessors only the readers-since rule imposed.
+    pub wait_readers: Duration,
+    /// Class of the predecessor waited on longest (index into [`WAIT_CLASSES`]).
+    pub blocker: Option<usize>,
+    pub n_cpreds: u32,
+    /// Handed to a commit thread / executor.
+    pub t_dispatch: Option<Instant>,
+    /// The job started on a thread.
+    pub t_start: Option<Instant>,
+    pub t_end: Option<Instant>,
+    pub t_end_unix_ns: u64,
+    pub on_worker: bool,
+}
+
+impl CommitTiming {
+    pub fn queue(&self) -> Duration {
+        match (self.t_dispatch, self.t_start) {
+            (Some(a), Some(b)) => b.saturating_duration_since(a),
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub fn service(&self) -> Duration {
+        match (self.t_start, self.t_end) {
+            (Some(a), Some(b)) => b.saturating_duration_since(a),
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub fn total(&self) -> Duration {
+        match (self.t_final, self.t_end) {
+            (Some(a), Some(b)) => b.saturating_duration_since(a),
+            _ => Duration::ZERO,
+        }
+    }
+
+    pub fn pred_wait(&self) -> Duration {
+        self.wait.iter().sum()
+    }
+
+    pub fn csv_header() -> &'static str {
+        "slot,ordinal,signature,vote,commit_unix_ns,total_us,bank_wait_us,pred_wait_us,\
+         wait_fl_commit_us,wait_fl_unfinal_us,wait_agave_sample_us,wait_agave_declined_us,\
+         wait_agave_first_us,wait_agave_other_us,wait_readers_us,blocker,n_cpreds,queue_us,\
+         service_us,on_worker"
+    }
+
+    pub fn csv_line(&self) -> String {
+        let us = |d: Duration| d.as_micros();
+        format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.slot,
+            self.ordinal,
+            self.signature,
+            u8::from(self.is_vote),
+            self.t_end_unix_ns,
+            us(self.total()),
+            us(self.bank_wait),
+            us(self.pred_wait()),
+            us(self.wait[0]),
+            us(self.wait[1]),
+            us(self.wait[2]),
+            us(self.wait[3]),
+            us(self.wait[4]),
+            us(self.wait[5]),
+            us(self.wait_readers),
+            self.blocker.map(|b| WAIT_CLASSES[b]).unwrap_or(""),
+            self.n_cpreds,
+            us(self.queue()),
+            us(self.service()),
+            u8::from(self.on_worker),
+        )
+    }
+}
+
 /// One transaction to commit.
 pub struct CommitJob {
     pub run_id: RunId,
@@ -84,8 +202,8 @@ pub struct CommitJob {
     pub board: Arc<Board>,
     pub tx: Arc<TxEntry>,
     pub processed: Box<FlProcessed>,
-    pub t_final: Instant,
     pub bytes: i64,
+    pub timing: Box<CommitTiming>,
 }
 
 /// Why FL declined a transaction (agave executes it).
@@ -112,11 +230,29 @@ pub struct CommitMetrics {
     pub runs_unbound: AtomicU64,
     pub bank_waits: AtomicU64,
     pub deposits: AtomicU64,
-    /// Commit latency (FINAL → committed), bank wait (a FINAL tx waiting for bank N), and
-    /// commit service time (per job on the commit thread), µs samples of the interval.
+    /// Samples FL picked (`sample_mode = fl`) and sample credit left unused at the end of runs.
+    pub samples_picked: AtomicU64,
+    /// Committed transactions whose longest predecessor wait was of each class.
+    pub blockers: [AtomicU64; 6],
+    /// Commits run on FL's executor threads.
+    pub on_workers: AtomicU64,
+    /// µs samples of the interval: FINAL → committed, bank wait of a run's first FINAL,
+    /// commit service, queue (dispatch → start), predecessor wait (total, on agave, on
+    /// readers-since predecessors), bank wait per transaction.
     pub latency_us: Mutex<Vec<u32>>,
     pub bank_wait_us: Mutex<Vec<u32>>,
     pub service_us: Mutex<Vec<u32>>,
+    pub queue_us: Mutex<Vec<u32>>,
+    pub pred_wait_us: Mutex<Vec<u32>>,
+    pub pred_wait_agave_us: Mutex<Vec<u32>>,
+    pub pred_wait_readers_us: Mutex<Vec<u32>>,
+    pub tx_bank_wait_us: Mutex<Vec<u32>>,
+    /// Summed µs of predecessor waits per class over the interval.
+    pub wait_sum_us: [AtomicU64; 6],
+    pub wait_readers_sum_us: AtomicU64,
+    pub bank_wait_sum_us: AtomicU64,
+    pub queue_sum_us: AtomicU64,
+    pub service_sum_us: AtomicU64,
     pub max_waiting: AtomicU64,
 }
 
@@ -134,16 +270,67 @@ impl CommitMetrics {
             }
         }
     }
+
+    /// Account one committed transaction's timing.
+    fn record(&self, t: &CommitTiming) {
+        let us = |d: Duration| d.as_micros() as u64;
+        Self::sample(&self.latency_us, us(t.total()));
+        Self::sample(&self.queue_us, us(t.queue()));
+        Self::sample(&self.pred_wait_us, us(t.pred_wait()));
+        Self::sample(&self.pred_wait_agave_us, us(t.wait[W_SAMPLE..].iter().sum()));
+        Self::sample(&self.pred_wait_readers_us, us(t.wait_readers));
+        Self::sample(&self.tx_bank_wait_us, us(t.bank_wait));
+        for (sum, w) in self.wait_sum_us.iter().zip(&t.wait) {
+            sum.fetch_add(us(*w), Ordering::Relaxed);
+        }
+        self.wait_readers_sum_us
+            .fetch_add(us(t.wait_readers), Ordering::Relaxed);
+        self.bank_wait_sum_us
+            .fetch_add(us(t.bank_wait), Ordering::Relaxed);
+        self.queue_sum_us.fetch_add(us(t.queue()), Ordering::Relaxed);
+        self.service_sum_us
+            .fetch_add(us(t.service()), Ordering::Relaxed);
+        if let Some(b) = t.blocker {
+            self.blockers[b].fetch_add(1, Ordering::Relaxed);
+        }
+        if t.on_worker {
+            self.on_workers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 struct Pending {
     cpreds: Vec<TxIdx>,
+    cpred_writers: usize,
     tx: Arc<TxEntry>,
     processed: Box<FlProcessed>,
-    t_final: Instant,
     bytes: i64,
-    /// The predecessor it is registered as waiting for (in `CommitRun::waiters`).
+    /// FL picked it for the verification sample (`sample_mode = fl`).
+    sample: bool,
+    /// The predecessor it is registered as waiting for (in `CommitRun::waiters`), since when,
+    /// its wait class, and whether only the readers-since rule made it a predecessor.
     parked_on: Option<TxIdx>,
+    park: Option<(Instant, usize, bool)>,
+    /// Longest single predecessor wait so far (for `blocker`).
+    longest: Duration,
+    timing: Box<CommitTiming>,
+}
+
+impl Pending {
+    /// End the current predecessor wait (if any) at `now`.
+    fn unpark(&mut self, now: Instant) {
+        if let Some((since, class, reader)) = self.park.take() {
+            let d = now.saturating_duration_since(since);
+            self.timing.wait[class] += d;
+            if reader {
+                self.timing.wait_readers += d;
+            }
+            if d >= self.longest {
+                self.longest = d;
+                self.timing.blocker = Some(class);
+            }
+        }
+    }
 }
 
 struct CommitRun {
@@ -156,8 +343,11 @@ struct CommitRun {
     waiters: HashMap<TxIdx, Vec<TxIdx>>,
     /// Declined before the run was bound (applied at binding), with FL's result for the
     /// verification sample.
-    declines: Vec<(TxIdx, Option<Box<FlProcessed>>)>,
-    in_flight: u32,
+    declines: Vec<(TxIdx, Option<Box<FlProcessed>>, bool)>,
+    /// Dispatched, not done.
+    inflight: HashSet<TxIdx>,
+    /// Transactions agave executes, with the reason (a decline class).
+    agave: HashMap<TxIdx, &'static str>,
     first_final: Option<Instant>,
     ended: bool,
     /// Transactions of the complete run (agave's indexes).
@@ -168,6 +358,29 @@ struct CommitRun {
 impl CommitRun {
     fn pending_bytes(&self) -> i64 {
         self.waiting.values().map(|p| p.bytes).sum()
+    }
+
+    /// Who owns predecessor `j` of a waiting transaction.
+    fn classify(&self, board: &Board, j: TxIdx) -> usize {
+        if self.inflight.contains(&j) || self.waiting.contains_key(&j) {
+            return W_FL;
+        }
+        if let Some(class) = self.agave.get(&j) {
+            return if *class == "sample" { W_SAMPLE } else { W_DECLINED };
+        }
+        let index = (j - self.base) as usize;
+        match board.state_of(index) {
+            fast_lane_commit::FL_CLAIMED => W_FL,
+            fast_lane_commit::FL_DECLINED => W_DECLINED,
+            fast_lane_commit::AGAVE_CLAIMED => {
+                let hash_sample = board.sample_mode == fast_lane_commit::SAMPLE_HASH
+                    && self.run.tx(j).is_some_and(|tx| {
+                        fast_lane_commit::sampled(&tx.signature, board.sample_ppm)
+                    });
+                if hash_sample { W_SAMPLE } else { W_FIRST }
+            }
+            _ => W_UNFINAL,
+        }
     }
 }
 
@@ -180,6 +393,20 @@ pub struct Committer {
     pub metrics: Arc<CommitMetrics>,
     last_sweep: Instant,
     released: bool,
+    /// `commit_on = workers`: FL's executor threads' side-job channel, with what a job needs.
+    workers: Option<WorkerCommit>,
+    /// Sampled per-transaction timings for the `fl_commit` CSV (sent to the comparator).
+    records: Option<Sender<crate::compare::CmpMsg>>,
+    record_credit: u64,
+    /// Sample credit (parts per million accumulated per FINAL transaction), per vote /
+    /// non-vote so that both are sampled.
+    sample_credit: [u64; 2],
+}
+
+struct WorkerCommit {
+    side_tx: Sender<SideJob>,
+    coord_tx: Sender<CoordMsg>,
+    services: Arc<ReplayServices>,
 }
 
 fn pending_bytes(processed: &FlProcessed) -> i64 {
@@ -201,7 +428,32 @@ impl Committer {
             metrics,
             last_sweep: Instant::now(),
             released: false,
+            workers: None,
+            records: None,
+            record_credit: 0,
+            sample_credit: [0; 2],
         }
+    }
+
+    /// Also commit on FL's executor threads when `commit_on = workers`.
+    pub fn with_workers(
+        mut self,
+        side_tx: Sender<SideJob>,
+        coord_tx: Sender<CoordMsg>,
+        services: ReplayServices,
+    ) -> Self {
+        self.workers = Some(WorkerCommit {
+            side_tx,
+            coord_tx,
+            services: Arc::new(services),
+        });
+        self
+    }
+
+    /// Send sampled per-transaction timings to the comparator (`fl_commit` CSV).
+    pub fn with_records(mut self, records: Sender<crate::compare::CmpMsg>) -> Self {
+        self.records = Some(records);
+        self
     }
 
     pub fn active_runs(&self) -> usize {
@@ -222,8 +474,7 @@ impl Committer {
                 run_id,
                 k,
                 outcome,
-                t_final,
-                t_done,
+                timing,
             } => {
                 let m = &self.metrics;
                 match &outcome {
@@ -232,10 +483,8 @@ impl Committer {
                         if !ok {
                             m.committed_err.fetch_add(1, Ordering::Relaxed);
                         }
-                        CommitMetrics::sample(
-                            &m.latency_us,
-                            t_done.saturating_duration_since(t_final).as_micros() as u64,
-                        );
+                        m.record(&timing);
+                        self.maybe_record(timing);
                     }
                     CommitOutcome::Declined(class) => m.decline(class),
                     CommitOutcome::Lost => {
@@ -249,11 +498,32 @@ impl Committer {
                     }
                 }
                 if let Some(run) = self.runs.get_mut(&run_id) {
-                    run.in_flight = run.in_flight.saturating_sub(1);
+                    run.inflight.remove(&k);
+                    match outcome {
+                        CommitOutcome::Declined(class) => {
+                            run.agave.insert(k, class);
+                        }
+                        CommitOutcome::Lost => {
+                            run.agave.insert(k, "lost");
+                        }
+                        _ => {}
+                    }
                 }
                 self.wake(run_id, k);
             }
         }
+    }
+
+    fn maybe_record(&mut self, timing: Box<CommitTiming>) {
+        let Some(records) = &self.records else {
+            return;
+        };
+        self.record_credit += u64::from(control::commit_csv_ppm());
+        if self.record_credit < 1_000_000 {
+            return;
+        }
+        self.record_credit -= 1_000_000;
+        let _ = records.try_send(crate::compare::CmpMsg::Commit(timing));
     }
 
     fn on_run_begin(&mut self, run_id: RunId, run: Arc<Run>) {
@@ -261,6 +531,7 @@ impl Committer {
             return;
         }
         let base = run.ordinal_base;
+        fast_lane_commit::expect_fl_run(run.slot, run.parent_bank_id);
         self.runs.insert(
             run_id,
             CommitRun {
@@ -271,7 +542,8 @@ impl Committer {
                 waiting: HashMap::new(),
                 waiters: HashMap::new(),
                 declines: Vec::new(),
-                in_flight: 0,
+                inflight: HashSet::new(),
+                agave: HashMap::new(),
                 first_final: None,
                 ended: false,
                 total: None,
@@ -350,21 +622,30 @@ impl Committer {
             );
         }
         self.metrics.runs_bound.fetch_add(1, Ordering::Relaxed);
-        for (k, processed) in std::mem::take(&mut cr.declines) {
+        for (k, processed, pick) in std::mem::take(&mut cr.declines) {
             let index = (k - cr.base) as usize;
             if let Some(processed) = processed {
                 mem::COMMIT_PENDING_BYTES.sub(pending_bytes(&processed));
-                if let Some(tx) = cr.run.tx(k) {
-                    if fast_lane_commit::sampled(&tx.signature, board.sample_ppm) {
-                        deposit(&board, index, *processed, &self.metrics);
-                        continue;
-                    }
+                let hash_sample = board.sample_mode == fast_lane_commit::SAMPLE_HASH
+                    && cr
+                        .run
+                        .tx(k)
+                        .is_some_and(|tx| fast_lane_commit::sampled(&tx.signature, board.sample_ppm));
+                if hash_sample || (pick && board.sample_mode == fast_lane_commit::SAMPLE_FL) {
+                    deposit(&board, index, *processed, &self.metrics);
+                    continue;
                 }
             }
             board.decline(index);
         }
         if let Some(total) = cr.total {
             board.set_fl_total(total);
+        }
+        // Transactions FINAL before the binding waited for bank N.
+        for pending in cr.waiting.values_mut() {
+            if let Some(t_final) = pending.timing.t_final {
+                pending.timing.bank_wait = now.saturating_duration_since(t_final);
+            }
         }
         cr.bank = Some(Arc::clone(bank));
         cr.board = Some(board);
@@ -376,25 +657,32 @@ impl Committer {
         true
     }
 
+
     /// A transaction became FINAL (on the coordinator thread, before the comparator and the
     /// output ring see it). Takes its processing result when FL will commit it.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_final(
         &mut self,
         run_id: RunId,
         k: TxIdx,
         cpreds: &[TxIdx],
+        cpred_writers: usize,
+        isolated: bool,
         outcome: &mut TxOutcome,
         t_final: Instant,
     ) {
         if !control::committing() {
             return;
         }
+        let Some(base) = self.runs.get(&run_id).map(|cr| cr.base) else {
+            return;
+        };
+        if k < base {
+            return;
+        }
         let Some(cr) = self.runs.get_mut(&run_id) else {
             return;
         };
-        if k < cr.base {
-            return;
-        }
         cr.first_final.get_or_insert(t_final);
         let Some(tx) = cr.run.tx(k) else {
             return;
@@ -421,15 +709,16 @@ impl Committer {
         };
         if let Some(class) = class {
             self.metrics.decline(class);
+            cr.agave.insert(k, class);
             let index = (k - cr.base) as usize;
             match &cr.board {
                 Some(board) => {
                     // A sampled transaction gets FL's result deposited whatever the reason
                     // FL does not commit it (agave's handler compares it).
+                    let hash_sample = board.sample_mode == fast_lane_commit::SAMPLE_HASH
+                        && fast_lane_commit::sampled(&tx.signature, board.sample_ppm);
                     match outcome.processed.take() {
-                        Some(processed)
-                            if fast_lane_commit::sampled(&tx.signature, board.sample_ppm) =>
-                        {
+                        Some(processed) if hash_sample => {
                             deposit(board, index, *processed, &self.metrics);
                         }
                         _ => {
@@ -442,7 +731,7 @@ impl Committer {
                     if let Some(p) = &processed {
                         mem::COMMIT_PENDING_BYTES.add(pending_bytes(p));
                     }
-                    cr.declines.push((k, processed));
+                    cr.declines.push((k, processed, false));
                 }
             }
             return;
@@ -450,17 +739,30 @@ impl Committer {
         let Some(processed) = outcome.processed.take() else {
             return;
         };
+        let pick = pick_sample(&mut self.sample_credit, &self.metrics, outcome.is_vote, isolated);
         let bytes = pending_bytes(&processed);
         mem::COMMIT_PENDING_BYTES.add(bytes);
         cr.waiting.insert(
             k,
             Pending {
                 cpreds: cpreds.to_vec(),
-                tx,
+                cpred_writers,
+                tx: Arc::clone(&tx),
                 processed,
-                t_final,
                 bytes,
+                sample: pick,
                 parked_on: None,
+                park: None,
+                longest: Duration::ZERO,
+                timing: Box::new(CommitTiming {
+                    slot: outcome.slot,
+                    ordinal: outcome.ordinal,
+                    signature: outcome.signature,
+                    is_vote: outcome.is_vote,
+                    t_final: Some(t_final),
+                    n_cpreds: cpreds.len() as u32,
+                    ..CommitTiming::default()
+                }),
             },
         );
         let waiting = cr.waiting.len() as u64;
@@ -482,29 +784,44 @@ impl Committer {
         };
         let base = cr.base;
         let index = (k - base) as usize;
-        if fast_lane_commit::sampled(&pending.tx.signature, board.sample_ppm) {
+        let sample = match board.sample_mode {
+            fast_lane_commit::SAMPLE_HASH => {
+                fast_lane_commit::sampled(&pending.tx.signature, board.sample_ppm)
+            }
+            _ => pending.sample,
+        };
+        if sample {
             // Agave executes it and compares with this result before committing its own.
             let pending = cr.waiting.remove(&k).unwrap();
             mem::COMMIT_PENDING_BYTES.sub(pending.bytes);
+            cr.agave.insert(k, "sample");
             self.metrics.decline("sample");
             deposit(&board, index, *pending.processed, &self.metrics);
             return;
         }
-        if let Some(&missing) = pending
+        let missing = pending
             .cpreds
             .iter()
-            .find(|&&j| j >= base && !board.is_done((j - base) as usize))
-        {
+            .enumerate()
+            .find(|&(_, &j)| j >= base && !board.is_done((j - base) as usize))
+            .map(|(i, &j)| (j, i >= pending.cpred_writers));
+        let now = Instant::now();
+        if let Some((missing, reader)) = missing {
             if pending.parked_on != Some(missing) {
+                let class = cr.classify(&board, missing);
                 cr.waiters.entry(missing).or_default().push(k);
-                if let Some(pending) = cr.waiting.get_mut(&k) {
-                    pending.parked_on = Some(missing);
-                }
+                let pending = cr.waiting.get_mut(&k).unwrap();
+                pending.unpark(now);
+                pending.parked_on = Some(missing);
+                pending.park = Some((now, class, reader));
             }
             return;
         }
-        let pending = cr.waiting.remove(&k).unwrap();
-        cr.in_flight += 1;
+        let mut pending = cr.waiting.remove(&k).unwrap();
+        pending.unpark(now);
+        cr.inflight.insert(k);
+        let mut timing = pending.timing;
+        timing.t_dispatch = Some(now);
         let job = CommitJob {
             run_id,
             k,
@@ -513,11 +830,28 @@ impl Committer {
             board,
             tx: pending.tx,
             processed: pending.processed,
-            t_final: pending.t_final,
             bytes: pending.bytes,
+            timing,
         };
-        if self.job_tx.send(job).is_err() {
-            warn!("fast lane: commit threads are gone");
+        match &self.workers {
+            Some(w) if control::commit_on_workers() => {
+                let (coord_tx, services, metrics) = (
+                    w.coord_tx.clone(),
+                    Arc::clone(&w.services),
+                    Arc::clone(&self.metrics),
+                );
+                let side: SideJob = Box::new(move || {
+                    run_commit_job(job, &services, &metrics, &coord_tx, true);
+                });
+                if w.side_tx.send(side).is_err() {
+                    warn!("fast lane: executor threads are gone");
+                }
+            }
+            _ => {
+                if self.job_tx.send(job).is_err() {
+                    warn!("fast lane: commit threads are gone");
+                }
+            }
         }
     }
 
@@ -566,9 +900,11 @@ impl Committer {
         let decline_bytes: i64 = cr
             .declines
             .iter()
-            .filter_map(|(_, p)| p.as_deref().map(pending_bytes))
+            .filter_map(|(_, p, _)| p.as_deref().map(pending_bytes))
             .sum();
         mem::COMMIT_PENDING_BYTES.sub(decline_bytes);
+        // The committer no longer binds this run: nobody should wait for it.
+        fast_lane_commit::unexpect_fl_run(cr.run.slot);
         if let Some(board) = &cr.board {
             if abandon {
                 board.abandon();
@@ -600,7 +936,7 @@ impl Committer {
         let mut sweep = Vec::new();
         for (&run_id, cr) in &self.runs {
             let closed = cr.board.as_ref().is_some_and(|b| b.is_closed());
-            let finished = cr.ended && cr.waiting.is_empty() && cr.in_flight == 0;
+            let finished = cr.ended && cr.waiting.is_empty() && cr.inflight.is_empty();
             let stale = cr.started.elapsed() > Duration::from_secs(30);
             if closed || finished || stale {
                 done.push((run_id, stale && !closed));
@@ -618,6 +954,25 @@ impl Committer {
                 self.try_dispatch(run_id, k);
             }
         }
+    }
+}
+
+/// Whether FL picks this committable FINAL transaction for the verification sample
+/// (`sample_mode = fl`): the sample rate accrues as credit (per vote / non-vote), spent on the
+/// next transaction no later transaction conflicts with, so the sample, which agave executes
+/// at its position, never delays a later commit.
+fn pick_sample(credits: &mut [u64; 2], metrics: &CommitMetrics, is_vote: bool, isolated: bool) -> bool {
+    if fast_lane_commit::sample_mode() != fast_lane_commit::SAMPLE_FL {
+        return false;
+    }
+    let credit = &mut credits[usize::from(is_vote)];
+    *credit = (*credit + u64::from(fast_lane_commit::sample_ppm())).min(4_000_000);
+    if *credit >= 1_000_000 && isolated {
+        *credit -= 1_000_000;
+        metrics.samples_picked.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
     }
 }
 
@@ -640,7 +995,86 @@ fn deposit(board: &Board, index: usize, processed: FlProcessed, metrics: &Commit
     metrics.deposits.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Commit one job through agave's commit path and report it to the coordinator. Runs on a
+/// commit thread or on an executor thread (`on_worker`). Returns false if the coordinator is
+/// gone.
+fn run_commit_job(
+    job: CommitJob,
+    services: &ReplayServices,
+    metrics: &CommitMetrics,
+    coord_tx: &Sender<CoordMsg>,
+    on_worker: bool,
+) -> bool {
+    let CommitJob {
+        run_id,
+        k,
+        index,
+        bank,
+        board,
+        tx,
+        processed,
+        bytes,
+        mut timing,
+    } = job;
+    mem::COMMIT_PENDING_BYTES.sub(bytes);
+    let t0 = Instant::now();
+    timing.t_start = Some(t0);
+    timing.on_worker = on_worker;
+    let outcome = if !control::committing() {
+        CommitOutcome::Stopped
+    } else {
+        let FlProcessed {
+            result,
+            balances,
+            check,
+            ..
+        } = *processed;
+        let services_ref = CommitServices {
+            transaction_status_sender: services.transaction_status_sender.as_ref(),
+            replay_vote_sender: services.replay_vote_sender.as_ref(),
+            prioritization_fee_cache: services.prioritization_fee_cache.as_deref(),
+        };
+        let mut timings = ExecuteTimings::default();
+        match catch_unwind(AssertUnwindSafe(|| {
+            commit_external(
+                &bank,
+                &board,
+                index,
+                &tx.rtx,
+                &check,
+                result,
+                balances,
+                services_ref,
+                &mut timings,
+            )
+        })) {
+            Ok(ExternalCommit::Committed(result)) => CommitOutcome::Committed(result.is_ok()),
+            Ok(ExternalCommit::Declined(class)) => CommitOutcome::Declined(class),
+            Ok(ExternalCommit::Lost) => CommitOutcome::Lost,
+            Err(_) => CommitOutcome::Failed,
+        }
+    };
+    let t_end = Instant::now();
+    timing.t_end = Some(t_end);
+    timing.t_end_unix_ns = crate::tap::unix_ns();
+    CommitMetrics::sample(
+        &metrics.service_us,
+        t_end.saturating_duration_since(t0).as_micros() as u64,
+    );
+    drop((bank, board, tx));
+    coord_tx
+        .send(CoordMsg::Sink(Box::new(CommitEvent::Done {
+            run_id,
+            k,
+            outcome,
+            timing,
+        })))
+        .is_ok()
+}
+
 /// Commit thread body: commit jobs through agave's commit path, report to the coordinator.
+/// The busy-poll time before parking is `control::commit_spin_us` (runtime), seeded with
+/// `spin`.
 pub fn commit_worker_loop(
     jobs: Receiver<CommitJob>,
     coord_tx: Sender<CoordMsg>,
@@ -649,71 +1083,16 @@ pub fn commit_worker_loop(
     spin: Duration,
     metrics: Arc<CommitMetrics>,
 ) {
-    let services_ref = CommitServices {
-        transaction_status_sender: services.transaction_status_sender.as_ref(),
-        replay_vote_sender: services.replay_vote_sender.as_ref(),
-        prioritization_fee_cache: services.prioritization_fee_cache.as_deref(),
-    };
-    while let Some(job) = recv_spin(&jobs, spin, &exit) {
-        let CommitJob {
-            run_id,
-            k,
-            index,
-            bank,
-            board,
-            tx,
-            processed,
-            t_final,
-            bytes,
-        } = job;
-        mem::COMMIT_PENDING_BYTES.sub(bytes);
-        let t0 = Instant::now();
-        let outcome = if !control::committing() {
-            CommitOutcome::Stopped
-        } else {
-            let FlProcessed {
-                result,
-                balances,
-                check,
-                ..
-            } = *processed;
-            let mut timings = ExecuteTimings::default();
-            match catch_unwind(AssertUnwindSafe(|| {
-                commit_external(
-                    &bank,
-                    &board,
-                    index,
-                    &tx.rtx,
-                    &check,
-                    result,
-                    balances,
-                    services_ref,
-                    &mut timings,
-                )
-            })) {
-                Ok(ExternalCommit::Committed(result)) => CommitOutcome::Committed(result.is_ok()),
-                Ok(ExternalCommit::Declined(class)) => CommitOutcome::Declined(class),
-                Ok(ExternalCommit::Lost) => CommitOutcome::Lost,
-                Err(_) => CommitOutcome::Failed,
-            }
+    if control::commit_spin_us() == u64::MAX {
+        control::set_commit_spin_us(spin.as_micros() as u64);
+    }
+    loop {
+        let spin = Duration::from_micros(control::commit_spin_us());
+        let Some(job) = recv_spin(&jobs, spin, &exit) else {
+            return;
         };
-        let t_done = Instant::now();
-        CommitMetrics::sample(
-            &metrics.service_us,
-            t_done.saturating_duration_since(t0).as_micros() as u64,
-        );
-        drop((bank, board, tx));
-        if coord_tx
-            .send(CoordMsg::Sink(Box::new(CommitEvent::Done {
-                run_id,
-                k,
-                outcome,
-                t_final,
-                t_done,
-            })))
-            .is_err()
-        {
-            break;
+        if !run_commit_job(job, &services, &metrics, &coord_tx, false) {
+            return;
         }
     }
 }
@@ -727,21 +1106,25 @@ pub fn pct(v: &mut [u32], p: f64) -> u32 {
     v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
+fn take(v: &Mutex<Vec<u32>>) -> Vec<u32> {
+    v.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
 /// The interval's commit report (fast_lane_commit log line and datapoint).
 pub struct CommitReport {
-    prev: [u64; 20],
+    prev: [u64; 22],
 }
 
 impl Default for CommitReport {
     fn default() -> Self {
-        Self { prev: [0; 20] }
+        Self { prev: [0; 22] }
     }
 }
 
 impl CommitReport {
     pub fn report(&mut self, secs: f64, metrics: &CommitMetrics) -> String {
         let s = &fast_lane_commit::STATS;
-        let now: [u64; 20] = [
+        let now: [u64; 22] = [
             metrics.committed.load(Ordering::Relaxed),
             metrics.committed_err.load(Ordering::Relaxed),
             metrics.lost.load(Ordering::Relaxed),
@@ -762,6 +1145,8 @@ impl CommitReport {
             s.sample_timeouts.load(Ordering::Relaxed),
             s.unverified_commits.load(Ordering::Relaxed),
             s.agave_only_slots.load(Ordering::Relaxed),
+            s.bind_waits.load(Ordering::Relaxed),
+            s.bind_wait_timeouts.load(Ordering::Relaxed),
         ];
         let d: Vec<u64> = now
             .iter()
@@ -775,33 +1160,53 @@ impl CommitReport {
             .map(|(c, n)| (*c, n.swap(0, Ordering::Relaxed)))
             .filter(|(_, n)| *n > 0)
             .collect();
-        let mut lat = metrics
-            .latency_us
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default();
-        let mut wait = metrics
-            .bank_wait_us
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default();
-        let mut service = metrics
-            .service_us
-            .lock()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default();
+        let blockers: Vec<(&str, u64)> = WAIT_CLASSES
+            .iter()
+            .zip(&metrics.blockers)
+            .map(|(c, n)| (*c, n.swap(0, Ordering::Relaxed)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        // Where the interval's FINAL → committed time went (ms summed over transactions).
+        let ms = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) / 1000;
+        let wait_ms: Vec<(&str, u64)> = WAIT_CLASSES
+            .iter()
+            .zip(&metrics.wait_sum_us)
+            .map(|(c, n)| (*c, ms(n)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let readers_ms = ms(&metrics.wait_readers_sum_us);
+        let bank_ms = ms(&metrics.bank_wait_sum_us);
+        let queue_ms = ms(&metrics.queue_sum_us);
+        let service_ms = ms(&metrics.service_sum_us);
+        let mut lat = take(&metrics.latency_us);
+        let mut wait = take(&metrics.bank_wait_us);
+        let mut service = take(&metrics.service_us);
+        let mut queue = take(&metrics.queue_us);
+        let mut pred = take(&metrics.pred_wait_us);
+        let mut pred_agave = take(&metrics.pred_wait_agave_us);
+        let mut readers = take(&metrics.pred_wait_readers_us);
+        let mut tx_bank = take(&metrics.tx_bank_wait_us);
         let max_waiting = metrics.max_waiting.swap(0, Ordering::Relaxed);
+        let picked = metrics.samples_picked.swap(0, Ordering::Relaxed);
+        let on_workers = metrics.on_workers.swap(0, Ordering::Relaxed);
         let follow_wait_avg = if d[10] > 0 { d[11] / d[10] } else { 0 };
         let line = format!(
-            "fast_lane_commit secs={secs:.1} mode={} committed={} committed_err={} \
-             agave_bound={} agave_unbound={} declined={declined:?} lost={} stopped={} failed={} \
-             commit_lat_us_p50={} p90={} p99={} commit_service_us_p50={} p99={} \
-             bank_waits={} bank_wait_us_p50={} p90={} max={} runs_bound={} runs_unbound={} \
-             follow_waits={} follow_wait_us_avg={follow_wait_avg} follow_timeouts={} \
-             follow_done={} identity_mismatch={} replay_required={} samples={} \
+            "fast_lane_commit secs={secs:.1} mode={} on={} sample_mode={} committed={} \
+             committed_err={} on_workers={on_workers} agave_bound={} agave_unbound={} \
+             declined={declined:?} lost={} stopped={} failed={} commit_lat_us_p50={} p75={} \
+             p90={} p99={} pred_wait_us_p50={} p75={} p90={} p99={} pred_agave_us_p90={} p99={} \
+             readers_us_p90={} p99={} tx_bank_wait_us_p90={} p99={} queue_us_p50={} p90={} \
+             p99={} commit_service_us_p50={} p90={} p99={} blocker={blockers:?} \
+             wait_ms={wait_ms:?} readers_ms={readers_ms} bank_ms={bank_ms} queue_ms={queue_ms} \
+             service_ms={service_ms} bank_waits={} bank_wait_us_p50={} p90={} max={} \
+             bind_waits={} bind_wait_timeouts={} runs_bound={} runs_unbound={} follow_waits={} \
+             follow_wait_us_avg={follow_wait_avg} follow_timeouts={} follow_done={} \
+             identity_mismatch={} replay_required={} samples={} samples_picked={picked} \
              sample_mismatch={} sample_timeouts={} unverified={} agave_only_slots={} \
              max_waiting={max_waiting} mem_commit_kb={} mem_board_kb={}",
             control::commit_mode_name(control::commit_mode()),
+            if control::commit_on_workers() { "workers" } else { "threads" },
+            if fast_lane_commit::sample_mode() == fast_lane_commit::SAMPLE_FL { "fl" } else { "hash" },
             d[0],
             d[1],
             d[7],
@@ -810,14 +1215,31 @@ impl CommitReport {
             d[3],
             d[4],
             pct(&mut lat, 0.5),
+            pct(&mut lat, 0.75),
             pct(&mut lat, 0.9),
             pct(&mut lat, 0.99),
+            pct(&mut pred, 0.5),
+            pct(&mut pred, 0.75),
+            pct(&mut pred, 0.9),
+            pct(&mut pred, 0.99),
+            pct(&mut pred_agave, 0.9),
+            pct(&mut pred_agave, 0.99),
+            pct(&mut readers, 0.9),
+            pct(&mut readers, 0.99),
+            pct(&mut tx_bank, 0.9),
+            pct(&mut tx_bank, 0.99),
+            pct(&mut queue, 0.5),
+            pct(&mut queue, 0.9),
+            pct(&mut queue, 0.99),
             pct(&mut service, 0.5),
+            pct(&mut service, 0.9),
             pct(&mut service, 0.99),
             wait.len(),
             pct(&mut wait, 0.5),
             pct(&mut wait, 0.9),
             wait.iter().max().copied().unwrap_or(0),
+            d[20],
+            d[21],
             d[5],
             d[6],
             d[10],
@@ -842,7 +1264,11 @@ impl CommitReport {
             ("failed", d[4] as i64, i64),
             ("commit_lat_us_p50", i64::from(pct(&mut lat, 0.5)), i64),
             ("commit_lat_us_p90", i64::from(pct(&mut lat, 0.9)), i64),
+            ("commit_lat_us_p99", i64::from(pct(&mut lat, 0.99)), i64),
+            ("pred_wait_us_p90", i64::from(pct(&mut pred, 0.9)), i64),
+            ("queue_us_p90", i64::from(pct(&mut queue, 0.9)), i64),
             ("bank_wait_us_p90", i64::from(pct(&mut wait, 0.9)), i64),
+            ("bind_wait_timeouts", d[21] as i64, i64),
             ("follow_timeouts", d[9] as i64, i64),
             ("identity_mismatch", d[13] as i64, i64),
             ("replay_required", d[14] as i64, i64),
@@ -855,17 +1281,15 @@ impl CommitReport {
 /// Log once at startup.
 pub fn log_start(config: &crate::config::Config) {
     info!(
-        "fast lane: commit threads {} (cores {:?}), verify_sample_ppm {}, follow_wait_ms {}, \
-         follow_spin_us {}",
+        "fast lane: commit threads {} (cores {:?}), commit_on {}, verify_sample_ppm {}, \
+         sample_mode {}, follow_wait_ms {}, follow_spin_us {}, bind_wait_us {}",
         config.commit_threads,
         config.commit_cores,
+        if config.commit_on_workers { "workers" } else { "threads" },
         config.verify_sample_ppm,
+        if config.sample_mode == fast_lane_commit::SAMPLE_FL { "fl" } else { "hash" },
         config.follow_wait_ms,
-        config.follow_spin_us
+        config.follow_spin_us,
+        config.bind_wait_us,
     );
-}
-
-#[allow(dead_code)]
-fn _slot(s: Slot) -> Slot {
-    s
 }

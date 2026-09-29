@@ -147,6 +147,12 @@ pub struct Finalized {
     /// writing it), reduced to the last writer of each account plus, for accounts this one
     /// writes, the readers since. Committing in this order is replay's order per account.
     pub cpreds: Vec<TxIdx>,
+    /// `cpreds[..cpred_writers]` come from the last-writer rule, the rest only from the
+    /// readers-since rule.
+    pub cpred_writers: usize,
+    /// No later transaction ingested so far conflicts with this one (none locks an account it
+    /// writes, none writes an account it reads): nothing would wait for it.
+    pub isolated: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -257,6 +263,7 @@ struct TxS {
     t_ready: Option<Instant>,
     /// Commit-order predecessors (see [`Finalized::cpreds`]).
     cpreds: Vec<TxIdx>,
+    cpred_writers: u32,
 }
 
 struct AcctS {
@@ -389,9 +396,64 @@ pub struct WorkerTask {
     prev_writes: Vec<Pubkey>,
 }
 
+/// A job an executor thread runs before its next execution (commit mode: committing a FINAL
+/// transaction into agave's bank on the thread that is already spinning, see `commit`).
+pub type SideJob = Box<dyn FnOnce() + Send>;
+
 /// Executor thread body: execute, install versions, report.
 pub fn worker_loop(
     tasks: Receiver<WorkerTask>,
+    done: Sender<CoordMsg>,
+    exit: Arc<AtomicBool>,
+    spin: Duration,
+) {
+    worker_loop_with_side(tasks, None, done, exit, spin)
+}
+
+/// Receive the next side job (first) or task; `None` on exit/disconnect.
+fn recv_work(
+    tasks: &Receiver<WorkerTask>,
+    side: &Receiver<SideJob>,
+    spin: Duration,
+    exit: &AtomicBool,
+) -> Option<Result<WorkerTask, SideJob>> {
+    let start = Instant::now();
+    let mut polls = 0u32;
+    loop {
+        if let Ok(job) = side.try_recv() {
+            return Some(Err(job));
+        }
+        match tasks.try_recv() {
+            Ok(task) => return Some(Ok(task)),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        polls = polls.wrapping_add(1);
+        if polls % 4096 == 0 && exit.load(Ordering::Relaxed) {
+            return None;
+        }
+        if spin < SPIN_FOREVER && start.elapsed() >= spin {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    loop {
+        crossbeam_channel::select! {
+            recv(side) -> job => if let Ok(job) = job { return Some(Err(job)) },
+            recv(tasks) -> task => return task.ok().map(Ok),
+            default(Duration::from_millis(100)) => {
+                if exit.load(Ordering::Relaxed) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// [`worker_loop`] that also runs side jobs (they take priority over executions).
+pub fn worker_loop_with_side(
+    tasks: Receiver<WorkerTask>,
+    side: Option<Receiver<SideJob>>,
     done: Sender<CoordMsg>,
     exit: Arc<AtomicBool>,
     spin: Duration,
@@ -400,9 +462,19 @@ pub fn worker_loop(
     let mut pda_cache_used = false;
     let mut pool_reported = 0i64;
     let result = loop {
-        let task = match recv_spin(&tasks, spin, &exit) {
-            Some(task) => task,
-            None => break,
+        let task = match &side {
+            None => match recv_spin(&tasks, spin, &exit) {
+                Some(task) => task,
+                None => break,
+            },
+            Some(side) => match recv_work(&tasks, side, spin, &exit) {
+                Some(Ok(task)) => task,
+                Some(Err(job)) => {
+                    job();
+                    continue;
+                }
+                None => break,
+            },
         };
         // FL-only VM shortcuts (result-identical; per-thread pools and caches).
         let want = crate::control::vm_opts();
@@ -779,6 +851,7 @@ impl<S: FinalSink> Coordinator<S> {
                     }
                 }
             }
+            let cpred_writers = preds.len() as u32;
             let mut cpreds: Vec<TxIdx> = preds.clone();
             for &(a, w) in &locks {
                 if w {
@@ -836,6 +909,7 @@ impl<S: FinalSink> Coordinator<S> {
                 rebased: 0,
                 t_ready: (pending == 0).then_some(t_ingest),
                 cpreds,
+                cpred_writers,
             });
             new_ready.push(k);
         }
@@ -1394,6 +1468,18 @@ impl<S: FinalSink> Coordinator<S> {
 
         // FINAL.
         let t_final = Instant::now();
+        let isolated = {
+            let tx = &run.txs[k as usize];
+            tx.locks.iter().all(|&(a, w)| {
+                let acct = &run.accts[a as usize];
+                if w {
+                    acct.lockers.last().is_none_or(|&(t, _)| t <= k)
+                } else {
+                    acct.last_writer.is_none_or(|lw| lw <= k)
+                }
+            })
+        };
+        let cpred_writers = run.txs[k as usize].cpred_writers as usize;
         let (out, out_inc, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds, cpreds) = {
             let tx = &mut run.txs[k as usize];
             tx.state = St::Final;
@@ -1470,6 +1556,8 @@ impl<S: FinalSink> Coordinator<S> {
             t_final,
             n_preds,
             cpreds,
+            cpred_writers,
+            isolated,
         });
         // Readers of a replaced prediction: re-dispatch/re-predict them now rather than at
         // their own validation.

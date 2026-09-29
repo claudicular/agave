@@ -84,6 +84,8 @@ pub enum CmpMsg {
     Rooted {
         slot: Slot,
     },
+    /// A committed transaction's FINAL → committed attribution (sampled, `commit_csv_ppm`).
+    Commit(Box<crate::commit::CommitTiming>),
 }
 
 /// The coordinator's sink: commits FINAL transactions into agave's banks (commit mode),
@@ -101,7 +103,15 @@ impl FinalSink for CmpSink {
             return;
         };
         if let Some(committer) = self.committer.as_mut() {
-            committer.on_final(f.run_id, f.k, &f.cpreds, &mut outcome, f.t_final);
+            committer.on_final(
+                f.run_id,
+                f.k,
+                &f.cpreds,
+                f.cpred_writers,
+                f.isolated,
+                &mut outcome,
+                f.t_final,
+            );
         }
         if let Some(out) = self.out.as_mut() {
             out.on_final(f.run_id, &outcome, f.incarnations, f.speculative);
@@ -294,6 +304,9 @@ pub struct Comparator {
     pub full: FullCompare,
     /// Commit mode: the committer's counters (reported as `fast_lane_commit` lines).
     pub commit_metrics: Option<Arc<crate::commit::CommitMetrics>>,
+    /// Sampled per-transaction commit attribution (`fl_commit.*.csv`).
+    commit_export: Option<RotatingWriter>,
+    export_dir: PathBuf,
     commit_report: crate::commit::CommitReport,
     /// Agave captures dropped because the queue to the comparator was full.
     pub full_drops: Arc<AtomicU64>,
@@ -358,6 +371,8 @@ impl Comparator {
             full_drops: Arc::new(AtomicU64::new(0)),
             commit_metrics: None,
             commit_report: Default::default(),
+            commit_export: None,
+            export_dir: export_dir.clone(),
         }
     }
 
@@ -441,8 +456,13 @@ impl Comparator {
     }
 
     fn flush(&mut self) {
-        for w in [&mut self.export, &mut self.mismatches, &mut self.summaries]
-            .into_iter()
+        for w in [
+            &mut self.export,
+            &mut self.mismatches,
+            &mut self.summaries,
+            &mut self.commit_export,
+        ]
+        .into_iter()
             .flatten()
         {
             w.flush();
@@ -529,6 +549,23 @@ impl Comparator {
             }
             CmpMsg::Rooted { slot } => {
                 self.skipped.retain(|s, _| *s + 64 > slot);
+            }
+            CmpMsg::Commit(timing) => {
+                if self.commit_export.is_none() {
+                    self.commit_export = RotatingWriter::new(
+                        &self.export_dir,
+                        "fl_commit",
+                        "csv",
+                        Some(crate::commit::CommitTiming::csv_header()),
+                        self.config.export_file_mb.saturating_mul(1 << 20),
+                        self.config.export_files,
+                    )
+                    .map_err(|err| warn!("fast lane: commit export disabled: {err}"))
+                    .ok();
+                }
+                if let Some(w) = self.commit_export.as_mut() {
+                    w.write_line(&timing.csv_line());
+                }
             }
         }
     }

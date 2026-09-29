@@ -91,6 +91,18 @@ static SAMPLE_WAIT_US: AtomicU64 = AtomicU64::new(200_000);
 /// How long a waiting replay handler spins before sleeping between checks (a handler that
 /// waits for the fast lane then costs almost no CPU).
 static FOLLOW_SPIN_US: AtomicU64 = AtomicU64::new(200);
+/// How samples are chosen (snapshotted per bank): [`SAMPLE_HASH`] (deterministic on the
+/// signature, both sides decide) or [`SAMPLE_FL`] (the fast lane picks transactions no later
+/// transaction conflicts with and deposits its result; agave compares what it finds).
+static SAMPLE_MODE: AtomicU8 = AtomicU8::new(SAMPLE_FL);
+pub const SAMPLE_HASH: u8 = 0;
+pub const SAMPLE_FL: u8 = 1;
+/// How long a replay handler waits for the fast lane to bind a bank it has a run for (the
+/// bank was just inserted; the fast lane's binding is on its way).
+static BIND_WAIT_US: AtomicU64 = AtomicU64::new(2_000);
+/// Slots (with the parent bank) the fast lane runs: a bank inserted for one is expected to be
+/// bound by the fast lane shortly.
+static EXPECTED: Mutex<VecDeque<(Slot, BankId)>> = Mutex::new(VecDeque::new());
 /// Registered commit boards (fast path of the handler hooks when zero).
 static COMMIT_BOARDS: AtomicUsize = AtomicUsize::new(0);
 
@@ -185,6 +197,70 @@ pub fn set_follow_wait(wait: Duration) {
 
 pub fn set_follow_spin(spin: Duration) {
     FOLLOW_SPIN_US.store(spin.as_micros() as u64, Ordering::Relaxed);
+}
+
+pub fn sample_mode() -> u8 {
+    SAMPLE_MODE.load(Ordering::Relaxed)
+}
+
+pub fn sample_ppm() -> u32 {
+    SAMPLE_PPM.load(Ordering::Relaxed)
+}
+
+pub fn set_sample_mode(mode: u8) {
+    SAMPLE_MODE.store(mode.min(SAMPLE_FL), Ordering::Relaxed);
+}
+
+pub fn set_bind_wait(wait: Duration) {
+    BIND_WAIT_US.store(wait.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The fast lane runs `slot` over the parent bank `parent_bank_id`: a bank of it inserted
+/// meanwhile waits (bounded) for the fast lane's binding instead of being executed by agave.
+pub fn expect_fl_run(slot: Slot, parent_bank_id: BankId) {
+    if let Ok(mut expected) = EXPECTED.lock() {
+        if !expected.contains(&(slot, parent_bank_id)) {
+            expected.push_back((slot, parent_bank_id));
+            while expected.len() > 256 {
+                expected.pop_front();
+            }
+        }
+    }
+    // A bank inserted before the expectation: mark its board too.
+    if COMMIT_BOARDS.load(Ordering::Acquire) > 0 {
+        if let Some(boards) = BOARDS.read().ok().as_ref().and_then(|b| b.as_ref()) {
+            for board in boards.values() {
+                if board.slot == slot && board.parent_bank_id == Some(parent_bank_id) {
+                    board.fl_expected.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+/// The fast lane gave up on `slot`: nobody waits for its binding.
+pub fn unexpect_fl_run(slot: Slot) {
+    if let Ok(mut expected) = EXPECTED.lock() {
+        expected.retain(|(s, _)| *s != slot);
+    }
+    if COMMIT_BOARDS.load(Ordering::Acquire) > 0 {
+        if let Some(boards) = BOARDS.read().ok().as_ref().and_then(|b| b.as_ref()) {
+            for board in boards.values() {
+                if board.slot == slot {
+                    board.fl_expected.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
+fn is_expected(slot: Slot, parent_bank_id: Option<BankId>) -> bool {
+    parent_bank_id.is_some_and(|parent| {
+        EXPECTED
+            .lock()
+            .map(|e| e.contains(&(slot, parent)))
+            .unwrap_or(false)
+    })
 }
 
 pub fn set_sample_wait(wait: Duration) {
@@ -533,6 +609,11 @@ pub struct Board {
     pub parent_slot: Slot,
     pub parent_bank_id: Option<BankId>,
     pub sample_ppm: u32,
+    /// [`SAMPLE_HASH`] or [`SAMPLE_FL`].
+    pub sample_mode: u8,
+    /// The fast lane runs this slot over this bank's parent: while unbound, agave waits
+    /// (bounded) for the binding.
+    fl_expected: AtomicBool,
     state: AtomicU8,
     closed: AtomicBool,
     inflight: AtomicU32,
@@ -553,12 +634,15 @@ pub struct Board {
 
 impl Board {
     fn new(bank: &Bank, sample_ppm: u32) -> Self {
+        let parent_bank_id = bank.parent().map(|p| p.bank_id());
         Self {
             slot: bank.slot(),
             bank_id: bank.bank_id(),
             parent_slot: bank.parent_slot(),
-            parent_bank_id: bank.parent().map(|p| p.bank_id()),
+            parent_bank_id,
             sample_ppm,
+            sample_mode: SAMPLE_MODE.load(Ordering::Relaxed),
+            fl_expected: AtomicBool::new(is_expected(bank.slot(), parent_bank_id)),
             state: AtomicU8::new(UNBOUND),
             closed: AtomicBool::new(false),
             inflight: AtomicU32::new(0),
@@ -584,6 +668,8 @@ impl Board {
             parent_slot: slot.saturating_sub(1),
             parent_bank_id: None,
             sample_ppm,
+            sample_mode: SAMPLE_HASH,
+            fl_expected: AtomicBool::new(false),
             state: AtomicU8::new(UNBOUND),
             closed: AtomicBool::new(false),
             inflight: AtomicU32::new(0),
@@ -656,9 +742,25 @@ impl Board {
 
     /// Deposit the fast lane's result of a sampled transaction (and decline the cell).
     pub fn deposit_sample(&self, index: usize, deposit: SampleDeposit) {
-        self.decline(index);
+        // The deposit first: a handler that finds the cell declined finds it too.
         if let Ok(mut deposits) = self.deposits.lock() {
             deposits.insert(index, deposit);
+        }
+        self.decline(index);
+    }
+
+    fn has_deposit(&self, index: usize) -> bool {
+        self.deposits
+            .lock()
+            .map(|d| d.contains_key(&index))
+            .unwrap_or(false)
+    }
+
+    /// Whether transaction `index` (`signature`) is in this bank's verification sample.
+    pub fn is_sample(&self, index: usize, signature: &Signature) -> bool {
+        match self.sample_mode {
+            SAMPLE_HASH => sampled(signature, self.sample_ppm),
+            _ => self.has_deposit(index),
         }
     }
 
@@ -829,6 +931,10 @@ pub struct CommitStats {
     pub poisons: AtomicU64,
     pub unverified_commits: AtomicU64,
     pub agave_only_slots: AtomicU64,
+    /// Handlers that waited for the fast lane's binding of a bank it runs, and those whose
+    /// wait ran out (executed by agave).
+    pub bind_waits: AtomicU64,
+    pub bind_wait_timeouts: AtomicU64,
 }
 
 pub static STATS: CommitStats = CommitStats {
@@ -850,6 +956,8 @@ pub static STATS: CommitStats = CommitStats {
     poisons: AtomicU64::new(0),
     unverified_commits: AtomicU64::new(0),
     agave_only_slots: AtomicU64::new(0),
+    bind_waits: AtomicU64::new(0),
+    bind_wait_timeouts: AtomicU64::new(0),
 };
 
 /// Bytes held by board cells (reported by the fast lane as `mem_board_kb`).
@@ -1001,8 +1109,10 @@ pub fn follow(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> Follo
     let mut waited = false;
     let follow_wait = Duration::from_micros(FOLLOW_WAIT_US.load(Ordering::Relaxed));
     // Transactions the fast lane never commits (agave executes them without waiting).
-    let agave_only_tx =
-        static_exclusion(tx).is_some() || sampled(tx.signature(), board.sample_ppm);
+    let agave_only_tx = static_exclusion(tx).is_some()
+        || (board.sample_mode == SAMPLE_HASH && sampled(tx.signature(), board.sample_ppm));
+    let bind_wait = Duration::from_micros(BIND_WAIT_US.load(Ordering::Relaxed));
+    let mut bind_waited = false;
     let finish_wait = |waited: bool| {
         if waited {
             STATS.follow_waits.fetch_add(1, Ordering::Relaxed);
@@ -1055,6 +1165,23 @@ pub fn follow(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> Follo
                 }
             }
             FREE => {
+                // The fast lane runs this slot and its binding is on its way: wait for it
+                // (bounded) rather than execute the transaction here.
+                if !agave_only_tx
+                    && !board.is_bound()
+                    && fl_live()
+                    && board.fl_expected.load(Ordering::Acquire)
+                    && board.state.load(Ordering::Acquire) == UNBOUND
+                    && start.elapsed() < bind_wait
+                {
+                    if !bind_waited {
+                        bind_waited = true;
+                        STATS.bind_waits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    waited = true;
+                    wait_step(start);
+                    continue;
+                }
                 let fl_will_commit = !agave_only_tx
                     && fl_live()
                     && board.is_bound()
@@ -1072,6 +1199,9 @@ pub fn follow(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> Follo
                             STATS.agave_bound.fetch_add(1, Ordering::Relaxed);
                         } else {
                             STATS.agave_unbound.fetch_add(1, Ordering::Relaxed);
+                            if bind_waited {
+                                STATS.bind_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         return Follow::Execute;
                     }
@@ -1103,8 +1233,8 @@ pub fn agave_done(bank: &Bank, index: usize) {
 
 /// Whether `tx` is in `bank`'s verification sample (agave executes it and compares the
 /// fast lane's result before committing its own).
-pub fn is_sample(bank: &Bank, tx: &impl TransactionWithMeta) -> bool {
-    board_for(bank).is_some_and(|board| sampled(tx.signature(), board.sample_ppm))
+pub fn is_sample(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> bool {
+    board_for(bank).is_some_and(|board| board.is_sample(index, tx.signature()))
 }
 
 /// Replay executed sampled transaction `index` (`result`, not committed yet): compare with

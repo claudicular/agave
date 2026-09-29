@@ -138,6 +138,19 @@ pub struct Config {
     /// Commit mode: a replay handler waiting for FL spins this long, then sleeps 20 µs
     /// between checks (low values free the handlers' cores).
     pub follow_spin_us: u64,
+    /// Commit on FL's executor threads (`commit_on = workers`) rather than on the commit
+    /// threads (`threads`). Runtime toggle: `commit_on=workers|threads`.
+    pub commit_on_workers: bool,
+    /// How the verification sample is chosen: `fl` (FL picks transactions no later
+    /// transaction conflicts with; samples never delay other commits) or `hash`
+    /// (deterministic on the signature). Runtime toggle `sample_mode=fl|hash` (new banks).
+    pub sample_mode: u8,
+    /// Commit mode: how long a replay handler waits for FL's binding of a bank FL runs (µs).
+    /// Runtime toggle `bind_wait_us=N`.
+    pub bind_wait_us: u64,
+    /// Parts per million of committed transactions written to `fl_commit.*.csv`. Runtime
+    /// toggle `commit_csv_ppm=N`.
+    pub commit_csv_ppm: u32,
 }
 
 impl Default for Config {
@@ -189,6 +202,10 @@ impl Default for Config {
             verify_sample_ppm: 0,
             follow_wait_ms: 100,
             follow_spin_us: 200,
+            commit_on_workers: false,
+            sample_mode: solana_runtime::fast_lane_commit::SAMPLE_FL,
+            bind_wait_us: 2_000,
+            commit_csv_ppm: 100_000,
         }
     }
 }
@@ -355,6 +372,22 @@ impl Config {
             "verify_sample_ppm" => self.verify_sample_ppm = parse_scalar(key, value)?,
             "follow_wait_ms" => self.follow_wait_ms = parse_scalar(key, value)?,
             "follow_spin_us" => self.follow_spin_us = parse_scalar(key, value)?,
+            "commit_on" => {
+                self.commit_on_workers = match value {
+                    "workers" => true,
+                    "threads" => false,
+                    _ => return Err(ConfigError(format!("bad commit_on {value}"))),
+                }
+            }
+            "sample_mode" => {
+                self.sample_mode = match value {
+                    "fl" => solana_runtime::fast_lane_commit::SAMPLE_FL,
+                    "hash" => solana_runtime::fast_lane_commit::SAMPLE_HASH,
+                    _ => return Err(ConfigError(format!("bad sample_mode {value}"))),
+                }
+            }
+            "bind_wait_us" => self.bind_wait_us = parse_scalar(key, value)?,
+            "commit_csv_ppm" => self.commit_csv_ppm = parse_scalar(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())
@@ -387,6 +420,12 @@ impl Config {
         }
         if self.verify_sample_ppm > 1_000_000 {
             return Err(ConfigError("verify_sample_ppm must be <= 1000000".into()));
+        }
+        if self.bind_wait_us > 100_000 {
+            return Err(ConfigError("bind_wait_us must be <= 100000".into()));
+        }
+        if self.commit_csv_ppm > 1_000_000 {
+            return Err(ConfigError("commit_csv_ppm must be <= 1000000".into()));
         }
         if self.follow_wait_ms > 10_000 {
             return Err(ConfigError("follow_wait_ms must be <= 10000".into()));
@@ -526,6 +565,22 @@ mod tests {
         let m3 = Config::parse("commit = on\ncommit_cores = [17-19]\ncommit_spin_us = 1000000")
             .unwrap();
         assert_eq!(m3.commit_cores, vec![17, 18, 19]);
+    }
+
+    /// The staged FRA config for the commit-latency build (`fast_lane.commit_latency.toml`).
+    #[test]
+    fn test_parse_fra_commit_latency_config() {
+        let config = Config::parse(include_str!("fra_commit_latency.toml")).unwrap();
+        assert_eq!(config.commit, crate::control::COMMIT_ON);
+        assert_eq!(config.sample_mode, solana_runtime::fast_lane_commit::SAMPLE_FL);
+        assert_eq!(config.bind_wait_us, 2000);
+        assert!(!config.commit_on_workers);
+        assert_eq!(config.commit_csv_ppm, 100_000);
+        assert_eq!(config.verify_sample_ppm, 10_000);
+        assert!(Config::parse("commit_on = workers").unwrap().commit_on_workers);
+        assert!(Config::parse("commit_on = both").is_err());
+        assert!(Config::parse("sample_mode = random").is_err());
+        assert!(Config::parse("bind_wait_us = 100001").is_err());
     }
 
     const FRA_REBASE_TOML: &str = r#"

@@ -24,7 +24,7 @@ use {
         forks::FlForkGraph,
         program_cache::ProgramCaches,
         run::{Run, TxOutcome},
-        sched::{CoordMsg, Coordinator, FinalSink, Finalized, RunId, RunSummary, worker_loop},
+        sched::{CoordMsg, Coordinator, FinalSink, Finalized, RunId, RunSummary},
     },
     crossbeam_channel::{Receiver, unbounded},
     rand::{Rng, SeedableRng, rngs::StdRng},
@@ -422,8 +422,15 @@ struct TestSink {
 impl FinalSink for TestSink {
     fn on_final(&mut self, f: Finalized) {
         if let Ok(mut outcome) = f.payload.downcast::<TxOutcome>() {
-            self.committer
-                .on_final(f.run_id, f.k, &f.cpreds, &mut outcome, f.t_final);
+            self.committer.on_final(
+                f.run_id,
+                f.k,
+                &f.cpreds,
+                f.cpred_writers,
+                f.isolated,
+                &mut outcome,
+                f.t_final,
+            );
             self.finals.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -476,16 +483,26 @@ fn start_fl(w: &World, run_id: RunId, txs: &[VersionedTransaction], workers: usi
     let (task_tx, task_rx) = unbounded();
     let (coord_tx, coord_rx) = unbounded();
     let (job_tx, job_rx) = unbounded();
+    let (side_tx, side_rx) = unbounded::<agave_fast_lane::sched::SideJob>();
     let metrics = Arc::new(CommitMetrics::default());
     let finals = Arc::new(AtomicU64::new(0));
     let ended = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     for _ in 0..workers {
         let (task_rx, coord_tx, exit) = (task_rx.clone(), coord_tx.clone(), exit.clone());
+        let side_rx = side_rx.clone();
         threads.push(
             thread::Builder::new()
                 .name("tFlExec".into())
-                .spawn(move || worker_loop(task_rx, coord_tx, exit, Duration::from_micros(20)))
+                .spawn(move || {
+                    agave_fast_lane::sched::worker_loop_with_side(
+                        task_rx,
+                        Some(side_rx),
+                        coord_tx,
+                        exit,
+                        Duration::from_micros(20),
+                    )
+                })
                 .unwrap(),
         );
     }
@@ -519,7 +536,15 @@ fn start_fl(w: &World, run_id: RunId, txs: &[VersionedTransaction], workers: usi
     }));
     {
         let sink = TestSink {
-            committer: Committer::new(job_tx, Some(w.bank_forks.clone()), metrics.clone()),
+            committer: Committer::new(job_tx, Some(w.bank_forks.clone()), metrics.clone())
+                .with_workers(
+                    side_tx,
+                    coord_tx.clone(),
+                    ReplayServices {
+                        transaction_status_sender: Some(w.tss.clone()),
+                        ..ReplayServices::default()
+                    },
+                ),
             finals: finals.clone(),
             ended,
         };
@@ -599,6 +624,9 @@ fn wait_fl_settled(fl: &Fl, board: &fast_lane_commit::Board, n: u64) {
 }
 
 fn reset(mode: u8, ppm: u32, follow_wait_ms: u64) {
+    fast_lane_commit::set_sample_mode(fast_lane_commit::SAMPLE_HASH);
+    control::set_commit_on_workers(false);
+    fast_lane_commit::set_bind_wait(Duration::from_millis(2));
     control::unpoison_for_tests();
     control::set_active(true);
     control::set_commit_mode(mode);
@@ -681,6 +709,15 @@ fn test_execute_once() {
     assert_eq!(u64::from(board.fl_committed()) + u64::from(board.agave_executed()), n);
     assert_eq!(board.verified(), board.fl_committed());
     assert_eq!(u64::from(board.agave_executed()), declined);
+    assert!(
+        fl.metrics.blockers[3].load(Ordering::SeqCst) > 0,
+        "commits waited for agave's execution of declined (loader) transactions"
+    );
+    assert_eq!(
+        fl.metrics.latency_us.lock().unwrap().len(),
+        board.fl_committed() as usize,
+        "every committed transaction attributed"
+    );
     fast_lane_commit::close_bank(&bank).unwrap();
     fl.stop();
     let got = finish(&w, bank);
@@ -737,6 +774,75 @@ fn test_execute_once() {
     fl.stop();
     let got = finish(&w, bank);
     assert_same("sampled", &reference, &got);
+
+    // 3b. FL-picked samples (`sample_mode = fl`): FL samples only transactions no later
+    //     transaction conflicts with; the rest is committed by FL; no sample differs.
+    reset(control::COMMIT_ON, 1_000_000, 100);
+    fast_lane_commit::set_sample_mode(fast_lane_commit::SAMPLE_FL);
+    let samples = STATS.samples.load(Ordering::SeqCst);
+    let sample_timeouts = STATS.sample_timeouts.load(Ordering::SeqCst);
+    let bank = new_bank(&w);
+    let board = fast_lane_commit::board_of(bank.bank_id()).unwrap();
+    let fl = start_fl(&w, 30, &txs, 4);
+    wait_fl_settled(&fl, &board, n);
+    replay(&bank, &txs).unwrap();
+    let picked = fl.metrics.samples_picked.load(Ordering::SeqCst);
+    assert!(picked > 0, "FL picked samples");
+    assert!(u64::from(board.fl_committed()) + picked + declined >= n - 2);
+    assert_eq!(STATS.samples.load(Ordering::SeqCst) - samples, picked);
+    assert_eq!(STATS.sample_timeouts.load(Ordering::SeqCst), sample_timeouts);
+    assert_eq!(STATS.sample_mismatches.load(Ordering::SeqCst), mismatches);
+    assert_eq!(
+        fl.metrics.blockers[2].load(Ordering::SeqCst),
+        0,
+        "no commit waited for a picked sample"
+    );
+    fast_lane_commit::close_bank(&bank).unwrap();
+    fl.stop();
+    let got = finish(&w, bank);
+    assert_same("fl-picked samples", &reference, &got);
+    eprintln!("fl-picked samples: {picked} of {n}, {} committed by FL", board.fl_committed());
+
+    // 3c. Commits on FL's executor threads (`commit_on = workers`), concurrent with agave.
+    reset(control::COMMIT_ON, 0, 100);
+    control::set_commit_on_workers(true);
+    let bank = new_bank(&w);
+    let board = fast_lane_commit::board_of(bank.bank_id()).unwrap();
+    let fl = start_fl(&w, 31, &txs, 4);
+    replay(&bank, &txs).unwrap();
+    assert_eq!(u64::from(board.fl_committed()) + u64::from(board.agave_executed()), n);
+    assert_eq!(
+        fl.metrics.on_workers.load(Ordering::SeqCst),
+        u64::from(board.fl_committed()),
+        "every FL commit ran on an executor thread"
+    );
+    fast_lane_commit::close_bank(&bank).unwrap();
+    fl.stop();
+    let got = finish(&w, bank);
+    assert_same("commit on workers", &reference, &got);
+
+    // 3d. Bank inserted after FL started its run: agave's replay waits for FL's binding
+    //     instead of executing (no unbound agave executions).
+    reset(control::COMMIT_ON, 0, 100);
+    fast_lane_commit::set_bind_wait(Duration::from_millis(50));
+    let unbound = STATS.agave_unbound.load(Ordering::SeqCst);
+    let bind_waits = STATS.bind_waits.load(Ordering::SeqCst);
+    let fl = start_fl(&w, 32, &txs, 4);
+    thread::sleep(Duration::from_millis(50)); // the run begins, its expectation is recorded
+    let bank = new_bank(&w);
+    let board = fast_lane_commit::board_of(bank.bank_id()).unwrap();
+    replay(&bank, &txs).unwrap();
+    assert_eq!(u64::from(board.fl_committed()) + u64::from(board.agave_executed()), n);
+    assert_eq!(
+        STATS.agave_unbound.load(Ordering::SeqCst),
+        unbound,
+        "agave waited for the binding (bind waits {})",
+        STATS.bind_waits.load(Ordering::SeqCst) - bind_waits
+    );
+    fast_lane_commit::close_bank(&bank).unwrap();
+    fl.stop();
+    let got = finish(&w, bank);
+    assert_same("bind wait", &reference, &got);
 
     // 4. FL poisoned mid-slot: FL has committed part of the block; agave executes the rest
     //    at once (no waiting), and the bank is still exact (FL's commits were valid).

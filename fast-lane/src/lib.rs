@@ -48,7 +48,7 @@ use {
         control::{TapStats, Tunables},
         ingest::{Ingest, IngestDeps},
         safety::Placement,
-        sched::{CoordMsg, Coordinator, worker_loop},
+        sched::{CoordMsg, Coordinator, SideJob, worker_loop_with_side},
         tap::TapBatch,
         tees::{AgaveEvent, AgaveFrame},
     },
@@ -349,6 +349,7 @@ fn start_threads(
 
     let (coord_tx, coord_rx) = unbounded::<CoordMsg>();
     let (task_tx, task_rx) = unbounded();
+    let (side_tx, side_rx) = unbounded::<SideJob>();
     let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(65_536);
     let (full_tx, full_rx) = bounded::<Box<AgaveProcessed>>(65_536);
     let (job_tx, job_rx) = unbounded::<commit::CommitJob>();
@@ -356,6 +357,11 @@ fn start_threads(
     control::set_verify_sample_ppm(config.verify_sample_ppm);
     control::set_follow_wait_ms(config.follow_wait_ms);
     solana_runtime::fast_lane_commit::set_follow_spin(Duration::from_micros(config.follow_spin_us));
+    solana_runtime::fast_lane_commit::set_sample_mode(config.sample_mode);
+    solana_runtime::fast_lane_commit::set_bind_wait(Duration::from_micros(config.bind_wait_us));
+    control::set_commit_on_workers(config.commit_on_workers);
+    control::set_commit_csv_ppm(config.commit_csv_ppm);
+    control::set_commit_spin_us(config.commit_spin_us);
     commit::log_start(&config);
     let full_drops = Arc::new(AtomicU64::new(0));
     let sink_drops = Arc::new(AtomicU64::new(0));
@@ -397,11 +403,12 @@ fn start_threads(
             Placement::Pinned(vec![config.worker_cores[i % config.worker_cores.len()]])
         };
         let task_rx = task_rx.clone();
+        let side_rx = side_rx.clone();
         let coord_tx = coord_tx.clone();
         let exit = exit.clone();
         threads.push(
             safety::spawn(&format!("solFlExec{i:02}"), place, move || {
-                worker_loop(task_rx, coord_tx, exit, worker_spin)
+                worker_loop_with_side(task_rx, Some(side_rx), coord_tx, exit, worker_spin)
             })
             .map_err(spawn_err)?,
         );
@@ -438,11 +445,15 @@ fn start_threads(
             tx: cmp_tx.clone(),
             drops: sink_drops.clone(),
             out,
-            committer: Some(commit::Committer::new(
-                job_tx,
-                Some(deps.bank_forks.clone()),
-                commit_metrics.clone(),
-            )),
+            committer: Some(
+                commit::Committer::new(
+                    job_tx,
+                    Some(deps.bank_forks.clone()),
+                    commit_metrics.clone(),
+                )
+                .with_workers(side_tx, coord_tx.clone(), deps.replay.clone())
+                .with_records(cmp_tx.clone()),
+            ),
         };
         let workers = config.workers;
         let hint_alpha = config.hint_alpha;
