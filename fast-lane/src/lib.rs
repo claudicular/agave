@@ -27,6 +27,7 @@ pub mod export;
 pub mod forks;
 pub mod full_cmp;
 pub mod gate;
+pub mod held;
 pub mod ingest;
 pub mod mem;
 pub mod mv;
@@ -136,6 +137,10 @@ pub struct FlHooks {
 }
 
 impl FastLaneHooks for FlHooks {
+    fn wants_slot(&self, slot: solana_clock::Slot) -> bool {
+        control::is_active() && control::wants_agave_slot(slot)
+    }
+
     fn on_agave_done(&self, _slot: solana_clock::Slot, bank_id: solana_clock::BankId, index: usize) {
         let _ = self.coord_tx.send(CoordMsg::Sink(Box::new(commit::CommitEvent::AgaveDone {
             bank_id,

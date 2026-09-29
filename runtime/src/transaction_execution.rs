@@ -72,7 +72,7 @@ pub fn execute_batch<'a>(
     let transaction_indexes = Cow::from(transaction_indexes);
 
     // Fast-lane shadow check: a copy of what the commit consumes (see `fast_lane_commit`).
-    let capture = crate::fast_lane_commit::capture_enabled();
+    let capture = crate::fast_lane_commit::capture_enabled(bank.slot());
     let mut captured = Vec::new();
     // Fast-lane commit mode: a sampled transaction is executed here and compared with the
     // fast lane's result before its commit.

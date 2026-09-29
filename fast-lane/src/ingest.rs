@@ -127,7 +127,16 @@ pub struct Ingest {
     last_bank_prune: Instant,
     last_program_stats: Instant,
     pub stats: IngestStats,
+    /// Memory-cap trip handling (see `maybe_auto_reenable`).
+    cap_tripped_at: Option<Instant>,
+    caught_up_since: Option<Instant>,
+    last_reenable: Option<Instant>,
+    reenable_backoff: Duration,
 }
+
+/// The node counts as caught up when replay's working bank is within this many slots of the
+/// blockstore's newest slot.
+const CAUGHT_UP_SLOTS: u64 = 8;
 
 impl Ingest {
     pub fn new(
@@ -159,6 +168,10 @@ impl Ingest {
             last_bank_prune: Instant::now(),
             last_program_stats: Instant::now(),
             stats: IngestStats::default(),
+            cap_tripped_at: None,
+            caught_up_since: None,
+            last_reenable: None,
+            reenable_backoff: Duration::from_secs(30),
         };
         ingest.seed();
         ingest
@@ -347,6 +360,7 @@ impl Ingest {
         crate::mem::PROGRAM_ENTRIES.set(0);
         crate::mem::PROGRAM_BYTES.set(0);
         self.released = true;
+        crate::control::reset_run_slots();
         info!("fast lane: released all ingest state ({reason})");
     }
 
@@ -360,14 +374,71 @@ impl Ingest {
             crate::mem::CAP_TRIPS.fetch_add(1, Ordering::Relaxed);
             log::error!(
                 "fast lane: holding {} MiB (cap {} MiB), {} live runs (cap {}); disabling and \
-                 releasing: {:?}",
+                 releasing (re-enabled automatically once under {}% of the cap and caught up): \
+                 {:?}",
                 snapshot.total_bytes() >> 20,
                 self.config.mem_cap_mb,
                 snapshot.live_runs,
                 crate::mem::MAX_LIVE_RUNS,
+                crate::mem::CAP_LOW_WATER_PCT,
                 snapshot
             );
-            crate::control::set_active(false);
+            // Repeated trips back off: 30 s, doubling up to 10 min while trips keep coming.
+            let now = Instant::now();
+            self.reenable_backoff = match self.last_reenable {
+                Some(t) if now.duration_since(t) < Duration::from_secs(600) => {
+                    (self.reenable_backoff * 2).min(Duration::from_secs(600))
+                }
+                _ => Duration::from_secs(30),
+            };
+            self.cap_tripped_at = Some(now);
+            self.caught_up_since = None;
+            crate::control::disable_for_cap();
+        }
+    }
+
+    /// After a cap trip: re-enable once memory is under the low watermark, the node has been
+    /// caught up (replay within a few slots of the blockstore's newest slot) for 5 s and the
+    /// backoff has passed. Never after a poison or an operator's command.
+    fn maybe_auto_reenable(&mut self) {
+        if !crate::control::cap_disabled() || crate::control::is_poisoned() {
+            self.caught_up_since = None;
+            return;
+        }
+        let cap = (self.config.mem_cap_mb as i64).saturating_mul(1 << 20);
+        let low = cap / 100 * crate::mem::CAP_LOW_WATER_PCT;
+        let now = Instant::now();
+        let caught_up = {
+            let working = self
+                .deps
+                .bank_forks
+                .read()
+                .ok()
+                .map(|forks| forks.working_bank().slot());
+            let highest = self.deps.blockstore.highest_slot().ok().flatten();
+            matches!((working, highest), (Some(w), Some(h)) if w + CAUGHT_UP_SLOTS >= h)
+        };
+        if crate::mem::Snapshot::now().total_bytes() > low || !caught_up {
+            self.caught_up_since = None;
+            return;
+        }
+        let since = *self.caught_up_since.get_or_insert(now);
+        let backoff_over = self
+            .cap_tripped_at
+            .is_none_or(|t| now.duration_since(t) >= self.reenable_backoff);
+        if now.duration_since(since) < Duration::from_secs(5) || !backoff_over {
+            return;
+        }
+        if crate::control::auto_reenable() {
+            crate::mem::CAP_REENABLES.fetch_add(1, Ordering::Relaxed);
+            self.last_reenable = Some(now);
+            self.caught_up_since = None;
+            log::warn!(
+                "fast lane: re-enabled after a memory-cap trip (memory under {}% of the cap, \
+                 node caught up; next backoff {:?})",
+                crate::mem::CAP_LOW_WATER_PCT,
+                self.reenable_backoff
+            );
         }
     }
 
@@ -402,6 +473,7 @@ impl Ingest {
         if let Some(root) = root {
             self.set_root(root);
         }
+        self.maybe_auto_reenable();
         if self.released {
             return;
         }
@@ -966,6 +1038,7 @@ impl Ingest {
         state.run = Some((run_id, Arc::clone(&run)));
         state.run_id = Some(run_id);
         state.status = SlotStatus::Running;
+        crate::control::note_run_slot(slot);
         state.next_ordinal = run.ordinal_base;
         if run.chain.is_some() {
             state.chain_run = Some((run_id, Arc::clone(&run)));

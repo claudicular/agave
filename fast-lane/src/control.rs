@@ -136,6 +136,34 @@ pub fn agave_execution() -> AgaveExecution {
     AGAVE_EXECUTION.get().copied().unwrap_or_default()
 }
 
+/// Slots FL started runs for since it was last (re)enabled: the first (0 = none yet) and the
+/// highest. Set by ingest; read on agave's threads to skip copies FL cannot use.
+static RUN_SLOT_FIRST: AtomicU64 = AtomicU64::new(0);
+static RUN_SLOT_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Ingest started a run of `slot`.
+pub fn note_run_slot(slot: u64) {
+    RUN_SLOT_MAX.fetch_max(slot, Ordering::Relaxed);
+    if RUN_SLOT_FIRST.load(Ordering::Relaxed) == 0 {
+        RUN_SLOT_FIRST.store(slot, Ordering::Relaxed);
+    }
+}
+
+/// Ingest released everything (the fast lane was disabled).
+pub fn reset_run_slots() {
+    RUN_SLOT_FIRST.store(0, Ordering::Relaxed);
+    RUN_SLOT_MAX.store(0, Ordering::Relaxed);
+}
+
+/// Whether agave's frames and results of `slot` may meet an FL result (a coarse filter for
+/// agave's threads; the comparator applies the exact one): FL started a run since it was
+/// enabled, and `slot` is not older than that first run nor far below the newest.
+#[inline]
+pub fn wants_agave_slot(slot: u64) -> bool {
+    let first = RUN_SLOT_FIRST.load(Ordering::Relaxed);
+    first != 0 && slot >= first && slot + 64 >= RUN_SLOT_MAX.load(Ordering::Relaxed)
+}
+
 /// Whether FL keeps each transaction's full processing result (shadow check or commit).
 #[inline]
 pub fn keep_processed() -> bool {
@@ -162,6 +190,25 @@ pub fn is_active() -> bool {
 
 pub fn is_poisoned() -> bool {
     FL_POISONED.load(Ordering::Relaxed)
+}
+
+/// The fast lane is off because its memory cap tripped (not by an operator): ingest turns it
+/// back on once memory is under the low watermark and the node is caught up.
+static CAP_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Disable after a memory-cap trip (auto re-enabled later, see [`auto_reenable`]).
+pub fn disable_for_cap() {
+    CAP_DISABLED.store(true, Ordering::SeqCst);
+    set_active(false);
+}
+
+pub fn cap_disabled() -> bool {
+    CAP_DISABLED.load(Ordering::SeqCst) && !FL_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Re-enable after a cap trip, unless an operator or a poison took over meanwhile.
+pub fn auto_reenable() -> bool {
+    CAP_DISABLED.swap(false, Ordering::SeqCst) && set_active(true)
 }
 
 /// Turn the fast lane on or off. Refused (returns false) once poisoned.
@@ -416,6 +463,7 @@ pub fn poll_control_file(
     for command in parse_commands(&text) {
         match command {
             Command::Enable => {
+                CAP_DISABLED.store(false, Ordering::SeqCst);
                 if set_active(true) {
                     info!("fast lane: enabled by control file");
                 } else {
@@ -426,6 +474,7 @@ pub fn poll_control_file(
                 }
             }
             Command::Disable => {
+                CAP_DISABLED.store(false, Ordering::SeqCst);
                 set_active(false);
                 info!("fast lane: disabled by control file");
             }

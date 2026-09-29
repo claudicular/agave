@@ -689,8 +689,17 @@ pub fn on_bank_version(slot: Slot, version: BlockVersion) {
     st.lift_passed(slot);
 }
 
+/// Highest slot whose frozen hash the cluster confirmed (0 before any).
+static LAST_MATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Highest slot whose frozen hash the cluster confirmed: FL results up to it are known good.
+pub fn last_matched_slot() -> Slot {
+    LAST_MATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The cluster confirmed `hash` for `slot`, and it equals our frozen hash.
 pub fn on_cluster_match(slot: Slot, hash: Hash) {
+    LAST_MATCHED.fetch_max(slot, std::sync::atomic::Ordering::Relaxed);
     let now = Instant::now();
     let mut guard = state().lock();
     let st = &mut *guard;

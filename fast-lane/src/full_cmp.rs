@@ -12,6 +12,7 @@
 
 use {
     crate::{
+        held::Held,
         mem,
         mv::accounts_equal,
         run::FlProcessed,
@@ -169,6 +170,8 @@ pub struct FullInterval {
     pub unjoined_agave: u64,
     /// FL executed without agave's recording configuration (recording fields skipped).
     pub unrecorded: u64,
+    /// Entries evicted by the join maps' bounds.
+    pub evicted: u64,
 }
 
 impl FullInterval {
@@ -180,14 +183,20 @@ impl FullInterval {
     }
 }
 
-/// Join state: FL results and agave captures waiting for the other side.
-#[derive(Default)]
+/// Join state: FL results and agave captures waiting for the other side (bounded: see
+/// [`crate::held::Held`]).
 pub struct FullCompare {
-    fl: HashMap<(Slot, Signature), FlFull>,
-    agave: HashMap<(Slot, Signature), Box<AgaveProcessed>>,
+    fl: Held<(Slot, Signature), FlFull>,
+    agave: Held<(Slot, Signature), Box<AgaveProcessed>>,
     pub interval: FullInterval,
     pub total_compared: u64,
     pub total_mismatched: u64,
+}
+
+impl Default for FullCompare {
+    fn default() -> Self {
+        Self::with_max_bytes(512 << 20)
+    }
 }
 
 /// A mismatch to sample (written by the comparator, rate-limited).
@@ -195,7 +204,21 @@ pub struct FullMismatch {
     pub json: String,
 }
 
+/// Most pending entries each join map holds.
+const FULL_MAX_COUNT: usize = 200_000;
+
 impl FullCompare {
+    /// Join maps of at most `max_bytes` each (and [`FULL_MAX_COUNT`] entries).
+    pub fn with_max_bytes(max_bytes: i64) -> Self {
+        Self {
+            fl: Held::new(FULL_MAX_COUNT, max_bytes, &mem::FULL_BYTES),
+            agave: Held::new(FULL_MAX_COUNT, max_bytes, &mem::FULL_BYTES),
+            interval: FullInterval::default(),
+            total_compared: 0,
+            total_mismatched: 0,
+        }
+    }
+
     pub fn fl_len(&self) -> usize {
         self.fl.len()
     }
@@ -207,13 +230,12 @@ impl FullCompare {
     pub fn on_fl(&mut self, fl: FlFull) -> Option<FullMismatch> {
         let key = (fl.slot, fl.signature);
         if let Some(agave) = self.agave.remove(&key) {
-            mem::FULL_BYTES.sub(agave_bytes(&agave));
             self.join(fl, &agave)
         } else {
-            mem::FULL_BYTES.add(fl.bytes());
-            if let Some(old) = self.fl.insert(key, fl) {
-                mem::FULL_BYTES.sub(old.bytes());
-            }
+            let bytes = fl.bytes();
+            let evicted = self.fl.insert(key, fl, bytes).len() as u64;
+            self.interval.evicted += evicted;
+            self.interval.unjoined_fl += evicted;
             None
         }
     }
@@ -221,13 +243,12 @@ impl FullCompare {
     pub fn on_agave(&mut self, agave: Box<AgaveProcessed>) -> Option<FullMismatch> {
         let key = (agave.slot, agave.signature);
         if let Some(fl) = self.fl.remove(&key) {
-            mem::FULL_BYTES.sub(fl.bytes());
             self.join(fl, &agave)
         } else {
-            mem::FULL_BYTES.add(agave_bytes(&agave));
-            if let Some(old) = self.agave.insert(key, agave) {
-                mem::FULL_BYTES.sub(agave_bytes(&old));
-            }
+            let bytes = agave_bytes(&agave);
+            let evicted = self.agave.insert(key, agave, bytes).len() as u64;
+            self.interval.evicted += evicted;
+            self.interval.unjoined_agave += evicted;
             None
         }
     }
@@ -268,39 +289,20 @@ impl FullCompare {
     /// Entries older than `horizon` without a partner are counted and dropped.
     pub fn gc(&mut self, horizon: Duration) {
         let now = Instant::now();
-        let stale_fl: Vec<_> = self
+        let stale_fl = self
             .fl
-            .iter()
-            .filter(|(_, f)| now.saturating_duration_since(f.t) > horizon)
-            .map(|(k, _)| *k)
-            .collect();
-        for key in stale_fl {
-            if let Some(fl) = self.fl.remove(&key) {
-                mem::FULL_BYTES.sub(fl.bytes());
-                self.interval.unjoined_fl += 1;
-            }
-        }
-        let stale_agave: Vec<_> = self
+            .remove_where(|_, f| now.saturating_duration_since(f.t) > horizon);
+        self.interval.unjoined_fl += stale_fl.len() as u64;
+        let stale_agave = self
             .agave
-            .iter()
-            .filter(|(_, a)| now.saturating_duration_since(a.t) > horizon)
-            .map(|(k, _)| *k)
-            .collect();
-        for key in stale_agave {
-            if let Some(agave) = self.agave.remove(&key) {
-                mem::FULL_BYTES.sub(agave_bytes(&agave));
-                self.interval.unjoined_agave += 1;
-            }
-        }
+            .remove_where(|_, a| now.saturating_duration_since(a.t) > horizon);
+        self.interval.unjoined_agave += stale_agave.len() as u64;
     }
 
     /// Drop everything held (the fast lane is off or the mode changed).
     pub fn release(&mut self) {
-        let held: i64 = self.fl.values().map(FlFull::bytes).sum::<i64>()
-            + self.agave.values().map(|a| agave_bytes(a)).sum::<i64>();
-        mem::FULL_BYTES.sub(held);
-        self.fl = HashMap::new();
-        self.agave = HashMap::new();
+        self.fl.clear();
+        self.agave.clear();
     }
 
     pub fn take_interval(&mut self) -> FullInterval {

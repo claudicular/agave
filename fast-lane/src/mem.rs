@@ -89,6 +89,11 @@ pub static COMMIT_PENDING_BYTES: Gauge = Gauge::new();
 
 /// Times the cap made the fast lane disable itself.
 pub static CAP_TRIPS: AtomicU64 = AtomicU64::new(0);
+/// Times the fast lane re-enabled itself after a cap trip (memory back under the low
+/// watermark and the node caught up).
+pub static CAP_REENABLES: AtomicU64 = AtomicU64::new(0);
+/// After a cap trip, memory must fall below this percentage of the cap before re-enabling.
+pub const CAP_LOW_WATER_PCT: i64 = 25;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Snapshot {

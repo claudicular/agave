@@ -12,6 +12,7 @@ use {
         config::Config,
         export::RotatingWriter,
         full_cmp::{FlFull, FullCompare},
+        held::Held,
         mv::{accounts_equal, same_value},
         run::{OutcomeKind, Run, TxOutcome},
         sched::{FinalSink, Finalized, RunId, RunSummary},
@@ -244,6 +245,16 @@ struct Interval {
     pred_misses: u64,
     spec_relaxed: u64,
     final_fixups: u64,
+    /// Held FL records / agave frames evicted by the comparator's bounds.
+    held_evicted: u64,
+}
+
+/// Most pending entries each of the comparator's join maps holds.
+const HELD_MAX_COUNT: usize = 200_000;
+
+/// Byte bound of each join map: an eighth of the memory cap.
+fn held_max_bytes(config: &Config) -> i64 {
+    (config.mem_cap_mb as i64).saturating_mul(1 << 20) / 8
 }
 
 struct RunInfo {
@@ -256,8 +267,13 @@ struct RunInfo {
 pub struct Comparator {
     config: Arc<Config>,
     bank_forks: Arc<RwLock<BankForks>>,
-    fl: HashMap<(Slot, Signature), FinalRecord>,
-    agave: HashMap<(Slot, Signature), AgaveFrame>,
+    fl: Held<(Slot, Signature), FinalRecord>,
+    agave: Held<(Slot, Signature), AgaveFrame>,
+    /// Slots FL started a run for since it was last (re)enabled: the first and the highest.
+    /// Agave frames/results of other slots are dropped at once (FL has, or will have, no
+    /// result for them: catch-up backlog after a restart, skipped slots).
+    first_run_slot: Option<Slot>,
+    max_run_slot: Slot,
     runs: HashMap<RunId, RunInfo>,
     slot_runs: HashMap<Slot, RunId>,
     skipped: HashMap<Slot, &'static str>,
@@ -315,11 +331,15 @@ impl Comparator {
                 .map_err(|err| warn!("fast lane: summaries disabled: {err}"))
                 .ok();
         info!("fast lane: comparator exporting to {}", export_dir.display());
+        let held_bytes = held_max_bytes(&config);
         Self {
+            fl: Held::new(HELD_MAX_COUNT, held_bytes, &crate::mem::CMP_HELD_BYTES),
+            agave: Held::new(HELD_MAX_COUNT, held_bytes, &crate::mem::CMP_HELD_BYTES),
+            full: FullCompare::with_max_bytes(held_bytes),
             config,
             bank_forks,
-            fl: HashMap::new(),
-            agave: HashMap::new(),
+            first_run_slot: None,
+            max_run_slot: 0,
             runs: HashMap::new(),
             slot_runs: HashMap::new(),
             skipped: HashMap::new(),
@@ -335,7 +355,6 @@ impl Comparator {
             out_stats: None,
             out_prev: [0; 16],
             totals: Interval::default(),
-            full: FullCompare::default(),
             full_drops: Arc::new(AtomicU64::new(0)),
             commit_metrics: None,
             commit_report: Default::default(),
@@ -396,18 +415,29 @@ impl Comparator {
         if self.full.fl_len() + self.full.agave_len() > 0 {
             self.full.release();
         }
+        self.first_run_slot = None;
+        self.max_run_slot = 0;
         if self.fl.is_empty() && self.agave.is_empty() && self.runs.is_empty() {
             return;
         }
-        let held: i64 = self.fl.values().map(record_bytes).sum::<i64>()
-            + self.agave.values().map(agave_frame_bytes).sum::<i64>();
-        crate::mem::CMP_HELD_BYTES.sub(held);
         self.fl.clear();
         self.agave.clear();
         self.runs.clear();
         self.slot_runs.clear();
-        self.fl.shrink_to_fit();
-        self.agave.shrink_to_fit();
+    }
+
+    /// Whether agave's frame or result for `slot` can still meet an FL result: FL has a run for
+    /// the slot, or may still start one (a slot above every run FL started since it was
+    /// enabled, and not skipped). Everything else (the catch-up backlog after a restart, slots
+    /// FL skipped or passed) is dropped at once and counted as unjoined.
+    fn wants_agave_slot(&self, slot: Slot) -> bool {
+        if self.slot_runs.contains_key(&slot) {
+            return true;
+        }
+        if self.skipped.contains_key(&slot) {
+            return false;
+        }
+        self.first_run_slot.is_some() && slot > self.max_run_slot
     }
 
     fn flush(&mut self) {
@@ -445,6 +475,8 @@ impl Comparator {
                     self.interval.parent_wait_us.push(parent_wait_us as i64);
                 }
                 self.slot_runs.insert(run.slot, run_id);
+                self.first_run_slot = Some(self.first_run_slot.map_or(run.slot, |f| f.min(run.slot)));
+                self.max_run_slot = self.max_run_slot.max(run.slot);
                 self.runs.insert(
                     run_id,
                     RunInfo {
@@ -508,8 +540,12 @@ impl Comparator {
         {
             return;
         }
-        if self.skipped.contains_key(&processed.slot) {
-            // FL has no result for this slot.
+        self.accept_agave_processed(processed);
+    }
+
+    fn accept_agave_processed(&mut self, processed: Box<AgaveProcessed>) {
+        if !self.wants_agave_slot(processed.slot) {
+            // FL has (or will have) no result for this slot.
             self.full.interval.unjoined_agave += 1;
             return;
         }
@@ -562,14 +598,18 @@ impl Comparator {
         }
         let key = (record.outcome.slot, record.outcome.signature);
         if let Some(frame) = self.agave.remove(&key) {
-            crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&frame));
             // Agave was first: FL is late for this transaction.
             self.interval.late_fl += 1;
             self.join(record, Some(frame));
+        } else if crate::control::commit_mode() == crate::control::COMMIT_ON {
+            // Commit mode: agave's grouped notification of this transaction comes from FL's
+            // own commit, so there is nothing to wait for.
+            self.join(record, None);
         } else {
-            crate::mem::CMP_HELD_BYTES.add(record_bytes(&record));
-            if let Some(old) = self.fl.insert(key, record) {
-                crate::mem::CMP_HELD_BYTES.sub(record_bytes(&old));
+            let bytes = record_bytes(&record);
+            for evicted in self.fl.insert(key, record, bytes) {
+                self.interval.held_evicted += 1;
+                self.join(evicted, None);
             }
         }
     }
@@ -578,15 +618,20 @@ impl Comparator {
         if !crate::control::is_active() {
             return;
         }
+        self.accept_agave_frame(frame);
+    }
+
+    fn accept_agave_frame(&mut self, frame: AgaveFrame) {
         let key = (frame.slot, frame.signature);
         if let Some(record) = self.fl.remove(&key) {
-            crate::mem::CMP_HELD_BYTES.sub(record_bytes(&record));
             self.join(record, Some(frame));
+        } else if !self.wants_agave_slot(frame.slot) {
+            self.interval.agave_only_skipped += 1;
         } else {
-            crate::mem::CMP_HELD_BYTES.add(agave_frame_bytes(&frame));
-            if let Some(old) = self.agave.insert(key, frame) {
-                crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&old));
-            }
+            let bytes = agave_frame_bytes(&frame);
+            let evicted = self.agave.insert(key, frame, bytes).len() as u64;
+            self.interval.held_evicted += evicted;
+            self.interval.agave_only_ran += evicted;
         }
     }
 
@@ -701,6 +746,15 @@ impl Comparator {
                         .agave_latency_us_token
                         .push(agave_latency_us.unwrap_or(0));
                 }
+            }
+        } else if !outcome.is_vote
+            && outcome_label == "fl_only"
+            && crate::control::commit_mode() == crate::control::COMMIT_ON
+        {
+            // Commit mode: no agave frame to join (FL's commit produced it); FL's own latency.
+            interval.fl_latency_us.push(fl_latency_us);
+            if token {
+                interval.fl_latency_us_token.push(fl_latency_us);
             }
         }
         if class.is_some() {
@@ -916,32 +970,20 @@ impl Comparator {
             self.full.release();
         }
         let now = Instant::now();
-        let stale_fl: Vec<(Slot, Signature)> = self
+        let stale_fl = self
             .fl
-            .iter()
-            .filter(|(_, r)| now.saturating_duration_since(r.t_final) > horizon)
-            .map(|(k, _)| *k)
-            .collect();
-        for key in stale_fl {
-            if let Some(record) = self.fl.remove(&key) {
-                crate::mem::CMP_HELD_BYTES.sub(record_bytes(&record));
-                self.join(record, None);
-            }
+            .remove_where(|_, r| now.saturating_duration_since(r.t_final) > horizon);
+        for (_, record) in stale_fl {
+            self.join(record, None);
         }
-        let stale_agave: Vec<(Slot, Signature)> = self
+        let stale_agave = self
             .agave
-            .iter()
-            .filter(|(_, f)| now.saturating_duration_since(f.t) > horizon)
-            .map(|(k, _)| *k)
-            .collect();
-        for key in stale_agave {
-            if let Some(frame) = self.agave.remove(&key) {
-                crate::mem::CMP_HELD_BYTES.sub(agave_frame_bytes(&frame));
-                if self.slot_runs.contains_key(&key.0) {
-                    self.interval.agave_only_ran += 1;
-                } else {
-                    self.interval.agave_only_skipped += 1;
-                }
+            .remove_where(|_, f| now.saturating_duration_since(f.t) > horizon);
+        for (key, _) in stale_agave {
+            if self.slot_runs.contains_key(&key.0) {
+                self.interval.agave_only_ran += 1;
+            } else {
+                self.interval.agave_only_skipped += 1;
             }
         }
         // Skipped-slot memory is bounded (rooted events do not reach the comparator).
@@ -1025,7 +1067,7 @@ impl Comparator {
              full_cmp={} full_match={} full_mismatch={} full_fields={full_fields:?} \
              full_unjoined_fl={} full_unjoined_agave={} full_unrecorded={} \
              full_drops={full_drops} mem_full_kb={} cluster_matched={} cluster_mismatched={} \
-             poisoned={} sticky={}",
+             poisoned={} sticky={} held_evicted={} full_evicted={} cap_reenables={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -1100,6 +1142,9 @@ impl Comparator {
             crate::cluster_check::totals().1,
             crate::control::is_poisoned(),
             crate::control::is_poisoned_sticky(),
+            iv.held_evicted,
+            fiv.evicted,
+            crate::mem::CAP_REENABLES.load(Ordering::Relaxed),
         );
         solana_metrics::datapoint_info!(
             "fast_lane_full",
@@ -1378,4 +1423,113 @@ impl Comparator {
 #[allow(dead_code)]
 fn _kind_is_executed(kind: OutcomeKind) -> bool {
     kind == OutcomeKind::Executed
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        solana_runtime::{bank::Bank, genesis_utils::create_genesis_config},
+        solana_svm::transaction_processing_result::ProcessedTransaction,
+        solana_svm::account_loader::NoOpTransaction,
+        solana_transaction_error::TransactionError,
+    };
+
+    fn comparator(mem_cap_mb: usize) -> (Comparator, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = create_genesis_config(1_000_000).genesis_config;
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis));
+        let config = Config {
+            mem_cap_mb,
+            ..Config::default()
+        };
+        let c = Comparator::new(
+            Arc::new(config),
+            bank_forks,
+            dir.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (c, dir)
+    }
+
+    fn frame(slot: Slot, i: u64) -> AgaveFrame {
+        let mut sig = [0u8; 64];
+        sig[..8].copy_from_slice(&i.to_le_bytes());
+        AgaveFrame {
+            slot,
+            bank_id: 1,
+            signature: Signature::from(sig),
+            accounts: vec![(Pubkey::new_unique(), AccountSharedData::new(1, 1000, &Pubkey::default()))],
+            t: Instant::now(),
+            t_unix_ns: 0,
+        }
+    }
+
+    fn processed(slot: Slot, i: u64) -> Box<AgaveProcessed> {
+        let mut sig = [0u8; 64];
+        sig[..8].copy_from_slice(&i.to_le_bytes());
+        Box::new(AgaveProcessed {
+            slot,
+            bank_id: 1,
+            parent_slot: slot - 1,
+            index: i as usize,
+            signature: Signature::from(sig),
+            message_hash: solana_hash::Hash::default(),
+            result: Ok(ProcessedTransaction::NoOp(Box::new(NoOpTransaction {
+                validation_error: TransactionError::AccountNotFound,
+                fee_payer_balance: None,
+                compute_unit_limit: 0,
+                loaded_accounts_bytes_limit: 0,
+            }))),
+            balances: None,
+            cost: None,
+            t: Instant::now(),
+        })
+    }
+
+    /// Agave frames and results of slots FL has no run for (and will not start one for) are
+    /// dropped at once: the catch-up backlog after a restart must not accumulate.
+    #[test]
+    fn test_agave_side_of_slots_without_runs_is_dropped() {
+        let (mut c, _dir) = comparator(4096);
+        // No run yet since FL was enabled: everything is dropped.
+        for i in 0..1_000 {
+            c.accept_agave_frame(frame(100 + i % 50, i));
+            c.accept_agave_processed(processed(100 + i % 50, i));
+        }
+        assert_eq!(c.agave.len(), 0);
+        assert_eq!(c.full.agave_len(), 0);
+        assert_eq!(c.interval.agave_only_skipped, 1_000);
+        assert_eq!(c.full.interval.unjoined_agave, 1_000);
+        // FL runs slot 500: the backlog below it is dropped, slot 500 and later slots are kept,
+        // a skipped slot is dropped.
+        c.slot_runs.insert(500, 1);
+        c.first_run_slot = Some(500);
+        c.max_run_slot = 500;
+        c.skipped.insert(502, "parent_timeout");
+        for (slot, kept) in [(400, false), (499, false), (500, true), (501, true), (502, false)] {
+            c.accept_agave_frame(frame(slot, slot));
+            c.accept_agave_processed(processed(slot, slot));
+            let key = (slot, frame(slot, slot).signature);
+            assert_eq!(c.agave.remove(&key).is_some(), kept, "frame of slot {slot}");
+        }
+        assert_eq!(c.full.agave_len(), 2);
+    }
+
+    /// The join maps are bounded by bytes (an eighth of the cap each), oldest evicted.
+    #[test]
+    fn test_join_maps_are_bounded() {
+        let (mut c, _dir) = comparator(8); // 1 MiB per map
+        c.slot_runs.insert(7, 1);
+        c.first_run_slot = Some(7);
+        c.max_run_slot = 7;
+        for i in 0..10_000 {
+            c.accept_agave_frame(frame(7, i));
+        }
+        assert!(c.agave.bytes() <= 1 << 20, "{}", c.agave.bytes());
+        assert!(c.agave.len() < 1_000);
+        assert!(c.interval.held_evicted > 9_000);
+        c.release();
+        assert_eq!((c.agave.len(), c.agave.bytes()), (0, 0));
+    }
 }

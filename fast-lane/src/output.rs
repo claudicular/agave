@@ -75,6 +75,8 @@ pub struct OutPublisher {
     open: HashMap<RunId, RunInfo>,
     /// Recently ended runs (for a ROLLBACK after the end).
     ended: VecDeque<(RunId, RunInfo)>,
+    /// The current poison has been handled (ROLLBACK of ended runs published).
+    poison_handled: bool,
 }
 
 impl OutPublisher {
@@ -85,6 +87,7 @@ impl OutPublisher {
             stats,
             open: HashMap::new(),
             ended: VecDeque::new(),
+            poison_handled: false,
         }
     }
 
@@ -211,8 +214,32 @@ impl OutPublisher {
         }
     }
 
+    /// About every millisecond. While the fast lane is poisoned (a result may have been
+    /// wrong): once, a ROLLBACK for every ended run above the last slot the cluster confirmed
+    /// our hash for (open runs get theirs when the coordinator aborts them); and no heartbeat,
+    /// so consumers see the producer stall and fall back (DESIGN §9.4).
     pub fn tick(&mut self) {
+        if crate::control::is_poisoned() {
+            if !self.poison_handled {
+                self.poison_handled = true;
+                self.rollback_after(crate::cluster_check::last_matched_slot(), "poisoned");
+            }
+            return;
+        }
+        self.poison_handled = false;
         self.ring.heartbeat();
+    }
+
+    /// ROLLBACK every ended run of a slot above `slot`.
+    pub fn rollback_after(&mut self, slot: Slot, reason: &'static str) {
+        let ended = std::mem::take(&mut self.ended);
+        for (run_id, info) in ended {
+            if info.slot > slot {
+                self.marker(KIND_ROLLBACK, run_id, &info, 0, Some(reason));
+            } else {
+                self.ended.push_back((run_id, info));
+            }
+        }
     }
 
     fn marker(&mut self, kind: u16, run_id: RunId, info: &RunInfo, count: u32, reason: Option<&str>) {
@@ -326,5 +353,18 @@ mod tests {
         );
         assert_ne!(kinds[1].1 & FLAG_SPECULATIVE, 0);
         assert_ne!(kinds[1].1 & FLAG_FROM_RING, 0);
+        // Rollback of ended runs above a confirmed slot (what a poison publishes).
+        for (run, slot) in [(3u64, 20u64), (4, 21), (5, 22)] {
+            publisher.on_final(run, &outcome(1, 0, slot, 0), 1, false);
+            publisher.on_run_end(run, &RunSummary { txs: 1, ..RunSummary::default() });
+        }
+        while let Poll::Record(_) = reader.poll() {}
+        publisher.rollback_after(20, "poisoned");
+        let rolled: Vec<(u16, u64)> = std::iter::from_fn(|| match reader.poll() {
+            Poll::Record(r) => Some((r.header.kind, r.header.slot)),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(rolled, vec![(KIND_ROLLBACK, 21), (KIND_ROLLBACK, 22)]);
     }
 }

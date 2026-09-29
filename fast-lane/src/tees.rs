@@ -129,7 +129,13 @@ impl AccountsUpdateNotifierInterface for TeeAccountsUpdateNotifier {
             accounts,
             write_version_start,
         );
-        if !control::is_active() || !self.shared.comparator_enabled {
+        // Only frames that can meet an FL result: not the catch-up backlog or slots FL did
+        // not run, and not in commit mode (agave's notification then comes from FL's commit).
+        if !control::is_active()
+            || !self.shared.comparator_enabled
+            || control::commit_mode() == control::COMMIT_ON
+            || !control::wants_agave_slot(slot)
+        {
             return;
         }
         let frame = AgaveFrame {

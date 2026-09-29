@@ -97,6 +97,11 @@ static COMMIT_BOARDS: AtomicUsize = AtomicUsize::new(0);
 /// Implemented by the fast lane. Called on agave's replay threads: implementations must be
 /// wait-free and must never panic (agave's panic hook exits the process).
 pub trait FastLaneHooks: Send + Sync {
+    /// Whether the fast lane wants agave's processing results of `slot` (shadow mode): replay
+    /// does not even copy them otherwise (e.g. the catch-up backlog after a restart).
+    fn wants_slot(&self, _slot: Slot) -> bool {
+        true
+    }
     /// Agave executed and committed transaction `index` of bank `slot` (shadow mode).
     fn on_agave_processed(&self, processed: AgaveProcessed);
     /// Agave's replay executed and committed transaction `index` it claimed on a commit
@@ -198,10 +203,11 @@ fn poison(reason: &'static str) {
     }
 }
 
-/// Whether replay should capture its processing results for the fast lane (shadow mode).
+/// Whether replay should capture its processing results of `slot` for the fast lane (shadow
+/// mode, and the fast lane wants the slot).
 #[inline]
-pub fn capture_enabled() -> bool {
-    MODE.load(Ordering::Relaxed) == MODE_SHADOW
+pub fn capture_enabled(slot: Slot) -> bool {
+    MODE.load(Ordering::Relaxed) == MODE_SHADOW && hooks().is_some_and(|h| h.wants_slot(slot))
 }
 
 /// A deep copy of a processing result (`ProcessedTransaction` is not `Clone`; its parts are).
