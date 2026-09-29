@@ -114,11 +114,30 @@ pub struct Config {
     pub out_token: bool,
     /// Further owners (programs) whose accounts are published.
     pub out_owners: Vec<Pubkey>,
-    /// Commit mode (`crate::control::COMMIT_*`): `off`, or `shadow` (milestone 1: FL keeps
+    /// Commit mode (`crate::control::COMMIT_*`): `off`; `shadow` (milestone 1: FL keeps
     /// every transaction's full processing result, executed with agave's recording
-    /// configuration, and the comparator checks it field by field against agave's own).
-    /// Runtime toggle: `commit=off|shadow` in the control file.
+    /// configuration, and the comparator checks it field by field against agave's own); or
+    /// `on` (milestone 2: FL commits its results into agave's banks, agave follows).
+    /// Runtime toggle: `commit=off|shadow|on` in the control file.
     pub commit: u8,
+    /// Commit threads (`solFlCommitNN`), committing FINAL transactions into agave's banks.
+    pub commit_threads: usize,
+    /// Cores the commit threads are pinned to, round-robin. Empty = unpinned (niced, on
+    /// `shared_cores`).
+    pub commit_cores: Vec<usize>,
+    /// Busy-poll before parking for commit threads (>= 1_000_000: never park).
+    pub commit_spin_us: u64,
+    /// Commit mode: parts per million of transactions agave executes itself, at their
+    /// position, and compares with FL's result before committing its own; any difference
+    /// poisons FL (and replays the slot without FL if FL committed into it). Runtime toggle:
+    /// `verify_sample_ppm=N` (banks created afterwards).
+    pub verify_sample_ppm: u32,
+    /// Commit mode: how long agave's replay waits for FL to claim a transaction before
+    /// executing it itself. Runtime toggle: `follow_wait_ms=N`.
+    pub follow_wait_ms: u64,
+    /// Commit mode: a replay handler waiting for FL spins this long, then sleeps 20 µs
+    /// between checks (low values free the handlers' cores).
+    pub follow_spin_us: u64,
 }
 
 impl Default for Config {
@@ -164,6 +183,12 @@ impl Default for Config {
             out_token: true,
             out_owners: Vec::new(),
             commit: crate::control::COMMIT_OFF,
+            commit_threads: 2,
+            commit_cores: Vec::new(),
+            commit_spin_us: 50,
+            verify_sample_ppm: 0,
+            follow_wait_ms: 100,
+            follow_spin_us: 200,
         }
     }
 }
@@ -324,6 +349,12 @@ impl Config {
                 self.commit = crate::control::parse_commit_mode(value)
                     .ok_or_else(|| ConfigError(format!("bad commit mode {value}")))?
             }
+            "commit_threads" => self.commit_threads = parse_scalar(key, value)?,
+            "commit_cores" => self.commit_cores = parse_list(key, value)?,
+            "commit_spin_us" => self.commit_spin_us = parse_scalar(key, value)?,
+            "verify_sample_ppm" => self.verify_sample_ppm = parse_scalar(key, value)?,
+            "follow_wait_ms" => self.follow_wait_ms = parse_scalar(key, value)?,
+            "follow_spin_us" => self.follow_spin_us = parse_scalar(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
         Ok(())
@@ -350,6 +381,15 @@ impl Config {
         }
         if self.out_ring && !self.out_token && self.out_owners.is_empty() {
             return Err(ConfigError("out_ring needs out_token or out_owners".into()));
+        }
+        if self.commit_threads == 0 || self.commit_threads > 64 {
+            return Err(ConfigError("commit_threads must be 1..=64".into()));
+        }
+        if self.verify_sample_ppm > 1_000_000 {
+            return Err(ConfigError("verify_sample_ppm must be <= 1000000".into()));
+        }
+        if self.follow_wait_ms > 10_000 {
+            return Err(ConfigError("follow_wait_ms must be <= 10000".into()));
         }
         if self.input_dual && self.ring_path.is_none() {
             return Err(ConfigError("input = dual needs ring_path".into()));
@@ -468,6 +508,24 @@ mod tests {
             Config::parse("commit = off").unwrap().commit,
             crate::control::COMMIT_OFF
         );
+    }
+
+    /// The staged FRA config for execute-once milestone 2 (`fast_lane.commit_on.toml`).
+    #[test]
+    fn test_parse_fra_commit_on_config() {
+        let config = Config::parse(include_str!("fra_commit_on.toml")).unwrap();
+        assert_eq!(config.commit, crate::control::COMMIT_ON);
+        assert_eq!(config.commit_threads, 3);
+        assert!(config.commit_cores.is_empty());
+        assert_eq!(config.verify_sample_ppm, 500);
+        assert_eq!(config.follow_wait_ms, 100);
+        assert_eq!(config.follow_spin_us, 200);
+        assert!(config.rebase && config.vm_opts && config.chain && config.out_ring);
+        assert!(Config::parse("commit_threads = 0").is_err());
+        assert!(Config::parse("verify_sample_ppm = 1000001").is_err());
+        let m3 = Config::parse("commit = on\ncommit_cores = [17-19]\ncommit_spin_us = 1000000")
+            .unwrap();
+        assert_eq!(m3.commit_cores, vec![17, 18, 19]);
     }
 
     const FRA_REBASE_TOML: &str = r#"

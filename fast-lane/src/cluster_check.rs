@@ -26,6 +26,21 @@
 //! Poisoning does not repair anything by itself; agave's dump-and-repair does. Poisoning only
 //! makes sure FL's results are no longer used. The execute-once commit path must consult
 //! [`crate::control::is_active`] when it decides to use FL results for a bank.
+//!
+//! **Attribution.** A disagreement disables FL *provisionally* ([`control::poison_provisional`])
+//! and the verdict comes when agave has dumped the slot and replayed it again without FL
+//! ([`on_bank_version`] records every frozen version's block identity: `block_id` and last entry
+//! hash, and how many transactions FL committed into it):
+//! - the re-replayed block differs from the one we (and FL) executed and its hash is the
+//!   cluster's: a **duplicate block**, not FL's fault. FL stays off for the dumped slot and its
+//!   descendants (they are marked agave-only) and comes back once a slot above them is frozen;
+//! - the same block, re-replayed without FL, gives the cluster's hash: **FL was wrong**; the
+//!   poison becomes sticky until restart;
+//! - anything else (the re-replay disagrees again, the version is unknown, we marked the slot
+//!   dead, no re-replay within 2 min): **can't tell**; sticky.
+//! A disagreement on a slot whose parent version was itself found wrong is inherited from the
+//! parent's verdict. A fast signal that the cluster then contradicts (it confirms our hash) is
+//! lifted as a false alarm.
 
 use {
     crate::control,
@@ -82,7 +97,57 @@ pub enum EventKind {
     /// Votes from at least the fast threshold of stake carry another hash than ours. FL was
     /// poisoned.
     FastSignal { stake_pct: u64 },
+    /// A disagreement was attributed (see the module docs): `duplicate_block`, `fl_wrong`,
+    /// `unresolved`, `inherited`, `false_alarm`, or `lifted` (FL back after a duplicate block).
+    Attribution { verdict: &'static str },
 }
+
+/// One frozen version of a slot (recorded by replay at freeze, [`on_bank_version`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockVersion {
+    pub hash: Hash,
+    pub parent_slot: Slot,
+    pub parent_hash: Hash,
+    /// Merkle root of the block's last FEC set (`Bank::block_id`), when known.
+    pub block_id: Option<Hash>,
+    /// Hash of the block's last entry (the blockhash the slot registers).
+    pub last_entry_hash: Hash,
+    /// Transactions the fast lane committed into this bank (execute once).
+    pub fl_commits: u32,
+}
+
+impl BlockVersion {
+    /// The same block: the same entries (the last entry's PoH hash chains every entry and
+    /// transaction of the slot), whatever the resulting bank hash. The bank's state depends on
+    /// the entries only, not on how they were shredded (`block_id` is logged, not compared), so a
+    /// re-repaired version with the same entries is the same block.
+    pub fn same_block(&self, other: &BlockVersion) -> bool {
+        self.last_entry_hash == other.last_entry_hash
+    }
+}
+
+/// An open disagreement (FL provisionally disabled) waiting for its verdict.
+struct Attribution {
+    slot: Slot,
+    token: u64,
+    first: BlockVersion,
+    /// `None` while only the fast signal fired (no dump yet).
+    cluster_hash: Option<Hash>,
+    source: &'static str,
+    /// Highest slot frozen when the disagreement was found: every dumped descendant is at or
+    /// below it.
+    horizon: Slot,
+    created: Instant,
+    /// Duplicate block: FL comes back once a slot above this is frozen.
+    lift_above: Option<Slot>,
+}
+
+/// Open attributions older than this without a verdict become sticky.
+const ATTRIBUTION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Slots marked agave-only after a duplicate block (the dumped slot and its descendants).
+const MAX_AGAVE_ONLY_SPAN: Slot = 256;
+/// Versions of known-wrong frozen banks remembered (to recognise inherited disagreements).
+const MAX_BAD: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
@@ -136,6 +201,12 @@ struct Stats {
     /// Slots dropped with a verdict whose gossip-only stake for our hash never reached 52%.
     gossip52_never: u64,
     gossip52_reached: u64,
+    attrib_duplicate: u64,
+    attrib_fl_wrong: u64,
+    attrib_unresolved: u64,
+    attrib_inherited: u64,
+    attrib_false_alarm: u64,
+    lifted: u64,
 }
 
 struct State {
@@ -147,6 +218,11 @@ struct State {
     interval: Stats,
     total: Stats,
     last_report: Instant,
+    /// Frozen versions per slot (block identity), for attribution.
+    versions: BTreeMap<Slot, Vec<BlockVersion>>,
+    /// Frozen versions found wrong.
+    bad: VecDeque<(Slot, Hash)>,
+    attributions: Vec<Attribution>,
 }
 
 impl State {
@@ -159,6 +235,192 @@ impl State {
             interval: Stats::default(),
             total: Stats::default(),
             last_report: Instant::now(),
+            versions: BTreeMap::new(),
+            bad: VecDeque::new(),
+            attributions: Vec::new(),
+        }
+    }
+
+    fn is_bad(&self, slot: Slot, hash: Hash) -> bool {
+        self.bad.contains(&(slot, hash))
+    }
+
+    fn attribution_event(&mut self, slot: Slot, verdict: &'static str, first: Option<&BlockVersion>,
+                         cluster_hash: Hash, source: &'static str, detail: &str) {
+        for stats in [&mut self.interval, &mut self.total] {
+            match verdict {
+                "duplicate_block" => stats.attrib_duplicate += 1,
+                "fl_wrong" => stats.attrib_fl_wrong += 1,
+                "inherited" => stats.attrib_inherited += 1,
+                "false_alarm" => stats.attrib_false_alarm += 1,
+                "lifted" => stats.lifted += 1,
+                _ => stats.attrib_unresolved += 1,
+            }
+        }
+        let fl_commits = first.map(|f| f.fl_commits).unwrap_or(0);
+        warn!(
+            "fast lane: cluster check attribution for slot {slot}: {verdict} ({detail}; source {source}, cluster hash {cluster_hash}, FL commits in our version {fl_commits})"
+        );
+        solana_metrics::datapoint_warn!(
+            "fast_lane_cluster_attribution",
+            ("slot", slot as i64, i64),
+            ("verdict", verdict, String),
+            ("source", source, String),
+            ("cluster_hash", cluster_hash.to_string(), String),
+            (
+                "our_hash",
+                first.map(|f| f.hash.to_string()).unwrap_or_default(),
+                String
+            ),
+            ("fl_commits", i64::from(fl_commits), i64),
+            ("detail", detail, String),
+        );
+        self.push_event(Event {
+            slot,
+            kind: EventKind::Attribution { verdict },
+            our_hash: first.map(|f| f.hash),
+            cluster_hash,
+            lag_ms: None,
+            fl_was_active: control::is_active(),
+        });
+    }
+
+    /// Our frozen version of `slot` disagrees with the cluster (`cluster_hash`; `None` for the
+    /// fast signal): disable FL provisionally and open an attribution, or decide at once.
+    fn disagree(
+        &mut self,
+        slot: Slot,
+        our_hash: Option<Hash>,
+        cluster_hash: Option<Hash>,
+        source: &'static str,
+        reason: &str,
+    ) {
+        if let Some(a) = self
+            .attributions
+            .iter_mut()
+            .find(|a| a.slot == slot && a.lift_above.is_none())
+        {
+            // E.g. the fast signal, then the cluster's confirmation.
+            if a.cluster_hash.is_none() {
+                a.cluster_hash = cluster_hash;
+                a.source = source;
+            }
+            return;
+        }
+        let Some(ours) = our_hash else {
+            control::poison(&format!("{reason} (cannot attribute: we marked the slot dead)"));
+            self.attribution_event(slot, "unresolved", None, cluster_hash.unwrap_or_default(),
+                source, "slot marked dead");
+            return;
+        };
+        if self.bad.len() >= MAX_BAD {
+            self.bad.pop_front();
+        }
+        if !self.is_bad(slot, ours) {
+            self.bad.push_back((slot, ours));
+        }
+        let first = self
+            .versions
+            .get(&slot)
+            .and_then(|vs| vs.iter().rev().find(|v| v.hash == ours))
+            .cloned();
+        let Some(first) = first else {
+            control::poison(&format!("{reason} (cannot attribute: our version is unknown)"));
+            self.attribution_event(slot, "unresolved", None, cluster_hash.unwrap_or_default(),
+                source, "our frozen version was not recorded");
+            return;
+        };
+        if self.is_bad(first.parent_slot, first.parent_hash) {
+            // Our parent version was already found wrong: this follows from it.
+            self.attribution_event(slot, "inherited", Some(&first),
+                cluster_hash.unwrap_or_default(), source, "parent version already disagreed");
+            return;
+        }
+        let token = control::poison_provisional(reason);
+        self.attributions.push(Attribution {
+            slot,
+            token,
+            first,
+            cluster_hash,
+            source,
+            horizon: self.max_slot.max(slot),
+            created: Instant::now(),
+            lift_above: None,
+        });
+    }
+
+    /// A new version of `slot` was frozen: decide the open attribution of the slot, if any.
+    fn resolve(&mut self, slot: Slot, version: &BlockVersion) {
+        let mut decided = Vec::new();
+        for (i, a) in self.attributions.iter().enumerate() {
+            if a.slot != slot || a.lift_above.is_some() || version.hash == a.first.hash {
+                continue;
+            }
+            let Some(cluster) = a.cluster_hash else {
+                continue;
+            };
+            decided.push((i, cluster));
+        }
+        for (i, cluster) in decided.into_iter().rev() {
+            let a = &self.attributions[i];
+            let (token, first, source, horizon) = (a.token, a.first.clone(), a.source, a.horizon);
+            let same_block = first.same_block(version);
+            if self.is_bad(first.parent_slot, first.parent_hash) {
+                // The parent turned out wrong meanwhile: this slot's disagreement follows.
+                self.attributions.remove(i);
+                control::lift_provisional(token, "inherited from the parent's disagreement");
+                self.attribution_event(slot, "inherited", Some(&first), cluster, source,
+                    "parent version disagreed");
+            } else if version.hash == cluster && !same_block {
+                let lift_above = horizon.max(slot);
+                for s in slot..=lift_above.min(slot + MAX_AGAVE_ONLY_SPAN) {
+                    solana_runtime::fast_lane_commit::mark_agave_only(s);
+                }
+                self.attributions[i].lift_above = Some(lift_above);
+                self.attribution_event(slot, "duplicate_block", Some(&first), cluster, source,
+                    &format!("re-repaired block differs from the one executed (last entry {} vs {}); FL off until a slot above {lift_above} is frozen",
+                    version.last_entry_hash, first.last_entry_hash));
+            } else if version.hash == cluster {
+                self.attributions.remove(i);
+                control::make_sticky(token, &format!("fast lane result was wrong in slot {slot}: the same block replayed without FL gives the cluster's hash {cluster}"));
+                self.attribution_event(slot, "fl_wrong", Some(&first), cluster, source,
+                    "same block, replay without FL gives the cluster's hash");
+            } else {
+                self.attributions.remove(i);
+                control::make_sticky(token, &format!("cannot attribute the disagreement in slot {slot}: replayed again with hash {}, cluster {cluster}", version.hash));
+                self.attribution_event(slot, "unresolved", Some(&first), cluster, source,
+                    &format!("replay without FL gives {}, not the cluster's hash", version.hash));
+            }
+        }
+    }
+
+    /// A slot was frozen: bring FL back after duplicate blocks it replayed past; time out
+    /// attributions without a verdict.
+    fn lift_passed(&mut self, frozen_slot: Slot) {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.attributions.len() {
+            let a = &self.attributions[i];
+            match a.lift_above {
+                Some(above) if frozen_slot > above => {
+                    let a = self.attributions.remove(i);
+                    let back = control::lift_provisional(
+                        a.token,
+                        &format!("duplicate block at slot {}, replayed past {above}", a.slot),
+                    );
+                    self.attribution_event(a.slot, "lifted", Some(&a.first),
+                        a.cluster_hash.unwrap_or_default(), a.source,
+                        &format!("slot {frozen_slot} frozen; fast lane back: {back}"));
+                }
+                None if now.saturating_duration_since(a.created) > ATTRIBUTION_TIMEOUT => {
+                    let a = self.attributions.remove(i);
+                    control::make_sticky(a.token, &format!("cannot attribute the disagreement in slot {}: no replay without FL within {:?}", a.slot,
+                        ATTRIBUTION_TIMEOUT));
+                    self.attribution_event(a.slot, "unresolved", Some(&a.first),
+                        a.cluster_hash.unwrap_or_default(), a.source, "timed out");
+                }
+                _ => i += 1,
+            }
         }
     }
 
@@ -184,6 +446,12 @@ impl State {
             }
             let (_, rec) = self.slots.pop_first().unwrap();
             self.finish(&rec);
+        }
+        while let Some((&slot, _)) = self.versions.first_key_value() {
+            if slot >= floor {
+                break;
+            }
+            self.versions.pop_first();
         }
         // Vote detail is only needed near the tip.
         let vote_floor = self.max_slot.saturating_sub(VOTE_WINDOW);
@@ -250,8 +518,9 @@ impl State {
              frozen hash is {ours}"
         );
         error!(
-            "fast lane: CLUSTER VOTE HASH DISAGREEMENT: {reason}; fast lane was {}; poisoning it \
-             (agave dumps and repairs the slot once the cluster duplicate-confirms its hash)",
+            "fast lane: CLUSTER VOTE HASH DISAGREEMENT: {reason}; fast lane was {}; disabling it \
+             until the disagreement is attributed (agave dumps and repairs the slot once the \
+             cluster duplicate-confirms its hash)",
             if fl_was_active { "active" } else { "inactive" }
         );
         solana_metrics::datapoint_error!(
@@ -262,7 +531,7 @@ impl State {
             ("stake_pct", stake_pct as i64, i64),
             ("fl_was_active", fl_was_active, bool),
         );
-        control::poison(&reason);
+        self.disagree(slot, Some(ours), None, "fast_vote", &reason);
         self.push_event(Event {
             slot,
             kind: EventKind::FastSignal { stake_pct },
@@ -294,7 +563,9 @@ impl State {
              lag_ms_p50={lag50} p90={lag90} p99={lag99} max={lagmax} gossip52_ms_p50={g50} \
              p90={g90} p99={g99} max={gmax} gossip52_reached={} gossip52_never={} votes={} \
              gossip_votes={} total_matched={} total_mismatched={} total_unchecked={} \
-             poisoned={poisoned}",
+             poisoned={poisoned} sticky={} attrib_duplicate={} attrib_fl_wrong={} \
+             attrib_unresolved={} attrib_inherited={} attrib_false_alarm={} lifted={} \
+             open_attributions={}",
             i.frozen,
             i.matched,
             i.matched_at_freeze,
@@ -310,9 +581,22 @@ impl State {
             t.matched,
             t.mismatched,
             t.unchecked,
+            control::is_poisoned_sticky(),
+            t.attrib_duplicate,
+            t.attrib_fl_wrong,
+            t.attrib_unresolved,
+            t.attrib_inherited,
+            t.attrib_false_alarm,
+            t.lifted,
+            self.attributions.len(),
         );
         solana_metrics::datapoint_info!(
             "fast_lane_cluster_check",
+            ("attrib_duplicate", t.attrib_duplicate as i64, i64),
+            ("attrib_fl_wrong", t.attrib_fl_wrong as i64, i64),
+            ("attrib_unresolved", t.attrib_unresolved as i64, i64),
+            ("lifted", t.lifted as i64, i64),
+            ("open_attributions", self.attributions.len() as i64, i64),
             ("frozen", i.frozen as i64, i64),
             ("matched", i.matched as i64, i64),
             ("matched_at_freeze", i.matched_at_freeze as i64, i64),
@@ -390,6 +674,21 @@ pub fn on_bank_frozen(slot: Slot, hash: Hash) {
     st.maybe_report(now);
 }
 
+/// Replay froze a version of `slot` (called right after the freeze, before
+/// [`on_bank_frozen`]): its block identity, for attributing a later disagreement, and the
+/// verdict of an open one when this is the re-replay of a dumped slot.
+pub fn on_bank_version(slot: Slot, version: BlockVersion) {
+    let mut guard = state().lock();
+    let st = &mut *guard;
+    let versions = st.versions.entry(slot).or_default();
+    if versions.len() >= 8 {
+        versions.remove(0);
+    }
+    versions.push(version.clone());
+    st.resolve(slot, &version);
+    st.lift_passed(slot);
+}
+
 /// The cluster confirmed `hash` for `slot`, and it equals our frozen hash.
 pub fn on_cluster_match(slot: Slot, hash: Hash) {
     let now = Instant::now();
@@ -436,6 +735,15 @@ pub fn on_cluster_match(slot: Slot, hash: Hash) {
              mismatch (recovered)"
         );
     }
+    // A fast signal the cluster contradicts: it confirmed our own hash.
+    if let Some(i) = st.attributions.iter().position(|a| {
+        a.slot == slot && a.cluster_hash.is_none() && a.first.hash == hash
+    }) {
+        let a = st.attributions.remove(i);
+        control::lift_provisional(a.token, &format!("the cluster confirmed our hash for slot {slot}"));
+        st.attribution_event(slot, "false_alarm", Some(&a.first), hash, a.source,
+            "the cluster confirmed our hash");
+    }
     let fl_was_active = control::is_active();
     st.push_event(Event {
         slot,
@@ -469,8 +777,9 @@ pub fn on_cluster_mismatch(
         }
     };
     error!(
-        "fast lane: CLUSTER BANK HASH MISMATCH: {reason}; fast lane was {}; poisoning it until \
-         restart; agave dumps slot {slot} and its descendants and repairs and replays them",
+        "fast lane: CLUSTER BANK HASH MISMATCH: {reason}; fast lane was {}; disabling it (sticky \
+         unless the re-replay shows a duplicate block); agave dumps slot {slot} and its \
+         descendants and repairs and replays them",
         if fl_was_active { "active" } else { "inactive" }
     );
     solana_metrics::datapoint_error!(
@@ -487,9 +796,9 @@ pub fn on_cluster_mismatch(
         ("source", source, String),
         ("fl_was_active", fl_was_active, bool),
     );
-    control::poison(&reason);
     let mut guard = state().lock();
     let st = &mut *guard;
+    st.disagree(slot, our_hash, Some(cluster_hash), source, &reason);
     let lag_ms = st.lag_ms(slot, now);
     if st.mismatched.len() >= MAX_MISMATCHED {
         st.mismatched.pop_front();

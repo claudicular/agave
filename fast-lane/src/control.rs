@@ -20,6 +20,21 @@ static FL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FL_POISONED: AtomicBool = AtomicBool::new(false);
 static FL_VM_OPTS: AtomicBool = AtomicBool::new(false);
 static POISON_REASON: Mutex<Option<String>> = Mutex::new(None);
+/// A sticky poison happened (never lifted until restart).
+static FL_STICKY: AtomicBool = AtomicBool::new(false);
+/// Open provisional poisons (see [`poison_provisional`]).
+static PROVISIONAL: Mutex<Provisional> = Mutex::new(Provisional {
+    next: 1,
+    open: Vec::new(),
+    restore_active: false,
+});
+
+struct Provisional {
+    next: u64,
+    open: Vec<(u64, String)>,
+    /// The fast lane was active when the first open provisional poison was taken.
+    restore_active: bool,
+}
 static FL_COMMIT_MODE: AtomicU8 = AtomicU8::new(COMMIT_OFF);
 
 /// `commit = off`: FL results stay inside FL (shadow comparator, output ring).
@@ -28,11 +43,16 @@ pub const COMMIT_OFF: u8 = 0;
 /// agave hands the fast lane a copy of its own (`solana_runtime::fast_lane_commit`); the
 /// comparator checks them field by field. Nothing is committed.
 pub const COMMIT_SHADOW: u8 = 1;
+/// `commit = on` (milestone 2, execute once): FL commits its validated results into agave's
+/// bank through agave's commit path and agave's replay follows (`crate::commit`,
+/// `solana_runtime::fast_lane_commit`). Takes effect for banks agave creates afterwards.
+pub const COMMIT_ON: u8 = 2;
 
 pub fn parse_commit_mode(value: &str) -> Option<u8> {
     match value {
         "off" => Some(COMMIT_OFF),
         "shadow" => Some(COMMIT_SHADOW),
+        "on" => Some(COMMIT_ON),
         _ => None,
     }
 }
@@ -40,8 +60,27 @@ pub fn parse_commit_mode(value: &str) -> Option<u8> {
 pub fn commit_mode_name(mode: u8) -> &'static str {
     match mode {
         COMMIT_SHADOW => "shadow",
+        COMMIT_ON => "on",
         _ => "off",
     }
+}
+
+/// Commit mode on and the fast lane active and not poisoned: FL commits.
+#[inline]
+pub fn committing() -> bool {
+    commit_mode() == COMMIT_ON && is_active() && !is_poisoned()
+}
+
+/// Parts per million of transactions agave executes itself and compares with FL's result
+/// in commit mode (`verify_sample_ppm`). Applies to banks created afterwards.
+pub fn set_verify_sample_ppm(ppm: u32) {
+    solana_runtime::fast_lane_commit::set_sample_ppm(ppm);
+}
+
+/// How long agave's replay waits for FL to claim a transaction before executing it itself
+/// (`follow_wait_ms`).
+pub fn set_follow_wait_ms(ms: u64) {
+    solana_runtime::fast_lane_commit::set_follow_wait(std::time::Duration::from_millis(ms));
 }
 
 #[inline]
@@ -66,9 +105,11 @@ fn sync_runtime_mode() {
         }
     };
     // Re-check after setting: a concurrent poison/disable/mode change that ran between our
-    // read and our store would otherwise be overwritten by our stale mode.
+    // read and our store would otherwise be overwritten by our stale mode. Liveness first
+    // when turning off: agave's handlers stop waiting for FL before anything else.
     loop {
         let mode = desired();
+        solana_runtime::fast_lane_commit::set_fl_live(mode == COMMIT_ON);
         solana_runtime::fast_lane_commit::set_mode(mode);
         if desired() == mode {
             break;
@@ -144,6 +185,7 @@ pub fn set_active(active: bool) -> bool {
 /// internal error). Sticky until the process restarts; the first reason is kept. Agave's side
 /// stops at once: no more captures, and (commit mode) no more waiting on FL.
 pub fn poison(reason: &str) {
+    FL_STICKY.store(true, Ordering::SeqCst);
     FL_POISONED.store(true, Ordering::SeqCst);
     FL_ACTIVE.store(false, Ordering::SeqCst);
     sync_runtime_mode();
@@ -162,12 +204,105 @@ pub fn poison(reason: &str) {
     }
 }
 
-/// Why the fast lane was poisoned (the first reason), if it was.
+/// Why the fast lane was poisoned (the first sticky reason, else the first open provisional
+/// one), if it is.
 pub fn poison_reason() -> Option<String> {
     POISON_REASON
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+        .or_else(|| {
+            PROVISIONAL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .open
+                .first()
+                .map(|(_, reason)| format!("{reason} (pending attribution)"))
+        })
+}
+
+/// Whether the poison is sticky (only a restart re-enables the fast lane).
+pub fn is_poisoned_sticky() -> bool {
+    FL_STICKY.load(Ordering::SeqCst)
+}
+
+/// Disable the fast lane like [`poison`], but liftable: the cluster check takes this when our
+/// bank hash disagrees with the cluster's and it cannot yet tell whether the fast lane or a
+/// duplicate block is at fault. [`make_sticky`] turns it into a permanent poison;
+/// [`lift_provisional`] lifts it (the fast lane comes back if it was active and nothing else
+/// poisoned it). Returns the token to resolve it with.
+pub fn poison_provisional(reason: &str) -> u64 {
+    let token = {
+        let mut p = PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner());
+        if p.open.is_empty() && !FL_POISONED.load(Ordering::SeqCst) {
+            p.restore_active = FL_ACTIVE.load(Ordering::SeqCst);
+        }
+        let token = p.next;
+        p.next += 1;
+        p.open.push((token, reason.to_string()));
+        token
+    };
+    FL_POISONED.store(true, Ordering::SeqCst);
+    FL_ACTIVE.store(false, Ordering::SeqCst);
+    sync_runtime_mode();
+    error!("fast lane: disabled pending attribution: {reason}");
+    solana_metrics::datapoint_error!(
+        "fast_lane_poisoned_provisional",
+        ("reason", reason, String)
+    );
+    token
+}
+
+/// Turn provisional poison `token` into a sticky one.
+pub fn make_sticky(token: u64, reason: &str) {
+    PROVISIONAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .open
+        .retain(|(t, _)| *t != token);
+    poison(reason);
+}
+
+/// Resolve provisional poison `token` as not the fast lane's fault. The fast lane comes back
+/// (active again if it was when first disabled) once no provisional poison is open and no sticky
+/// poison happened. Returns whether it came back.
+pub fn lift_provisional(token: u64, why: &str) -> bool {
+    let restore = {
+        let mut p = PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner());
+        p.open.retain(|(t, _)| *t != token);
+        if !p.open.is_empty()
+            || FL_STICKY.load(Ordering::SeqCst)
+            || !FL_POISONED.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        FL_POISONED.store(false, Ordering::SeqCst);
+        p.restore_active
+    };
+    if restore {
+        FL_ACTIVE.store(true, Ordering::SeqCst);
+        // A poison that raced with this lift wins (as in `set_active`).
+        if FL_POISONED.load(Ordering::SeqCst) {
+            FL_ACTIVE.store(false, Ordering::SeqCst);
+            sync_runtime_mode();
+            return false;
+        }
+    }
+    sync_runtime_mode();
+    warn!("fast lane: re-enabled ({why}; active={restore})");
+    solana_metrics::datapoint_warn!("fast_lane_unpoisoned", ("why", why, String));
+    true
+}
+
+/// Tests only: clear the poison flag (a poisoned fast lane otherwise stays off for the life
+/// of the process).
+#[doc(hidden)]
+pub fn unpoison_for_tests() {
+    FL_STICKY.store(false, Ordering::SeqCst);
+    PROVISIONAL.lock().unwrap_or_else(|e| e.into_inner()).open.clear();
+    *POISON_REASON.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    FL_POISONED.store(false, Ordering::SeqCst);
+    sync_runtime_mode();
 }
 
 /// Runtime-tunable scheduler knobs (control file `key=value`).
@@ -314,6 +449,23 @@ pub fn poll_control_file(
                     }
                     None => warn!("fast lane: bad commit mode {value}"),
                 },
+                "verify_sample_ppm" => match value.parse::<u32>() {
+                    Ok(ppm) if ppm <= 1_000_000 => {
+                        set_verify_sample_ppm(ppm);
+                        info!("fast lane: verify_sample_ppm={ppm} by control file");
+                    }
+                    _ => warn!("fast lane: bad verify_sample_ppm {value}"),
+                },
+                "follow_wait_ms" => match value.parse::<u64>() {
+                    Ok(ms) if ms <= 10_000 => set_follow_wait_ms(ms),
+                    _ => warn!("fast lane: bad follow_wait_ms {value}"),
+                },
+                "follow_spin_us" => match value.parse::<u64>() {
+                    Ok(us) if us <= 1_000_000 => solana_runtime::fast_lane_commit::set_follow_spin(
+                        std::time::Duration::from_micros(us),
+                    ),
+                    _ => warn!("fast lane: bad follow_spin_us {value}"),
+                },
                 "theta" => match value.parse::<f32>() {
                     Ok(theta) if (0.0..=1000.0).contains(&theta) => tunables.set_theta(theta),
                     _ => warn!("fast lane: bad theta {value}"),
@@ -369,6 +521,7 @@ mod tests {
     fn test_commit_mode_control_command() {
         assert_eq!(parse_commit_mode("shadow"), Some(COMMIT_SHADOW));
         assert_eq!(parse_commit_mode("off"), Some(COMMIT_OFF));
+        assert_eq!(parse_commit_mode("on"), Some(COMMIT_ON));
         assert_eq!(parse_commit_mode("bogus"), None);
         let cmds = parse_commands("commit=shadow\n");
         assert_eq!(cmds, vec![Command::Set("commit".into(), "shadow".into())]);

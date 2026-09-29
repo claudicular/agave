@@ -74,12 +74,24 @@ pub fn execute_batch<'a>(
     // Fast-lane shadow check: a copy of what the commit consumes (see `fast_lane_commit`).
     let capture = crate::fast_lane_commit::capture_enabled();
     let mut captured = Vec::new();
+    // Fast-lane commit mode: a sampled transaction is executed here and compared with the
+    // fast lane's result before its commit.
+    let sampled = transaction_indexes.len() == 1
+        && crate::fast_lane_commit::is_sample(
+            bank,
+            &batch.sanitized_transactions()[0],
+        );
     let pre_commit_callback = |processing_results: &[_]| -> TransactionResult<()> {
         if capture {
             captured = processing_results
                 .iter()
                 .map(crate::fast_lane_commit::clone_processing_result)
                 .collect();
+        }
+        if sampled {
+            if let Some(result) = processing_results.first() {
+                crate::fast_lane_commit::verify_sample(bank, transaction_indexes[0], result);
+            }
         }
         // We're entering into one of the block-verification methods.
         get_first_error(batch, processing_results)
@@ -95,6 +107,44 @@ pub fn execute_batch<'a>(
             pre_commit_callback,
         )?;
 
+    // A sampled transaction of a fast-lane commit bank: compare balances with FL's result.
+    let verify_balances = sampled.then_some(transaction_indexes.first().copied()).flatten();
+    finish_committed_batch(
+        batch,
+        transaction_indexes,
+        bank,
+        commit_results,
+        balance_collector,
+        transaction_status_sender,
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        prioritization_fee_cache,
+        capture.then_some(captured),
+        verify_balances,
+    )
+}
+
+/// Everything `execute_batch` does after the commit: the block cost check, votes,
+/// prioritization fees and the transaction status batch (and the fast-lane shadow capture).
+/// Shared with [`commit_external`], so a fast-lane commit has exactly these effects.
+#[allow(clippy::too_many_arguments)]
+fn finish_committed_batch<Tx: TransactionWithMeta>(
+    batch: &TransactionBatch<Tx>,
+    transaction_indexes: Cow<[usize]>,
+    bank: &Arc<Bank>,
+    commit_results: Vec<TransactionCommitResult>,
+    balance_collector: Option<solana_svm::transaction_balances::BalanceCollector>,
+    transaction_status_sender: Option<&TransactionStatusSender>,
+    replay_vote_sender: Option<&ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &mut ExecuteTimings,
+    prioritization_fee_cache: Option<&PrioritizationFeeCache>,
+    captured: Option<Vec<solana_svm::transaction_processing_result::TransactionProcessingResult>>,
+    verify_balances: Option<usize>,
+) -> TransactionResult<()> {
+    let capture = captured.is_some();
+    let captured = captured.unwrap_or_default();
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 
     let tx_costs = get_transaction_costs(bank, &commit_results, batch.sanitized_transactions());
@@ -123,6 +173,7 @@ pub fn execute_batch<'a>(
         prioritization_fee_cache.update(bank, fee_paying_transactions);
     }
     let capture = capture && !captured.is_empty();
+    let want_balances = capture || verify_balances.is_some();
     let captured_costs: Vec<Option<u64>> = if capture {
         tx_costs
             .iter()
@@ -136,7 +187,7 @@ pub fn execute_batch<'a>(
     } else {
         Vec::new()
     };
-    let mut captured_balances = None;
+    let mut captured_balances: Option<Vec<crate::fast_lane_commit::TxBalances>> = None;
     if let Some(transaction_status_sender) = transaction_status_sender {
         let transactions: Vec<SanitizedTransaction> = batch
             .sanitized_transactions()
@@ -154,7 +205,7 @@ pub fn execute_batch<'a>(
 
         let (balances, token_balances) =
             compile_collected_balances(balance_collector.unwrap_or_default());
-        if capture {
+        if want_balances {
             captured_balances = Some(
                 balances
                     .pre_balances
@@ -196,6 +247,11 @@ pub fn execute_batch<'a>(
             tx_costs,
             transaction_indexes.into_owned(),
         );
+    }
+    if let (Some(index), Some(balances)) = (verify_balances, captured_balances.as_ref()) {
+        if let Some(balances) = balances.first() {
+            crate::fast_lane_commit::verify_sample_balances(bank, index, balances);
+        }
     }
     if capture {
         crate::fast_lane_commit::send_captures(
@@ -334,6 +390,118 @@ impl TransactionStatusSender {
             warn!("Slot {slot} transaction_status send freeze message failed: {e:?}");
         }
     }
+}
+
+/// Where a committed transaction's side effects go: exactly the unified scheduler's handler
+/// context (`DefaultTaskHandler`).
+#[derive(Clone, Copy, Default)]
+pub struct CommitServices<'a> {
+    pub transaction_status_sender: Option<&'a TransactionStatusSender>,
+    pub replay_vote_sender: Option<&'a ReplayVoteSender>,
+    pub prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
+}
+
+/// Outcome of [`commit_external`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExternalCommit {
+    /// Committed into the bank. The value is what replay's task for this transaction
+    /// returns: `Ok`, or the block-level error of the commit (e.g. a block cost limit).
+    Committed(TransactionResult<()>),
+    /// Not committed and handed to agave (the cell is `FL_DECLINED`): the bank's runtime
+    /// check differs from the one the result was executed with, or the result is not
+    /// committable (an unprocessable transaction: agave's own execution fails the block).
+    Declined(&'static str),
+    /// Not committed: agave claimed the transaction first, or the bank's board is closed.
+    Lost,
+}
+
+/// Commit a transaction the fast lane executed (`processing_result`, executed with the
+/// runtime check result `executed_check` and replay's recording configuration) into `bank`
+/// as transaction `index` of the slot, through exactly replay's commit path: the bank's own
+/// `check_transactions` (blockhash age, nonce, status cache, at this point of the slot),
+/// `Bank::finish_load_and_execute`, the block-verification pre-commit check,
+/// `Bank::commit_transactions` (stores, lt hash, status cache, fees, stakes cache, geyser
+/// notifications) and everything `execute_batch` does afterwards (cost tracker, votes,
+/// prioritization fees, transaction status batch). The per-transaction claim on `board`
+/// makes sure it is committed once, by the fast lane or by agave's replay.
+///
+/// The caller must only commit `index` after every earlier transaction of the slot that
+/// conflicts with it (shares an account, one of the two writing it) is committed, by either
+/// side, and must run this on a thread whose panics are contained: an unwinding commit
+/// marks the cell failed and the slot for replay (see `fast_lane_commit`).
+#[allow(clippy::too_many_arguments)]
+pub fn commit_external<Tx: TransactionWithMeta>(
+    bank: &Arc<Bank>,
+    board: &crate::fast_lane_commit::Board,
+    index: usize,
+    transaction: &Tx,
+    executed_check: &solana_svm::account_loader::TransactionCheckResult,
+    processing_result: solana_svm::transaction_processing_result::TransactionProcessingResult,
+    balance_collector: Option<solana_svm::transaction_balances::BalanceCollector>,
+    services: CommitServices,
+    timings: &mut ExecuteTimings,
+) -> ExternalCommit {
+    if bank.freeze_started() {
+        return ExternalCommit::Lost;
+    }
+    let Some(guard) = board.begin_commit(index) else {
+        return ExternalCommit::Lost;
+    };
+    if bank.freeze_started() {
+        // Replay closes the board before freezing, so this cannot happen; never commit into
+        // a freezing bank regardless (`commit_transactions` would panic).
+        guard.decline();
+        return ExternalCommit::Lost;
+    }
+    let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
+    let mut error_counters = solana_svm::transaction_error_metrics::TransactionErrorMetrics::default();
+    let check = bank.check_transactions::<Tx>(
+        batch.sanitized_transactions(),
+        batch.lock_results(),
+        bank.max_processing_age(),
+        false, // strict_nonce_size_check: never in replay
+        &mut error_counters,
+    );
+    if check.first() != Some(executed_check) {
+        guard.decline();
+        return ExternalCommit::Declined("check");
+    }
+    let output = bank.finish_load_and_execute(
+        batch.sanitized_transactions(),
+        vec![processing_result],
+        balance_collector,
+        timings,
+        &mut error_counters,
+    );
+    if get_first_error(&batch, &output.processing_results).is_err() {
+        guard.decline();
+        return ExternalCommit::Declined("unprocessable");
+    }
+    let commit_results = bank.commit_transactions(
+        batch.sanitized_transactions(),
+        output.processing_results,
+        &output.processed_counts,
+        timings,
+    );
+    let result = finish_committed_batch(
+        &batch,
+        Cow::Owned(vec![index]),
+        bank,
+        commit_results,
+        output.balance_collector,
+        services.transaction_status_sender,
+        services.replay_vote_sender,
+        ReplayVoteSendType::Executed {
+            replay_bank_id: bank.bank_id(),
+            replay_slot: bank.slot(),
+        },
+        timings,
+        services.prioritization_fee_cache,
+        None,
+        None,
+    );
+    guard.done(&result, transaction.message_hash());
+    ExternalCommit::Committed(result)
 }
 
 #[cfg(test)]

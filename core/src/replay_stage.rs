@@ -84,6 +84,7 @@ use {
     },
     solana_runtime::{
         bank::{Bank, MAX_ALPENGLOW_VOTE_ACCOUNTS, NewBankOptions, bank_hash_details},
+        fast_lane_commit,
         bank_forks::BankForks,
         bank_forks_controller::{BankForksCommand, BankForksCommandReceiver, SetRootCommand},
         block_component_processor::BlockComponentProcessorError,
@@ -2709,6 +2710,30 @@ impl ReplayStage {
         }
     }
 
+    /// Replay of `bank` failed. If the fast lane committed transactions into it (commit
+    /// mode), the failure may come from one of them: instead of marking the slot dead, clear
+    /// the bank and replay the slot without the fast lane (a genuinely invalid block fails
+    /// again and is then marked dead). Returns whether the bank was cleared.
+    fn fast_lane_retry(
+        bank: &BankWithScheduler,
+        error: &str,
+        bank_forks: &RwLock<BankForks>,
+        progress: &mut ProgressMap,
+        async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+    ) -> bool {
+        if !fast_lane_commit::abandon_bank(bank) {
+            return false;
+        }
+        let slot = bank.slot();
+        warn!(
+            "slot {slot}: replay failed after fast-lane commits ({error}); replaying it without \
+             the fast lane"
+        );
+        fast_lane_commit::mark_agave_only(slot);
+        Self::clear_slots([slot], bank_forks, progress, async_verification_freelist);
+        true
+    }
+
     fn recycle_async_verification(
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
         async_verification: Option<AsyncVerificationProgress>,
@@ -4086,6 +4111,15 @@ impl ReplayStage {
                         return vec![];
                     }
                     Err(err) => {
+                        if Self::fast_lane_retry(
+                            bank,
+                            &format!("{err:?}"),
+                            bank_forks,
+                            progress,
+                            async_verification_freelist,
+                        ) {
+                            continue;
+                        }
                         mark_replay_dead_slot(
                             bank,
                             err,
@@ -4118,6 +4152,15 @@ impl ReplayStage {
                 ) {
                     Ok(completed_replay) => completed_replay,
                     Err(err) => {
+                        if Self::fast_lane_retry(
+                            bank,
+                            &format!("{err:?}"),
+                            bank_forks,
+                            progress,
+                            async_verification_freelist,
+                        ) {
+                            continue;
+                        }
                         mark_replay_dead_slot(
                             bank,
                             &err,
@@ -4132,6 +4175,29 @@ impl ReplayStage {
                         continue;
                     }
                 };
+                // Fast-lane commit mode: every task is done; close the bank's commit board
+                // and make sure everything the fast lane committed is kept only if replay
+                // verified it (else replay the slot without the fast lane).
+                let fl_commits = match fast_lane_commit::close_bank(bank) {
+                    Ok(fl_commits) => fl_commits,
+                    Err(reason) => {
+                        warn!(
+                            "slot {bank_slot}: replaying without the fast lane before freezing \
+                             ({reason})"
+                        );
+                        fast_lane_commit::mark_agave_only(bank_slot);
+                        Self::clear_slots(
+                            [bank_slot],
+                            bank_forks,
+                            progress,
+                            async_verification_freelist,
+                        );
+                        continue;
+                    }
+                };
+                let bank_progress = progress
+                    .get_mut(&bank.slot())
+                    .expect("Bank fork progress entry missing for completed bank");
                 let is_leader_block = Self::leader_is_me(bank.leader_id(), my_pubkey);
 
                 // The block id is the merkle root of the last data shred
@@ -4212,6 +4278,19 @@ impl ReplayStage {
                      {:?}",
                     bank.slot(),
                     r_replay_stats.batch_execute.totals
+                );
+                // Fast lane safety net: the frozen version's block identity, to attribute a
+                // later disagreement with the cluster (duplicate block vs. a wrong FL result).
+                agave_fast_lane::cluster_check::on_bank_version(
+                    bank_slot,
+                    agave_fast_lane::cluster_check::BlockVersion {
+                        hash: bank.hash(),
+                        parent_slot: bank.parent_slot(),
+                        parent_hash: bank.parent_hash(),
+                        block_id: bank.block_id(),
+                        last_entry_hash: bank.last_blockhash(),
+                        fl_commits,
+                    },
                 );
                 new_frozen_slots.push(bank.slot());
                 if process_active_banks_context

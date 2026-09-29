@@ -4162,18 +4162,35 @@ impl Bank {
         // Accumulate the transaction batch execution timings.
         timings.accumulate(&sanitized_output.execute_timings);
 
+        self.finish_load_and_execute(
+            sanitized_txs,
+            sanitized_output.processing_results,
+            sanitized_output.balance_collector,
+            timings,
+            error_counters,
+        )
+    }
+
+    /// The part of [`Self::load_and_execute_transactions`] after execution: log collection
+    /// and the processed-transaction counts the commit consumes. Also used to commit a result
+    /// the fast lane executed (`transaction_execution::commit_external`), so that such a
+    /// commit takes exactly this code path.
+    pub fn finish_load_and_execute(
+        &self,
+        sanitized_txs: &[impl TransactionWithMeta],
+        processing_results: Vec<TransactionProcessingResult>,
+        balance_collector: Option<BalanceCollector>,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> LoadAndExecuteTransactionsOutput {
         let ((), collect_logs_us) =
-            measure_us!(self.collect_logs(sanitized_txs, &sanitized_output.processing_results));
+            measure_us!(self.collect_logs(sanitized_txs, &processing_results));
         timings.saturating_add_in_place(ExecuteTimingType::CollectLogsUs, collect_logs_us);
 
         let mut processed_counts = ProcessedTransactionCounts::default();
         let err_count = &mut error_counters.total;
 
-        for (processing_result, tx) in sanitized_output
-            .processing_results
-            .iter()
-            .zip(sanitized_txs)
-        {
+        for (processing_result, tx) in processing_results.iter().zip(sanitized_txs) {
             if let Some(debug_keys) = &self.transaction_debug_keys {
                 for key in tx.account_keys().iter() {
                     if debug_keys.contains(key) {
@@ -4211,9 +4228,9 @@ impl Bank {
         }
 
         LoadAndExecuteTransactionsOutput {
-            processing_results: sanitized_output.processing_results,
+            processing_results,
             processed_counts,
-            balance_collector: sanitized_output.balance_collector,
+            balance_collector,
         }
     }
 

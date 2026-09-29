@@ -85,19 +85,23 @@ pub enum CmpMsg {
     },
 }
 
-/// The coordinator's sink: publishes FINAL transactions into the output ring (if enabled)
-/// and forwards them to the comparator.
+/// The coordinator's sink: commits FINAL transactions into agave's banks (commit mode),
+/// publishes them into the output ring (if enabled) and forwards them to the comparator.
 pub struct CmpSink {
     pub tx: Sender<CmpMsg>,
     pub drops: Arc<AtomicU64>,
     pub out: Option<crate::output::OutPublisher>,
+    pub committer: Option<crate::commit::Committer>,
 }
 
 impl FinalSink for CmpSink {
     fn on_final(&mut self, f: Finalized) {
-        let Ok(outcome) = f.payload.downcast::<TxOutcome>() else {
+        let Ok(mut outcome) = f.payload.downcast::<TxOutcome>() else {
             return;
         };
+        if let Some(committer) = self.committer.as_mut() {
+            committer.on_final(f.run_id, f.k, &f.cpreds, &mut outcome, f.t_final);
+        }
         if let Some(out) = self.out.as_mut() {
             out.on_final(f.run_id, &outcome, f.incarnations, f.speculative);
         }
@@ -127,6 +131,9 @@ impl FinalSink for CmpSink {
     }
 
     fn on_run_end(&mut self, run_id: RunId, summary: RunSummary) {
+        if let Some(committer) = self.committer.as_mut() {
+            committer.on_run_end(run_id, &summary);
+        }
         if let Some(out) = self.out.as_mut() {
             out.on_run_end(run_id, &summary);
         }
@@ -140,8 +147,20 @@ impl FinalSink for CmpSink {
     }
 
     fn tick(&mut self) {
+        if let Some(committer) = self.committer.as_mut() {
+            committer.tick();
+        }
         if let Some(out) = self.out.as_mut() {
             out.tick();
+        }
+    }
+
+    fn on_event(&mut self, event: Box<dyn std::any::Any + Send>) {
+        if let (Some(committer), Ok(event)) = (
+            self.committer.as_mut(),
+            event.downcast::<crate::commit::CommitEvent>(),
+        ) {
+            committer.on_event(*event);
         }
     }
 }
@@ -257,6 +276,9 @@ pub struct Comparator {
     totals: Interval,
     /// Commit-mode shadow check (full processing results, `full_cmp`).
     pub full: FullCompare,
+    /// Commit mode: the committer's counters (reported as `fast_lane_commit` lines).
+    pub commit_metrics: Option<Arc<crate::commit::CommitMetrics>>,
+    commit_report: crate::commit::CommitReport,
     /// Agave captures dropped because the queue to the comparator was full.
     pub full_drops: Arc<AtomicU64>,
 }
@@ -315,6 +337,8 @@ impl Comparator {
             totals: Interval::default(),
             full: FullCompare::default(),
             full_drops: Arc::new(AtomicU64::new(0)),
+            commit_metrics: None,
+            commit_report: Default::default(),
         }
     }
 
@@ -479,7 +503,9 @@ impl Comparator {
 
     /// Agave's processing result of a replayed transaction (commit mode shadow).
     pub fn on_agave_processed(&mut self, processed: Box<AgaveProcessed>) {
-        if !crate::control::is_active() || !crate::control::keep_processed() {
+        if !crate::control::is_active()
+            || crate::control::commit_mode() != crate::control::COMMIT_SHADOW
+        {
             return;
         }
         if self.skipped.contains_key(&processed.slot) {
@@ -508,7 +534,7 @@ impl Comparator {
 
     fn on_final(&mut self, mut record: FinalRecord) {
         if let Some(processed) = record.outcome.processed.take() {
-            if crate::control::keep_processed() {
+            if crate::control::commit_mode() == crate::control::COMMIT_SHADOW {
                 let outcome = &record.outcome;
                 let fl = FlFull::new(
                     outcome.slot,
@@ -884,7 +910,9 @@ impl Comparator {
     fn gc(&mut self) {
         let horizon = Duration::from_secs(3);
         self.full.gc(horizon);
-        if !crate::control::keep_processed() && self.full.fl_len() + self.full.agave_len() > 0 {
+        if crate::control::commit_mode() != crate::control::COMMIT_SHADOW
+            && self.full.fl_len() + self.full.agave_len() > 0
+        {
             self.full.release();
         }
         let now = Instant::now();
@@ -996,7 +1024,8 @@ impl Comparator {
              rebase_hit={} rebase_miss={} spec_relaxed={} final_fixups={} commit={} \
              full_cmp={} full_match={} full_mismatch={} full_fields={full_fields:?} \
              full_unjoined_fl={} full_unjoined_agave={} full_unrecorded={} \
-             full_drops={full_drops} mem_full_kb={}",
+             full_drops={full_drops} mem_full_kb={} cluster_matched={} cluster_mismatched={} \
+             poisoned={} sticky={}",
             iv.matched,
             iv.mismatched,
             iv.noframe,
@@ -1067,6 +1096,10 @@ impl Comparator {
             fiv.unjoined_agave,
             fiv.unrecorded,
             mem.full >> 10,
+            crate::cluster_check::totals().0,
+            crate::cluster_check::totals().1,
+            crate::control::is_poisoned(),
+            crate::control::is_poisoned_sticky(),
         );
         solana_metrics::datapoint_info!(
             "fast_lane_full",
@@ -1240,6 +1273,17 @@ impl Comparator {
             w.write_line(&line);
         }
         self.out_summary(secs);
+        if let Some(metrics) = self.commit_metrics.clone() {
+            let line = self.commit_report.report(secs, &metrics);
+            info!("{line}");
+            if let Some(w) = self.summaries.as_mut() {
+                w.write_line(&format!(
+                    "{{\"commit\":true,\"unix_ns\":{},\"line\":\"{}\"}}",
+                    unix_ns(),
+                    line.replace('"', "'")
+                ));
+            }
+        }
         self.totals.matched += iv.matched;
         self.totals.mismatched += iv.mismatched;
         self.flush();

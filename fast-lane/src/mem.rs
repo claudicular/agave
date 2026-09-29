@@ -83,6 +83,10 @@ pub static PRED_BYTES: Gauge = Gauge::new();
 /// queued from replay to the comparator and both sides held while waiting for the other.
 pub static FULL_BYTES: Gauge = Gauge::new();
 
+/// Commit mode: FINAL transactions' processing results waiting for their commit (the
+/// committer's queue and jobs handed to commit threads).
+pub static COMMIT_PENDING_BYTES: Gauge = Gauge::new();
+
 /// Times the cap made the fast lane disable itself.
 pub static CAP_TRIPS: AtomicU64 = AtomicU64::new(0);
 
@@ -101,6 +105,9 @@ pub struct Snapshot {
     pub pred: i64,
     pub vm_pool: i64,
     pub full: i64,
+    pub commit: i64,
+    /// Commit boards (agave-side claim tables, `solana_runtime::fast_lane_commit`).
+    pub board: i64,
 }
 
 impl Snapshot {
@@ -119,6 +126,9 @@ impl Snapshot {
             pred: PRED_BYTES.get(),
             vm_pool: VM_POOL_BYTES.get(),
             full: FULL_BYTES.get(),
+            commit: COMMIT_PENDING_BYTES.get(),
+            board: solana_runtime::fast_lane_commit::BOARD_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
         }
     }
 
@@ -133,6 +143,8 @@ impl Snapshot {
             + self.pred
             + self.vm_pool
             + self.full
+            + self.commit
+            + self.board
     }
 }
 

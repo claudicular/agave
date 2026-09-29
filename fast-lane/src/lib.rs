@@ -19,6 +19,7 @@
 //!   the fast lane when the cluster's bank hash for a slot differs from ours.
 
 pub mod cluster_check;
+pub mod commit;
 pub mod compare;
 pub mod config;
 pub mod control;
@@ -127,12 +128,35 @@ pub struct ReplayServices {
 
 /// The fast lane's side of agave's replay hooks (`solana_runtime::fast_lane_commit`). Runs on
 /// agave's replay handler threads: wait-free (`try_send`), never panics.
-struct FlHooks {
-    full_tx: Sender<Box<AgaveProcessed>>,
-    full_drops: Arc<AtomicU64>,
+pub struct FlHooks {
+    pub full_tx: Sender<Box<AgaveProcessed>>,
+    pub full_drops: Arc<AtomicU64>,
+    /// The coordinator's channel (unbounded: sending never blocks agave).
+    pub coord_tx: Sender<CoordMsg>,
 }
 
 impl FastLaneHooks for FlHooks {
+    fn on_agave_done(&self, _slot: solana_clock::Slot, bank_id: solana_clock::BankId, index: usize) {
+        let _ = self.coord_tx.send(CoordMsg::Sink(Box::new(commit::CommitEvent::AgaveDone {
+            bank_id,
+            index,
+        })));
+    }
+
+    fn on_bank_inserted(&self, bank: &Arc<solana_runtime::bank::Bank>) {
+        if control::committing() {
+            let _ = self
+                .coord_tx
+                .send(CoordMsg::Sink(Box::new(commit::CommitEvent::BankInserted(
+                    Arc::clone(bank),
+                ))));
+        }
+    }
+
+    fn poison(&self, reason: &'static str) {
+        control::poison(reason);
+    }
+
     fn on_agave_processed(&self, processed: AgaveProcessed) {
         if !control::is_active() || !control::keep_processed() {
             return;
@@ -322,6 +346,12 @@ fn start_threads(
     let (task_tx, task_rx) = unbounded();
     let (cmp_tx, cmp_rx) = bounded::<CmpMsg>(65_536);
     let (full_tx, full_rx) = bounded::<Box<AgaveProcessed>>(65_536);
+    let (job_tx, job_rx) = unbounded::<commit::CommitJob>();
+    let commit_metrics = Arc::new(commit::CommitMetrics::default());
+    control::set_verify_sample_ppm(config.verify_sample_ppm);
+    control::set_follow_wait_ms(config.follow_wait_ms);
+    solana_runtime::fast_lane_commit::set_follow_spin(Duration::from_micros(config.follow_spin_us));
+    commit::log_start(&config);
     let full_drops = Arc::new(AtomicU64::new(0));
     let sink_drops = Arc::new(AtomicU64::new(0));
     // Phase-3 output ring (created before any thread so its failure only disables it).
@@ -373,6 +403,28 @@ fn start_threads(
     }
     drop(task_rx);
 
+    // Commit threads (commit mode): commit FINAL transactions into agave's banks.
+    for i in 0..config.commit_threads {
+        let place = if config.commit_cores.is_empty() {
+            Placement::Niced(config.nice, config.shared_cores.clone())
+        } else {
+            Placement::Pinned(vec![config.commit_cores[i % config.commit_cores.len()]])
+        };
+        let job_rx = job_rx.clone();
+        let coord_tx = coord_tx.clone();
+        let exit = exit.clone();
+        let services = deps.replay.clone();
+        let metrics = commit_metrics.clone();
+        let spin = Duration::from_micros(config.commit_spin_us);
+        threads.push(
+            safety::spawn(&format!("solFlCommit{i:02}"), place, move || {
+                commit::commit_worker_loop(job_rx, coord_tx, services, exit, spin, metrics)
+            })
+            .map_err(spawn_err)?,
+        );
+    }
+    drop(job_rx);
+
     // Coordinator.
     {
         let exit = exit.clone();
@@ -381,6 +433,11 @@ fn start_threads(
             tx: cmp_tx.clone(),
             drops: sink_drops.clone(),
             out,
+            committer: Some(commit::Committer::new(
+                job_tx,
+                Some(deps.bank_forks.clone()),
+                commit_metrics.clone(),
+            )),
         };
         let workers = config.workers;
         let hint_alpha = config.hint_alpha;
@@ -439,6 +496,7 @@ fn start_threads(
                     Comparator::new(config_c, bank_forks, export_dir, sink_drops);
                 comparator.tap_stats = Some(shared_c);
                 comparator.full_drops = full_drops_c;
+                comparator.commit_metrics = Some(commit_metrics);
                 if out_enabled {
                     comparator.out_stats = Some(out_stats);
                 }
@@ -447,6 +505,7 @@ fn start_threads(
             .map_err(spawn_err)?,
         );
     }
+    let hooks_coord_tx = coord_tx.clone();
     drop(coord_tx);
 
     // Control.
@@ -488,6 +547,7 @@ fn start_threads(
     solana_runtime::fast_lane_commit::install_hooks(Arc::new(FlHooks {
         full_tx,
         full_drops,
+        coord_tx: hooks_coord_tx,
     }));
     control::set_active(true);
     control::set_commit_mode(config.commit);

@@ -18,40 +18,18 @@ use {
     },
     solana_account::ReadableAccount,
     solana_clock::Slot,
-    solana_program_runtime::program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryType},
-    solana_pubkey::Pubkey,
     solana_runtime::fast_lane_commit::{AgaveProcessed, TxBalances, tx_balances},
     solana_signature::Signature,
     solana_svm::transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     std::{
         collections::HashMap,
         fmt::Write as _,
-        sync::Arc,
         time::{Duration, Instant},
     },
 };
 
 /// Every field the comparison reports, in reporting order.
-pub const FIELDS: [&str; 18] = [
-    "kind",
-    "status",
-    "accounts",
-    "touched",
-    "fee",
-    "rollback",
-    "loaded_size",
-    "budget",
-    "logs",
-    "inner_ix",
-    "return_data",
-    "cu",
-    "deltas",
-    "programs",
-    "bal_native",
-    "bal_token",
-    "noop",
-    "parent",
-];
+pub const FIELDS: [&str; 18] = solana_runtime::fast_lane_commit::DIFF_FIELDS;
 
 /// FL's side of one comparison: the processing result and its compiled balances.
 pub struct FlFull {
@@ -159,45 +137,9 @@ pub fn agave_bytes(processed: &AgaveProcessed) -> i64 {
     processing_result_bytes(&processed.result) + balances_bytes(processed.balances.as_ref()) + 192
 }
 
-fn keyed_equal(
-    a: &[(Pubkey, solana_account::AccountSharedData)],
-    b: &[(Pubkey, solana_account::AccountSharedData)],
-) -> bool {
-    a.len() == b.len()
-        && a
-            .iter()
-            .zip(b)
-            .all(|((ka, aa), (kb, ab))| ka == kb && accounts_equal(aa, ab))
-}
-
-fn program_type_tag(entry: &ProgramCacheEntry) -> u8 {
-    match entry.program {
-        ProgramCacheEntryType::FailedVerification(_) => 1,
-        ProgramCacheEntryType::Closed => 2,
-        ProgramCacheEntryType::DelayVisibility => 3,
-        ProgramCacheEntryType::Unloaded(_) => 4,
-        ProgramCacheEntryType::Loaded(_) => 5,
-        ProgramCacheEntryType::Builtin(_) => 6,
-    }
-}
-
-fn programs_equal(
-    a: &HashMap<Pubkey, Arc<ProgramCacheEntry>>,
-    b: &HashMap<Pubkey, Arc<ProgramCacheEntry>>,
-) -> bool {
-    a.len() == b.len()
-        && a.iter().all(|(key, ea)| {
-            b.get(key).is_some_and(|eb| {
-                ea.deployment_slot == eb.deployment_slot
-                    && ea.account_owner == eb.account_owner
-                    && program_type_tag(ea) == program_type_tag(eb)
-            })
-        })
-}
-
-/// Compare FL's result with agave's; pushes the name of every differing field. Recording
-/// fields (logs, inner instructions, return data, balances) are compared only when FL
-/// executed with agave's recording configuration (`recorded`).
+/// Compare FL's result with agave's (`solana_runtime::fast_lane_commit::diff_results`, the
+/// same comparison agave's handlers run on commit-mode samples); pushes the name of every
+/// differing field. Recording fields are compared only when `recorded`.
 pub fn diff(
     fl: &TransactionProcessingResult,
     fl_balances: Option<&TxBalances>,
@@ -206,99 +148,14 @@ pub fn diff(
     agave_balances: Option<&TxBalances>,
     out: &mut Vec<&'static str>,
 ) {
-    match (fl, agave) {
-        (Err(a), Err(b)) => {
-            if a != b {
-                out.push("status");
-            }
-        }
-        (Ok(a), Ok(b)) => match (a, b) {
-            (ProcessedTransaction::Executed(a), ProcessedTransaction::Executed(b)) => {
-                let (la, lb) = (&a.loaded_transaction, &b.loaded_transaction);
-                let (ea, eb) = (&a.execution_details, &b.execution_details);
-                if ea.status != eb.status {
-                    out.push("status");
-                }
-                let before = out.len();
-                if !keyed_equal(&la.accounts, &lb.accounts) {
-                    out.push("accounts");
-                }
-                if la.touched_flags != lb.touched_flags {
-                    out.push("touched");
-                }
-                if la.fee_details != lb.fee_details {
-                    out.push("fee");
-                }
-                if la.rollback_accounts != lb.rollback_accounts {
-                    out.push("rollback");
-                }
-                if la.loaded_accounts_data_size != lb.loaded_accounts_data_size {
-                    out.push("loaded_size");
-                }
-                // The only other loaded-transaction field is the compute budget.
-                if out.len() == before && la != lb {
-                    out.push("budget");
-                }
-                if recorded {
-                    if ea.log_messages != eb.log_messages {
-                        out.push("logs");
-                    }
-                    if ea.inner_instructions != eb.inner_instructions {
-                        out.push("inner_ix");
-                    }
-                    if ea.return_data != eb.return_data {
-                        out.push("return_data");
-                    }
-                }
-                if ea.executed_units != eb.executed_units {
-                    out.push("cu");
-                }
-                if ea.accounts_deltas != eb.accounts_deltas {
-                    out.push("deltas");
-                }
-                if !programs_equal(&a.programs_modified_by_tx, &b.programs_modified_by_tx) {
-                    out.push("programs");
-                }
-            }
-            (ProcessedTransaction::FeesOnly(a), ProcessedTransaction::FeesOnly(b)) => {
-                if a.load_error != b.load_error {
-                    out.push("status");
-                }
-                if a.rollback_accounts != b.rollback_accounts {
-                    out.push("rollback");
-                }
-                if a.fee_details != b.fee_details {
-                    out.push("fee");
-                }
-                if a.loaded_accounts_data_size != b.loaded_accounts_data_size {
-                    out.push("loaded_size");
-                }
-            }
-            (ProcessedTransaction::NoOp(a), ProcessedTransaction::NoOp(b)) => {
-                if a.validation_error != b.validation_error {
-                    out.push("status");
-                } else if a != b {
-                    out.push("noop");
-                }
-            }
-            _ => out.push("kind"),
-        },
-        _ => out.push("kind"),
-    }
-    if recorded {
-        match (fl_balances, agave_balances) {
-            (Some(a), Some(b)) => {
-                if a.pre != b.pre || a.post != b.post {
-                    out.push("bal_native");
-                }
-                if a.token_pre != b.token_pre || a.token_post != b.token_post {
-                    out.push("bal_token");
-                }
-            }
-            (None, None) => {}
-            _ => out.push("bal_native"),
-        }
-    }
+    solana_runtime::fast_lane_commit::diff_results(
+        fl,
+        fl_balances,
+        recorded,
+        agave,
+        agave_balances,
+        out,
+    )
 }
 
 /// Per-interval counters of the full comparison.
@@ -569,6 +426,7 @@ mod tests {
         super::*,
         solana_account::AccountSharedData,
         solana_fee_structure::FeeDetails,
+        solana_pubkey::Pubkey,
         solana_svm::{
             account_loader::{FeesOnlyTransaction, LoadedTransaction},
             rollback_accounts::RollbackAccounts,

@@ -317,6 +317,10 @@ impl BankForks {
         };
         let prev = self.banks.insert(bank.slot(), bank.clone_with_scheduler());
         assert!(prev.is_none());
+        if matches!(mode, SchedulingMode::BlockVerification) {
+            // Fast-lane commit board (inert unless the fast lane runs in commit mode).
+            crate::fast_lane_commit::on_bank_inserted(&bank.clone_without_scheduler());
+        }
         let slot = bank.slot();
         self.descendants.entry(slot).or_default();
         for parent in bank.proper_ancestors() {
@@ -357,6 +361,10 @@ impl BankForks {
 
     pub fn remove(&mut self, slot: Slot) -> Option<BankWithScheduler> {
         let bank = self.banks.remove(&slot)?;
+        // No fast-lane commit may reach a bank that left bank forks (its slot's accounts may be
+        // purged next): close its board, waiting for commits in flight (they never take the
+        // bank forks lock).
+        crate::fast_lane_commit::on_bank_removed(bank.bank_id());
         for parent in bank.proper_ancestors() {
             let Entry::Occupied(mut entry) = self.descendants.entry(parent) else {
                 panic!("this should not happen!");

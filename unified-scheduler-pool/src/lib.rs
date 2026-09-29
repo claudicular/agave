@@ -25,6 +25,7 @@ use {
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_runtime::{
+        fast_lane_commit,
         installed_scheduler_pool::{
             InstalledScheduler, InstalledSchedulerBox, InstalledSchedulerPool, ResultWithTimings,
             ScheduleResult, SchedulerAborted, SchedulerId, SchedulingContext, TimeoutListener,
@@ -630,28 +631,40 @@ impl TaskHandler for DefaultTaskHandler {
         let bank = scheduling_context.bank();
         let transaction = task.transaction();
         let task_id = task.task_id();
+        let index: usize = task_id.try_into().unwrap();
 
-        let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
+        // Fast-lane commit mode (`solana_runtime::fast_lane_commit`): if the fast lane
+        // committed this transaction, its result is the task's result; otherwise agave
+        // executes it. Inert (one relaxed load) unless the fast lane runs in commit mode.
+        match fast_lane_commit::follow(bank, index, transaction) {
+            fast_lane_commit::Follow::Done(fast_lane_result) => {
+                *result = fast_lane_result;
+            }
+            fast_lane_commit::Follow::Execute => {
+                let batch = bank.prepare_unlocked_batch_from_single_tx(transaction);
 
-        let transaction_indexes = vec![task_id.try_into().unwrap()];
-        let batch_with_indexes = TransactionBatchWithIndexes {
-            batch,
-            transaction_indexes,
-        };
+                let transaction_indexes = vec![index];
+                let batch_with_indexes = TransactionBatchWithIndexes {
+                    batch,
+                    transaction_indexes,
+                };
 
-        *result = execute_batch(
-            &batch_with_indexes,
-            bank,
-            handler_context.transaction_status_sender.as_ref(),
-            handler_context.replay_vote_sender.as_ref(),
-            ReplayVoteSendType::Executed {
-                replay_bank_id: bank.bank_id(),
-                replay_slot: bank.slot(),
-            },
-            timings,
-            handler_context.log_messages_bytes_limit,
-            handler_context.prioritization_fee_cache.as_deref(),
-        );
+                *result = execute_batch(
+                    &batch_with_indexes,
+                    bank,
+                    handler_context.transaction_status_sender.as_ref(),
+                    handler_context.replay_vote_sender.as_ref(),
+                    ReplayVoteSendType::Executed {
+                        replay_bank_id: bank.bank_id(),
+                        replay_slot: bank.slot(),
+                    },
+                    timings,
+                    handler_context.log_messages_bytes_limit,
+                    handler_context.prioritization_fee_cache.as_deref(),
+                );
+                fast_lane_commit::agave_done(bank, index);
+            }
+        }
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
     }
 }

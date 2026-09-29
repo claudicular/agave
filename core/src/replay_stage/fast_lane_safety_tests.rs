@@ -27,6 +27,9 @@ use {
 
 static TEST_PUBKEY: Pubkey = Pubkey::new_from_array([11; 32]);
 
+/// The fast lane's poison and commit mode are process-global: these tests run one at a time.
+static FL_E2E: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A full slot: one transaction entry, then the ticks to the end of `slot` from `parent`.
 fn slot_entries(
     genesis_config: &solana_genesis_config::GenesisConfig,
@@ -285,6 +288,7 @@ impl Node {
 
 #[test]
 fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
+    let _serial = FL_E2E.lock().unwrap_or_else(|e| e.into_inner());
     agave_logger::setup();
     let GenesisConfigInfo {
         genesis_config,
@@ -485,4 +489,178 @@ fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
     assert!(!control::is_active());
     control::set_commit_mode(control::COMMIT_SHADOW);
     assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_OFF);
+}
+
+/// The same scenario through the real execute-once commit path: with `commit = on`, slot 1's
+/// first transaction is committed by `commit_external` with a wrong fast-lane result (the
+/// mint's post-state one lamport too high), agave's replay follows (verifies the committed
+/// transaction, executes the others). The cluster's confirmation disables FL provisionally;
+/// the dump and the re-replay of the same block without FL give the cluster's hashes, so the
+/// disagreement is attributed to FL and the poison becomes sticky.
+#[test]
+#[ignore = "needs the process-global fast lane active for its whole run, which other core tests \
+            poison through the cluster-check hooks: run alone with \
+            `cargo test -p solana-core --lib -- --ignored fast_lane_real_commit`"]
+fn test_fast_lane_real_commit_wrong_result_is_attributed_to_fl() {
+    use {
+        solana_runtime::transaction_execution::{CommitServices, ExternalCommit, commit_external},
+        solana_svm::{
+            transaction_processing_result::ProcessedTransaction,
+            transaction_processor::TransactionProcessingConfig,
+        },
+        solana_svm_timings::ExecuteTimings,
+        solana_transaction::{TransactionVerificationMode, versioned::VersionedTransaction},
+    };
+    let _serial = FL_E2E.lock().unwrap_or_else(|e| e.into_inner());
+    agave_logger::setup();
+    control::unpoison_for_tests();
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(100 * solana_native_token::LAMPORTS_PER_SOL);
+    let genesis_hash = genesis_config.hash();
+    let payers: Vec<Keypair> = (0..3u8)
+        .map(|i| Keypair::new_from_array([i + 41; 32]))
+        .collect();
+    let transfer = |from: &Keypair, to: &Pubkey, lamports| {
+        system_transaction::transfer(from, to, lamports, genesis_hash)
+    };
+    let slot1_txs: Vec<Transaction> = payers
+        .iter()
+        .map(|payer| {
+            transfer(
+                &mint_keypair,
+                &payer.pubkey(),
+                solana_native_token::LAMPORTS_PER_SOL,
+            )
+        })
+        .collect();
+    let slot2_txs = vec![transfer(
+        &payers[0],
+        &payers[1].pubkey(),
+        solana_native_token::LAMPORTS_PER_SOL / 2,
+    )];
+    let mut cluster = Node::new(&genesis_config);
+    let shred_keypair = Keypair::new_from_array([9; 32]);
+    let entries1 = slot_entries(
+        &genesis_config,
+        cluster.bank_forks.read().unwrap().get(0).unwrap().last_blockhash(),
+        1,
+        0,
+        slot1_txs.clone(),
+    );
+    let entries2 = slot_entries(&genesis_config, entries1.last().unwrap().hash, 2, 1, slot2_txs);
+    let shreds1 = slot_shreds(&shred_keypair, 1, 0, &entries1, Hash::default());
+    let shreds2 = slot_shreds(
+        &shred_keypair,
+        2,
+        1,
+        &entries2,
+        shreds1.last().unwrap().merkle_root().unwrap(),
+    );
+    cluster.blockstore.insert_shreds(shreds1.clone(), false).unwrap();
+    cluster.blockstore.insert_shreds(shreds2.clone(), false).unwrap();
+    let mut frozen = cluster.replay_until_idle(&|_| {});
+    frozen.sort_unstable();
+    assert_eq!(frozen, vec![1, 2]);
+    let cluster_hash1 = cluster.hash(1).unwrap();
+    let cluster_hash2 = cluster.hash(2).unwrap();
+
+    // Our node in commit mode. The fast lane is simulated by committing slot 1's first
+    // transaction through the real commit path, with a wrong result.
+    assert!(control::set_active(true));
+    control::set_commit_mode(control::COMMIT_ON);
+    control::set_follow_wait_ms(0);
+    assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_ON);
+    let mint = mint_keypair.pubkey();
+    let mut node = Node::new(&genesis_config);
+    node.blockstore.insert_shreds(shreds1.clone(), false).unwrap();
+    node.blockstore.insert_shreds(shreds2.clone(), false).unwrap();
+    let node_forks = node.bank_forks.clone();
+    let fl_commit = |bank: &Bank| {
+        if bank.slot() != 1 || fast_lane_commit::mode() != fast_lane_commit::MODE_ON {
+            return;
+        }
+        let bank = node_forks.read().unwrap().get(1).unwrap();
+        let board = fast_lane_commit::board_of(bank.bank_id()).expect("commit board");
+        assert!(board.bind());
+        let rtx = bank
+            .verify_transaction(
+                VersionedTransaction::from(slot1_txs[0].clone()),
+                TransactionVerificationMode::HashOnly,
+            )
+            .unwrap();
+        let batch = bank.prepare_unlocked_batch_from_single_tx(&rtx);
+        let check = bank.check_transactions::<solana_runtime_transaction::runtime_transaction::RuntimeTransaction<
+            solana_transaction::sanitized::SanitizedTransaction,
+        >>(
+            batch.sanitized_transactions(),
+            batch.lock_results(),
+            bank.max_processing_age(),
+            false,
+            &mut Default::default(),
+        );
+        let mut output = bank.load_and_execute_transactions(
+            &batch,
+            bank.max_processing_age(),
+            &mut ExecuteTimings::default(),
+            &mut Default::default(),
+            TransactionProcessingConfig::default(),
+        );
+        drop(batch);
+        let Ok(ProcessedTransaction::Executed(executed)) = &mut output.processing_results[0] else {
+            panic!("executed");
+        };
+        let (key, account) = &mut executed.loaded_transaction.accounts[0];
+        assert_eq!(*key, mint);
+        account.set_lamports(account.lamports() + 1);
+        let result = commit_external(
+            &bank,
+            &board,
+            0,
+            &rtx,
+            &check[0],
+            output.processing_results.pop().unwrap(),
+            output.balance_collector,
+            CommitServices::default(),
+            &mut ExecuteTimings::default(),
+        );
+        assert_eq!(result, ExternalCommit::Committed(Ok(())));
+    };
+    let mut frozen = node.replay_until_idle(&fl_commit);
+    frozen.sort_unstable();
+    assert_eq!(frozen, vec![1, 2]);
+    let wrong_hash1 = node.hash(1).unwrap();
+    assert_ne!(wrong_hash1, cluster_hash1);
+    assert_ne!(node.hash(2).unwrap(), cluster_hash2);
+
+    // Detection: FL off at once (provisionally), agave's gate off.
+    node.cluster_confirms(1, cluster_hash1);
+    assert!(control::is_poisoned());
+    assert!(!control::is_poisoned_sticky(), "not attributed yet");
+    assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_OFF);
+    assert!(!fast_lane_commit::fl_live());
+    node.cluster_confirms(2, cluster_hash2);
+    let mut dumped = node.dump_then_repair();
+    dumped.sort_unstable();
+    assert_eq!(dumped, vec![(1, cluster_hash1), (2, cluster_hash2)]);
+
+    // The same block, repaired and replayed without FL: the cluster's hashes. FL was wrong.
+    node.blockstore.insert_shreds(shreds1, false).unwrap();
+    node.blockstore.insert_shreds(shreds2, false).unwrap();
+    let mut frozen = node.replay_until_idle(&fl_commit);
+    frozen.sort_unstable();
+    assert_eq!(frozen, vec![1, 2]);
+    assert_eq!(node.hash(1), Some(cluster_hash1));
+    assert_eq!(node.hash(2), Some(cluster_hash2));
+    assert!(
+        cluster_check::recent_events().iter().any(|e| e.slot == 1
+            && e.kind == EventKind::Attribution { verdict: "fl_wrong" }),
+        "attributed to the fast lane"
+    );
+    assert!(control::is_poisoned_sticky());
+    assert!(!control::set_active(true));
+    assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_OFF);
+    control::set_follow_wait_ms(100);
 }

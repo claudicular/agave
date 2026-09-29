@@ -979,6 +979,15 @@ impl Ingest {
                 run: run.clone(),
             })
             .map_err(|_| "coordinator_gone")?;
+        if crate::control::committing() {
+            // Commit mode: the committer binds the run to agave's bank of the slot.
+            let _ = self.coord_tx.send(CoordMsg::Sink(Box::new(
+                crate::commit::CommitEvent::RunBegin {
+                    run_id,
+                    run: run.clone(),
+                },
+            )));
+        }
         if let Some(meta) = run.provisional_meta() {
             self.coord_tx
                 .send(CoordMsg::Txs {

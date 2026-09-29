@@ -118,6 +118,8 @@ pub enum CoordMsg {
         k: TxIdx,
         out: ExecOutput,
     },
+    /// An event for the sink, handled on the coordinator thread ([`FinalSink::on_event`]).
+    Sink(Box<dyn Any + Send>),
     Shutdown,
 }
 
@@ -140,6 +142,11 @@ pub struct Finalized {
     pub t_exec_end: Instant,
     pub t_final: Instant,
     pub n_preds: usize,
+    /// Commit-order predecessors: every earlier transaction of the run that conflicts with
+    /// this one the way agave's scheduler orders them (shares an account, one of the two
+    /// writing it), reduced to the last writer of each account plus, for accounts this one
+    /// writes, the readers since. Committing in this order is replay's order per account.
+    pub cpreds: Vec<TxIdx>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -211,6 +218,8 @@ pub trait FinalSink: Send {
     fn on_abort_ended(&mut self, _run_id: RunId, _reason: &'static str) {}
     /// Called about every millisecond by the coordinator loop, busy or idle.
     fn tick(&mut self) {}
+    /// An event sent with [`CoordMsg::Sink`].
+    fn on_event(&mut self, _event: Box<dyn Any + Send>) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,12 +255,16 @@ struct TxS {
     pred_recs: Vec<PredRec>,
     rebased: u32,
     t_ready: Option<Instant>,
+    /// Commit-order predecessors (see [`Finalized::cpreds`]).
+    cpreds: Vec<TxIdx>,
 }
 
 struct AcctS {
     key: Pubkey,
     lockers: Vec<(TxIdx, bool)>,
     last_writer: Option<TxIdx>,
+    /// Read-lockers since `last_writer` (commit order: the next writer follows them).
+    readers: Vec<TxIdx>,
     unexec_w: BTreeSet<TxIdx>,
     unexec_certain: BTreeSet<TxIdx>,
     /// Fee payer of some transaction of the run.
@@ -704,6 +717,7 @@ impl<S: FinalSink> Coordinator<S> {
                 self.drain_worklist();
                 self.maybe_end_run(run_id);
             }
+            CoordMsg::Sink(event) => self.sink.on_event(event),
             CoordMsg::Shutdown => return false,
         }
         true
@@ -718,6 +732,7 @@ impl<S: FinalSink> Coordinator<S> {
             key: *key,
             lockers: Vec::new(),
             last_writer: None,
+            readers: Vec::new(),
             unexec_w: BTreeSet::new(),
             unexec_certain: BTreeSet::new(),
             payer: false,
@@ -764,6 +779,16 @@ impl<S: FinalSink> Coordinator<S> {
                     }
                 }
             }
+            let mut cpreds: Vec<TxIdx> = preds.clone();
+            for &(a, w) in &locks {
+                if w {
+                    for &r in &run.accts[a as usize].readers {
+                        if !cpreds.contains(&r) {
+                            cpreds.push(r);
+                        }
+                    }
+                }
+            }
             let mut pending = 0;
             for &p in &preds {
                 let pred = &mut run.txs[p as usize];
@@ -775,6 +800,11 @@ impl<S: FinalSink> Coordinator<S> {
             for &(a, w) in &locks {
                 let acct = &mut run.accts[a as usize];
                 acct.lockers.push((k, w));
+                if w {
+                    acct.readers.clear();
+                } else {
+                    acct.readers.push(k);
+                }
                 if w {
                     acct.last_writer = Some(k);
                     acct.unexec_w.insert(k);
@@ -805,6 +835,7 @@ impl<S: FinalSink> Coordinator<S> {
                 pred_recs: Vec::new(),
                 rebased: 0,
                 t_ready: (pending == 0).then_some(t_ingest),
+                cpreds,
             });
             new_ready.push(k);
         }
@@ -1363,7 +1394,7 @@ impl<S: FinalSink> Coordinator<S> {
 
         // FINAL.
         let t_final = Instant::now();
-        let (out, out_inc, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds) = {
+        let (out, out_inc, out_spec, incarnations, succs, t_ingest, t_first_dispatch, n_preds, cpreds) = {
             let tx = &mut run.txs[k as usize];
             tx.state = St::Final;
             (
@@ -1375,6 +1406,7 @@ impl<S: FinalSink> Coordinator<S> {
                 tx.t_ingest,
                 tx.t_first_dispatch.unwrap_or(tx.t_ingest),
                 tx.preds.len(),
+                std::mem::take(&mut tx.cpreds),
             )
         };
         let (t_ready, rebased) = {
@@ -1437,6 +1469,7 @@ impl<S: FinalSink> Coordinator<S> {
             t_exec_end: exec_end,
             t_final,
             n_preds,
+            cpreds,
         });
         // Readers of a replaced prediction: re-dispatch/re-predict them now rather than at
         // their own validation.
