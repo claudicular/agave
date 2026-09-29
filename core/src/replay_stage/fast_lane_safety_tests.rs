@@ -18,6 +18,7 @@ use {
         genesis_utils::{GenesisConfigInfo, create_genesis_config},
         shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
     },
+    solana_runtime::fast_lane_commit,
     solana_sha256_hasher::hash,
     solana_system_transaction as system_transaction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
@@ -371,6 +372,9 @@ fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
     // If no other test in this process has poisoned the fast lane yet, it starts active and the
     // detection below must turn it off.
     let fl_started_active = control::set_active(true);
+    // Agave's side of the execute-once gate (`solana_runtime::fast_lane_commit::mode`, which the
+    // commit path consults) follows the fast lane's commit mode while the fast lane is active.
+    control::set_commit_mode(control::COMMIT_SHADOW);
     let mut node = Node::new(&genesis_config);
     node.blockstore
         .insert_shreds(shreds1.clone(), false)
@@ -399,6 +403,7 @@ fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
         "the control file's enable must be refused"
     );
     assert!(control::poison_reason().is_some());
+    assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_OFF);
     if fl_started_active {
         assert!(
             control::poison_reason()
@@ -439,11 +444,12 @@ fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
     );
 
     // Repair delivers the same block again; replay runs it with the fast lane off, so the
-    // stand-in commit is skipped (as the execute-once path must when `is_active()` is false).
+    // stand-in commit is skipped (as the execute-once path must when agave's side of the gate,
+    // `fast_lane_commit::mode()`, is off).
     node.blockstore.insert_shreds(shreds1, false).unwrap();
     node.blockstore.insert_shreds(shreds2, false).unwrap();
     let gated_fl_commit = |bank: &Bank| {
-        if control::is_active() {
+        if control::is_active() || fast_lane_commit::mode() != fast_lane_commit::MODE_OFF {
             fl_commit(bank)
         }
     };
@@ -477,4 +483,6 @@ fn test_fast_lane_cluster_mismatch_poisons_dumps_and_replays() {
     // Still poisoned: nothing re-arms the fast lane before a restart.
     assert!(control::is_poisoned());
     assert!(!control::is_active());
+    control::set_commit_mode(control::COMMIT_SHADOW);
+    assert_eq!(fast_lane_commit::mode(), fast_lane_commit::MODE_OFF);
 }
