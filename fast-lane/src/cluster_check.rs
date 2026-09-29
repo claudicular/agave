@@ -601,8 +601,11 @@ pub fn totals() -> (u64, u64, u64, u64, u64) {
     )
 }
 
-/// Per-slot summary kept for recent slots: (our hash, gossip stake per voted hash, total stake).
-pub fn slot_votes(slot: Slot) -> Option<(Option<Hash>, HashMap<Hash, (u64, u64)>, u64)> {
+/// (our frozen hash, per voted hash: (stake, gossip-seen stake), total stake).
+pub type SlotVotes = (Option<Hash>, HashMap<Hash, (u64, u64)>, u64);
+
+/// Per-slot vote summary kept for recent slots.
+pub fn slot_votes(slot: Slot) -> Option<SlotVotes> {
     let st = state().lock();
     st.slots.get(&slot).map(|r| {
         (
