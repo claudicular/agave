@@ -569,6 +569,10 @@ pub fn poll_control_file(
                     ),
                     _ => warn!("fast lane: bad bind_wait_us {value}"),
                 },
+                "bind_wait_on" => match crate::config::parse_bind_wait_on(value.as_str()) {
+                    Some(on) => solana_runtime::fast_lane_commit::set_bind_on(on),
+                    None => warn!("fast lane: bad bind_wait_on {value}"),
+                },
                 "follow_spin_us" => match value.parse::<u64>() {
                     Ok(us) if us <= 1_000_000 => solana_runtime::fast_lane_commit::set_follow_spin(
                         std::time::Duration::from_micros(us),
@@ -631,8 +635,10 @@ mod tests {
         assert_eq!(parse_commit_mode("shadow"), Some(COMMIT_SHADOW));
         assert_eq!(parse_commit_mode("off"), Some(COMMIT_OFF));
         assert_eq!(parse_commit_mode("on"), Some(COMMIT_ON));
-        let cmds = parse_commands("commit_on=workers\nsample_mode=fl\nbind_wait_us=500\n");
-        assert_eq!(cmds.len(), 3);
+        let cmds = parse_commands(
+            "commit_on=workers\nsample_mode=fl\nbind_wait_us=500\nbind_wait_on=parent\n",
+        );
+        assert_eq!(cmds.len(), 4);
         assert_eq!(parse_commit_mode("bogus"), None);
         let cmds = parse_commands("commit=shadow\n");
         assert_eq!(cmds, vec![Command::Set("commit".into(), "shadow".into())]);

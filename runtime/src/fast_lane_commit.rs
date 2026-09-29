@@ -103,6 +103,32 @@ static BIND_WAIT_US: AtomicU64 = AtomicU64::new(2_000);
 /// Slots (with the parent bank) the fast lane runs: a bank inserted for one is expected to be
 /// bound by the fast lane shortly.
 static EXPECTED: Mutex<VecDeque<(Slot, BankId)>> = Mutex::new(VecDeque::new());
+/// When an unbound bank's handlers wait for the fast lane's binding (all bounded by
+/// `BIND_WAIT_US` per bank; never for a slot the fast lane skipped or cannot run):
+/// [`BIND_ON_RUN`] only when the fast lane registered its run of the slot;
+/// [`BIND_ON_KNOWN`] also when its ingest has the slot's input (same parent slot);
+/// [`BIND_ON_PARENT`] also when it ran the bank's parent bank (it follows this fork) and has
+/// not seen the slot's input yet.
+static BIND_ON: AtomicU8 = AtomicU8::new(BIND_ON_KNOWN);
+pub const BIND_ON_RUN: u8 = 0;
+pub const BIND_ON_KNOWN: u8 = 1;
+pub const BIND_ON_PARENT: u8 = 2;
+/// Slots the fast lane's ingest knows (has input for, with the parent slot) or skipped,
+/// indexed by slot: `slot << 2 | state` (0 = empty) and the parent slot. Lock-free for the
+/// handlers; a torn read only changes a bounded wait, never a result.
+const KNOWN_LEN: usize = 1024;
+const KNOWN: u64 = 1;
+const SKIPPED: u64 = 2;
+static KNOWN_SLOTS: [AtomicU64; KNOWN_LEN] = [const { AtomicU64::new(0) }; KNOWN_LEN];
+static KNOWN_PARENTS: [AtomicU64; KNOWN_LEN] = [const { AtomicU64::new(0) }; KNOWN_LEN];
+/// Banks the fast lane bound (`bank_id + 1`, indexed by bank id): a child of one is on a
+/// fork the fast lane follows.
+const FOLLOWED_LEN: usize = 256;
+static FOLLOWED: [AtomicU64; FOLLOWED_LEN] = [const { AtomicU64::new(0) }; FOLLOWED_LEN];
+/// Per-bank binding waits of the interval (reason, outcome, µs), drained by the fast lane's
+/// report; bounded (dropped when full).
+static BIND_WAIT_LOG: Mutex<Vec<BindWait>> = Mutex::new(Vec::new());
+const BIND_WAIT_LOG_MAX: usize = 8192;
 /// Registered commit boards (fast path of the handler hooks when zero).
 static COMMIT_BOARDS: AtomicUsize = AtomicUsize::new(0);
 
@@ -252,6 +278,135 @@ pub fn unexpect_fl_run(slot: Slot) {
             }
         }
     }
+}
+
+pub fn set_bind_on(on: u8) {
+    BIND_ON.store(on.min(BIND_ON_PARENT), Ordering::Relaxed);
+}
+
+pub fn bind_on() -> u8 {
+    BIND_ON.load(Ordering::Relaxed)
+}
+
+/// The fast lane's ingest has input of `slot` (child of `parent_slot`): it will run the slot
+/// once the parent is frozen, so a bank of it waits (bounded) for the binding.
+pub fn fl_knows_slot(slot: Slot, parent_slot: Slot) {
+    let i = slot as usize % KNOWN_LEN;
+    let key = slot << 2 | KNOWN;
+    if KNOWN_SLOTS[i].load(Ordering::Acquire) == key
+        && KNOWN_PARENTS[i].load(Ordering::Relaxed) == parent_slot
+    {
+        return;
+    }
+    KNOWN_SLOTS[i].store(0, Ordering::Release);
+    KNOWN_PARENTS[i].store(parent_slot, Ordering::Release);
+    KNOWN_SLOTS[i].store(key, Ordering::Release);
+}
+
+/// The fast lane skipped `slot` (or gave up on it): agave executes a bank of it at once.
+pub fn fl_skips_slot(slot: Slot) {
+    let i = slot as usize % KNOWN_LEN;
+    KNOWN_SLOTS[i].store(slot << 2 | SKIPPED, Ordering::Release);
+    unexpect_fl_run(slot);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Known {
+    Absent,
+    Known,
+    Skipped,
+}
+
+fn known_state(slot: Slot, parent_slot: Slot) -> Known {
+    let i = slot as usize % KNOWN_LEN;
+    let key = KNOWN_SLOTS[i].load(Ordering::Acquire);
+    if key >> 2 != slot || key == 0 {
+        return Known::Absent;
+    }
+    match key & 3 {
+        SKIPPED => Known::Skipped,
+        KNOWN => {
+            let parent = KNOWN_PARENTS[i].load(Ordering::Acquire);
+            // Re-check: the entry was not replaced while reading the parent.
+            if KNOWN_SLOTS[i].load(Ordering::Acquire) == key && parent == parent_slot {
+                Known::Known
+            } else {
+                Known::Absent
+            }
+        }
+        _ => Known::Absent,
+    }
+}
+
+/// What the fast lane published about `slot` (child of `parent_slot`): `Some(true)` known,
+/// `Some(false)` skipped, `None` nothing (diagnostics and tests).
+pub fn known_slot(slot: Slot, parent_slot: Slot) -> Option<bool> {
+    match known_state(slot, parent_slot) {
+        Known::Known => Some(true),
+        Known::Skipped => Some(false),
+        Known::Absent => None,
+    }
+}
+
+/// Forget what the fast lane published about `slot` (tests).
+pub fn forget_slot_for_tests(slot: Slot) {
+    KNOWN_SLOTS[slot as usize % KNOWN_LEN].store(0, Ordering::Release);
+}
+
+fn note_followed(bank_id: BankId) {
+    FOLLOWED[bank_id as usize % FOLLOWED_LEN].store(bank_id + 1, Ordering::Release);
+}
+
+fn is_followed(bank_id: BankId) -> bool {
+    FOLLOWED[bank_id as usize % FOLLOWED_LEN].load(Ordering::Acquire) == bank_id + 1
+}
+
+/// Why replay's handlers waited for the fast lane's binding of an unbound bank.
+pub const BIND_WAIT_REASONS: [&str; 3] = ["run", "known", "parent"];
+/// How a bank's binding wait ended.
+pub const BIND_WAIT_OUTCOMES: [&str; 5] = ["bound", "timeout", "skipped", "not_live", "abandoned"];
+/// Why agave's replay executed a transaction on an unbound board (`agave_unbound`).
+/// `known` / `parent`: the fast lane knew the slot / ran the parent, but `bind_wait_on` does
+/// not wait on that; `no_wait`: `bind_wait_us = 0`; `unknown`: neither.
+pub const UNBOUND_CLASSES: [&str; 10] = [
+    "excluded",
+    "not_live",
+    "abandoned",
+    "unsupported",
+    "skipped",
+    "unknown",
+    "timeout",
+    "no_wait",
+    "known",
+    "parent",
+];
+const UNBOUND_EXCLUDED: usize = 0;
+const UNBOUND_NOT_LIVE: usize = 1;
+const UNBOUND_ABANDONED: usize = 2;
+const UNBOUND_UNSUPPORTED: usize = 3;
+const UNBOUND_SKIPPED: usize = 4;
+const UNBOUND_UNKNOWN: usize = 5;
+const UNBOUND_TIMEOUT: usize = 6;
+const UNBOUND_NO_WAIT: usize = 7;
+const UNBOUND_KNOWN: usize = 8;
+const UNBOUND_PARENT: usize = 9;
+
+/// One bank's binding wait (from the first waiting handler to the first one leaving).
+#[derive(Clone, Copy, Debug)]
+pub struct BindWait {
+    /// Index into [`BIND_WAIT_REASONS`].
+    pub reason: u8,
+    /// Index into [`BIND_WAIT_OUTCOMES`].
+    pub outcome: u8,
+    pub us: u32,
+}
+
+/// The binding waits recorded since the last call.
+pub fn take_bind_waits() -> Vec<BindWait> {
+    BIND_WAIT_LOG
+        .lock()
+        .map(|mut log| std::mem::take(&mut *log))
+        .unwrap_or_default()
 }
 
 fn is_expected(slot: Slot, parent_bank_id: Option<BankId>) -> bool {
@@ -614,6 +769,14 @@ pub struct Board {
     /// The fast lane runs this slot over this bank's parent: while unbound, agave waits
     /// (bounded) for the binding.
     fl_expected: AtomicBool,
+    /// Whether the fast lane can run this slot over the parent (`Bank::fast_lane_support`),
+    /// computed on first need: 0 unknown, 1 yes, 2 no.
+    fl_supported: AtomicU8,
+    /// The bank's binding wait: start (ns after `created`, 0 = none yet), its reason + 1, and
+    /// whether it was recorded. All handlers share one deadline per bank.
+    bind_wait_start_ns: AtomicU64,
+    bind_wait_reason: AtomicU8,
+    bind_wait_recorded: AtomicBool,
     state: AtomicU8,
     closed: AtomicBool,
     inflight: AtomicU32,
@@ -643,6 +806,10 @@ impl Board {
             sample_ppm,
             sample_mode: SAMPLE_MODE.load(Ordering::Relaxed),
             fl_expected: AtomicBool::new(is_expected(bank.slot(), parent_bank_id)),
+            fl_supported: AtomicU8::new(0),
+            bind_wait_start_ns: AtomicU64::new(0),
+            bind_wait_reason: AtomicU8::new(0),
+            bind_wait_recorded: AtomicBool::new(false),
             state: AtomicU8::new(UNBOUND),
             closed: AtomicBool::new(false),
             inflight: AtomicU32::new(0),
@@ -670,6 +837,10 @@ impl Board {
             sample_ppm,
             sample_mode: SAMPLE_HASH,
             fl_expected: AtomicBool::new(false),
+            fl_supported: AtomicU8::new(0),
+            bind_wait_start_ns: AtomicU64::new(0),
+            bind_wait_reason: AtomicU8::new(0),
+            bind_wait_recorded: AtomicBool::new(false),
             state: AtomicU8::new(UNBOUND),
             closed: AtomicBool::new(false),
             inflight: AtomicU32::new(0),
@@ -715,11 +886,117 @@ impl Board {
 
     /// The fast lane takes the bank on: agave's handlers wait for it on free cells.
     pub fn bind(&self) -> bool {
-        !self.closed.load(Ordering::SeqCst)
+        let bound = !self.closed.load(Ordering::SeqCst)
             && self
                 .state
                 .compare_exchange(UNBOUND, BOUND, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .is_ok();
+        if bound {
+            note_followed(self.bank_id);
+        }
+        bound
+    }
+
+    /// Whether the fast lane can run this slot over the bank's parent (as its ingest decides).
+    fn fl_supported(&self, bank: &Bank) -> bool {
+        match self.fl_supported.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let supported = bank
+                    .parent()
+                    .is_some_and(|parent| parent.fast_lane_support(self.slot).is_ok());
+                self.fl_supported
+                    .store(if supported { 1 } else { 2 }, Ordering::Relaxed);
+                supported
+            }
+        }
+    }
+
+    /// Why a handler should wait for the fast lane's binding of this unbound bank (index into
+    /// [`BIND_WAIT_REASONS`]), or why not (index into [`UNBOUND_CLASSES`]).
+    fn bind_wait_reason(&self, bank: &Bank) -> Result<u8, usize> {
+        if !fl_live() {
+            return Err(UNBOUND_NOT_LIVE);
+        }
+        if self.state.load(Ordering::Acquire) != UNBOUND {
+            return Err(UNBOUND_ABANDONED);
+        }
+        let known = known_state(self.slot, self.parent_slot);
+        if known == Known::Skipped {
+            return Err(UNBOUND_SKIPPED);
+        }
+        if self.fl_expected.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        let reason = match known {
+            Known::Known => 1,
+            Known::Absent if self.parent_bank_id.is_some_and(is_followed) => 2,
+            _ => return Err(UNBOUND_UNKNOWN),
+        };
+        if !self.fl_supported(bank) {
+            return Err(UNBOUND_UNSUPPORTED);
+        }
+        // Classified even when the setting does not wait on it (what a wider one would cover).
+        if reason > BIND_ON.load(Ordering::Relaxed) {
+            return Err(if reason == 1 { UNBOUND_KNOWN } else { UNBOUND_PARENT });
+        }
+        Ok(reason)
+    }
+
+    /// Whether the bank's binding wait (started now if not yet) is still open.
+    fn bind_wait_open(&self, bind_wait: Duration, reason: u8) -> bool {
+        if bind_wait.is_zero() {
+            return false;
+        }
+        let now = (self.created.elapsed().as_nanos() as u64).max(1);
+        // Spinning handlers only read the start (no read-modify-write per check).
+        let mut start = self.bind_wait_start_ns.load(Ordering::Acquire);
+        if start == 0 {
+            start = match self.bind_wait_start_ns.compare_exchange(
+                0,
+                now,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.bind_wait_reason.store(reason + 1, Ordering::Release);
+                    now
+                }
+                Err(start) => start,
+            };
+        }
+        now.saturating_sub(start) < bind_wait.as_nanos() as u64
+    }
+
+    /// The first handler leaving the bank's binding wait records it.
+    fn end_bind_wait(&self) {
+        let start = self.bind_wait_start_ns.load(Ordering::Acquire);
+        if start == 0
+            || self.bind_wait_recorded.load(Ordering::Acquire)
+            || self.bind_wait_recorded.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let us = ((self.created.elapsed().as_nanos() as u64).saturating_sub(start) / 1000)
+            .min(u64::from(u32::MAX)) as u32;
+        let outcome = if self.is_bound() {
+            0
+        } else if !fl_live() {
+            3
+        } else if self.state.load(Ordering::Acquire) != UNBOUND {
+            4
+        } else if known_state(self.slot, self.parent_slot) == Known::Skipped {
+            2
+        } else {
+            1
+        };
+        let reason = self.bind_wait_reason.load(Ordering::Acquire).saturating_sub(1);
+        if let Ok(mut log) = BIND_WAIT_LOG.lock() {
+            if log.len() < BIND_WAIT_LOG_MAX {
+                log.push(BindWait { reason, outcome, us });
+            }
+        }
     }
 
     pub fn is_bound(&self) -> bool {
@@ -935,6 +1212,10 @@ pub struct CommitStats {
     /// wait ran out (executed by agave).
     pub bind_waits: AtomicU64,
     pub bind_wait_timeouts: AtomicU64,
+    /// The same waits by reason ([`BIND_WAIT_REASONS`]).
+    pub bind_wait_txs: [AtomicU64; 3],
+    /// `agave_unbound` by class ([`UNBOUND_CLASSES`]).
+    pub unbound_why: [AtomicU64; 10],
 }
 
 pub static STATS: CommitStats = CommitStats {
@@ -958,6 +1239,8 @@ pub static STATS: CommitStats = CommitStats {
     agave_only_slots: AtomicU64::new(0),
     bind_waits: AtomicU64::new(0),
     bind_wait_timeouts: AtomicU64::new(0),
+    bind_wait_txs: [const { AtomicU64::new(0) }; 3],
+    unbound_why: [const { AtomicU64::new(0) }; 10],
 };
 
 /// Bytes held by board cells (reported by the fast lane as `mem_board_kb`).
@@ -1165,22 +1448,31 @@ pub fn follow(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> Follo
                 }
             }
             FREE => {
-                // The fast lane runs this slot and its binding is on its way: wait for it
-                // (bounded) rather than execute the transaction here.
-                if !agave_only_tx
-                    && !board.is_bound()
-                    && fl_live()
-                    && board.fl_expected.load(Ordering::Acquire)
-                    && board.state.load(Ordering::Acquire) == UNBOUND
-                    && start.elapsed() < bind_wait
-                {
-                    if !bind_waited {
-                        bind_waited = true;
-                        STATS.bind_waits.fetch_add(1, Ordering::Relaxed);
+                // The fast lane runs (or is about to run) this slot and its binding is on its
+                // way: wait for it (bounded per bank) rather than execute the transaction here.
+                let mut unbound_class = UNBOUND_EXCLUDED;
+                if !agave_only_tx {
+                    if !board.is_bound() {
+                        match board.bind_wait_reason(bank) {
+                            Ok(reason) if board.bind_wait_open(bind_wait, reason) => {
+                                if !bind_waited {
+                                    bind_waited = true;
+                                    STATS.bind_waits.fetch_add(1, Ordering::Relaxed);
+                                    STATS.bind_wait_txs[reason as usize]
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                waited = true;
+                                wait_step(start);
+                                continue;
+                            }
+                            Ok(_) if bind_wait.is_zero() => unbound_class = UNBOUND_NO_WAIT,
+                            Ok(_) => unbound_class = UNBOUND_TIMEOUT,
+                            Err(class) => unbound_class = class,
+                        }
                     }
-                    waited = true;
-                    wait_step(start);
-                    continue;
+                    if bind_waited {
+                        board.end_bind_wait();
+                    }
                 }
                 let fl_will_commit = !agave_only_tx
                     && fl_live()
@@ -1199,6 +1491,7 @@ pub fn follow(bank: &Bank, index: usize, tx: &impl TransactionWithMeta) -> Follo
                             STATS.agave_bound.fetch_add(1, Ordering::Relaxed);
                         } else {
                             STATS.agave_unbound.fetch_add(1, Ordering::Relaxed);
+                            STATS.unbound_why[unbound_class].fetch_add(1, Ordering::Relaxed);
                             if bind_waited {
                                 STATS.bind_wait_timeouts.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1425,6 +1718,93 @@ mod tests {
         assert!(board.decline(5));
         assert!(!board.decline(5));
         assert!(board.begin_commit(5).is_none());
+    }
+
+    /// When an unbound bank's handlers wait for the fast lane's binding (and why not).
+    #[test]
+    fn test_bind_wait_reasons() {
+        use crate::{bank::SlotLeader, genesis_utils::create_genesis_config};
+        let genesis = create_genesis_config(1_000_000_000).genesis_config;
+        let (parent, bank_forks) = Bank::new_for_tests(&genesis).wrap_with_bank_forks_for_tests();
+        parent.freeze();
+        let child = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            parent.clone(),
+            SlotLeader::default(),
+            1,
+        );
+        let board = Board::new(&child, 0);
+        set_fl_live(true);
+        set_bind_on(BIND_ON_KNOWN);
+        forget_slot_for_tests(1);
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_UNKNOWN));
+        // FL's ingest has the slot's input (same parent): wait.
+        fl_knows_slot(1, 0);
+        assert_eq!(known_slot(1, 0), Some(true));
+        assert_eq!(board.bind_wait_reason(&child), Ok(1));
+        // Another parent (another block version): no wait.
+        fl_knows_slot(1, 7);
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_UNKNOWN));
+        fl_knows_slot(1, 0);
+        // `run` waits only on a registered run (classified as what `known` would cover).
+        set_bind_on(BIND_ON_RUN);
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_KNOWN));
+        set_bind_on(BIND_ON_KNOWN);
+        // FL off: no wait.
+        set_fl_live(false);
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_NOT_LIVE));
+        set_fl_live(true);
+        // FL skipped the slot: no wait, even with its run registered.
+        board.fl_expected.store(true, Ordering::SeqCst);
+        assert_eq!(board.bind_wait_reason(&child), Ok(0));
+        fl_skips_slot(1);
+        assert_eq!(known_slot(1, 0), Some(false));
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_SKIPPED));
+        board.fl_expected.store(false, Ordering::SeqCst);
+        // FL follows the parent (it bound the parent's bank) and has not seen the slot.
+        forget_slot_for_tests(1);
+        let parent_board = Board::new_for_tests(0, parent.bank_id(), 0);
+        assert!(parent_board.bind());
+        assert_eq!(board.bind_wait_reason(&child), Err(UNBOUND_PARENT));
+        set_bind_on(BIND_ON_PARENT);
+        assert_eq!(board.bind_wait_reason(&child), Ok(2));
+        // A slot FL cannot run (epoch boundary): no wait.
+        let next_epoch = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            parent.clone(),
+            SlotLeader::default(),
+            40,
+        );
+        assert_ne!(next_epoch.epoch(), parent.epoch());
+        let far = Board::new(&next_epoch, 0);
+        fl_knows_slot(40, 0);
+        assert_eq!(far.bind_wait_reason(&next_epoch), Err(UNBOUND_UNSUPPORTED));
+        set_bind_on(BIND_ON_KNOWN);
+
+        // One deadline per bank, shared by its handlers; the first leaving records the wait.
+        let _ = take_bind_waits();
+        let wait = Duration::from_millis(30);
+        assert!(!board.bind_wait_open(Duration::ZERO, 1), "bind_wait_us = 0: never");
+        assert!(board.bind_wait_open(wait, 1));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(board.bind_wait_open(wait, 1), "still open (shared start)");
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!board.bind_wait_open(wait, 1), "closed for every handler");
+        board.end_bind_wait();
+        board.end_bind_wait();
+        let waits = take_bind_waits();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert_eq!((waits[0].reason, waits[0].outcome), (1, 1), "known, timed out");
+        assert!(waits[0].us >= 30_000, "{waits:?}");
+        let bound = Board::new(&child, 0);
+        assert!(bound.bind_wait_open(wait, 2));
+        assert!(bound.bind());
+        bound.end_bind_wait();
+        let waits = take_bind_waits();
+        assert_eq!((waits[0].reason, waits[0].outcome), (2, 0), "parent, bound");
+        set_fl_live(false);
+        forget_slot_for_tests(1);
+        forget_slot_for_tests(40);
     }
 
     #[test]

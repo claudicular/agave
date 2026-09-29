@@ -625,6 +625,7 @@ fn wait_fl_settled(fl: &Fl, board: &fast_lane_commit::Board, n: u64) {
 
 fn reset(mode: u8, ppm: u32, follow_wait_ms: u64) {
     fast_lane_commit::set_sample_mode(fast_lane_commit::SAMPLE_HASH);
+    fast_lane_commit::set_bind_on(fast_lane_commit::BIND_ON_KNOWN);
     control::set_commit_on_workers(false);
     fast_lane_commit::set_bind_wait(Duration::from_millis(2));
     control::unpoison_for_tests();
@@ -843,6 +844,74 @@ fn test_execute_once() {
     fl.stop();
     let got = finish(&w, bank);
     assert_same("bind wait", &reference, &got);
+
+    // 3e. FL's ingest has the slot's input but no run yet when agave inserts bank N and
+    //     starts replaying it (`bind_wait_on = known`): agave waits for the run's binding
+    //     instead of executing (only the loader transactions FL never commits run unbound).
+    reset(control::COMMIT_ON, 0, 100);
+    fast_lane_commit::set_bind_wait(Duration::from_millis(2_000));
+    let unbound_why: Vec<u64> = STATS.unbound_why.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+    let _ = fast_lane_commit::take_bind_waits();
+    // (3d's run registration outlives its stopped test FL: drop it, as its committer would.)
+    fast_lane_commit::unexpect_fl_run(SLOT);
+    fast_lane_commit::fl_knows_slot(SLOT, 1);
+    let bank = new_bank(&w);
+    let board = fast_lane_commit::board_of(bank.bank_id()).unwrap();
+    let fl = thread::scope(|scope| {
+        let starter = scope.spawn(|| {
+            thread::sleep(Duration::from_millis(30));
+            start_fl(&w, 33, &txs, 4)
+        });
+        replay(&bank, &txs).unwrap();
+        starter.join().unwrap()
+    });
+    assert_eq!(u64::from(board.fl_committed()) + u64::from(board.agave_executed()), n);
+    assert!(board.fl_committed() > 0, "FL committed after agave waited for it");
+    let classes: Vec<(&str, u64)> = fast_lane_commit::UNBOUND_CLASSES
+        .iter()
+        .zip(STATS.unbound_why.iter().zip(&unbound_why))
+        .map(|(name, (now, before))| (*name, now.load(Ordering::SeqCst) - before))
+        .filter(|(_, d)| *d > 0)
+        .collect();
+    assert!(
+        classes.iter().all(|(name, _)| *name == "excluded"),
+        "only excluded transactions ran unbound: {classes:?}"
+    );
+    let waits = fast_lane_commit::take_bind_waits();
+    assert!(
+        waits.iter().any(|w| (w.reason, w.outcome) == (1, 0) && w.us >= 10_000),
+        "a known-slot wait ended with the binding: {waits:?}"
+    );
+    fast_lane_commit::close_bank(&bank).unwrap();
+    fl.stop();
+    let got = finish(&w, bank);
+    assert_same("known-slot bind wait", &reference, &got);
+    eprintln!(
+        "known-slot bind wait: {waits:?}, {} committed by FL, unbound {classes:?}",
+        board.fl_committed()
+    );
+
+    // 3f. FL skipped the slot: agave's replay does not wait at all.
+    reset(control::COMMIT_ON, 0, 100);
+    fast_lane_commit::set_bind_wait(Duration::from_millis(5_000));
+    let unbound = STATS.agave_unbound.load(Ordering::SeqCst);
+    let skipped = STATS.unbound_why[4].load(Ordering::SeqCst);
+    let excluded = STATS.unbound_why[0].load(Ordering::SeqCst);
+    fast_lane_commit::fl_knows_slot(SLOT, 1);
+    fast_lane_commit::fl_skips_slot(SLOT);
+    let bank = new_bank(&w);
+    let t0 = Instant::now();
+    replay(&bank, &txs).unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(4), "no wait for a skipped slot");
+    assert_eq!(STATS.agave_unbound.load(Ordering::SeqCst) - unbound, n);
+    let skipped = STATS.unbound_why[4].load(Ordering::SeqCst) - skipped;
+    let excluded = STATS.unbound_why[0].load(Ordering::SeqCst) - excluded;
+    assert!(skipped > 0 && excluded > 0, "{skipped} / {excluded}");
+    assert_eq!(skipped + excluded, n, "classified as skipped (loader transactions: excluded)");
+    fast_lane_commit::forget_slot_for_tests(SLOT);
+    fast_lane_commit::close_bank(&bank).unwrap();
+    let got = finish(&w, bank);
+    assert_same("skipped slot", &reference, &got);
 
     // 4. FL poisoned mid-slot: FL has committed part of the block; agave executes the rest
     //    at once (no waiting), and the bank is still exact (FL's commits were valid).

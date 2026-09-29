@@ -86,6 +86,8 @@ struct SlotIngest {
     done_run: Option<Arc<Run>>,
     /// A chained run waiting for its parent's freeze.
     chain_run: Option<(RunId, Arc<Run>)>,
+    /// Published to agave's replay as known (see `fast_lane_commit::fl_knows_slot`).
+    known_noted: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -298,10 +300,16 @@ impl Ingest {
     }
 
     fn skip(&mut self, slot: Slot, reason: &'static str) {
+        if self
+            .slots
+            .get(&slot)
+            .is_some_and(|state| matches!(state.status, SlotStatus::Skipped(_)))
+        {
+            return;
+        }
+        // Agave's replay executes a bank of it at once (no binding will come).
+        solana_runtime::fast_lane_commit::fl_skips_slot(slot);
         if let Some(state) = self.slots.get_mut(&slot) {
-            if matches!(state.status, SlotStatus::Skipped(_)) {
-                return;
-            }
             state.chain_run = None;
             state.done_run = None;
             if state.status == SlotStatus::Complete {
@@ -347,6 +355,7 @@ impl Ingest {
                 let _ = self.coord_tx.send(CoordMsg::AbortRun { run_id, reason });
             }
             if !matches!(state.status, SlotStatus::Skipped(_)) {
+                solana_runtime::fast_lane_commit::fl_skips_slot(slot);
                 *self.stats.slots_skipped.entry(reason).or_default() += 1;
                 let _ = self.cmp_tx.try_send(CmpMsg::SlotSkipped { slot, reason });
             }
@@ -516,6 +525,9 @@ impl Ingest {
             .collect();
         for slot in old {
             if let Some(state) = self.slots.remove(&slot) {
+                if state.run_id.is_none() && !matches!(state.status, SlotStatus::Skipped(_)) {
+                    solana_runtime::fast_lane_commit::fl_skips_slot(slot);
+                }
                 if let Some((run_id, _)) = state.run {
                     if state.status != SlotStatus::Complete {
                         let _ = self.coord_tx.send(CoordMsg::AbortRun {
@@ -628,12 +640,22 @@ impl Ingest {
                     last_entry_hash: None,
                     done_run: None,
                     chain_run: None,
+                    known_noted: false,
                 },
             );
         }
         let state = self.slots.get_mut(&slot)?;
         if state.parent.is_none() {
             state.parent = parent;
+        }
+        // Agave's replay may insert bank N and reach its first transactions before this run
+        // exists: tell it the fast lane has the slot's input, so it waits for the binding
+        // (bounded) instead of executing them itself.
+        if !state.known_noted && !matches!(state.status, SlotStatus::Skipped(_)) {
+            if let Some(parent) = state.parent {
+                state.known_noted = true;
+                solana_runtime::fast_lane_commit::fl_knows_slot(slot, parent);
+            }
         }
         match state.status {
             // A complete slot still accepts pieces for the cross-check (nothing is released).
@@ -1216,9 +1238,15 @@ mod tests {
         /// The genesis validator (a leader whose vote account is staked).
         leader: SlotLeader,
         mint_keypair: Keypair,
+        /// Tests using slot 2 run one at a time (the published known/skipped slots are global).
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn fixture() -> Fixture {
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        solana_runtime::fast_lane_commit::forget_slot_for_tests(2);
         let GenesisConfigInfo {
             genesis_config,
             mint_keypair,
@@ -1303,6 +1331,7 @@ mod tests {
                 vote_address: voting_keypair.pubkey(),
             },
             mint_keypair,
+            _serial: serial,
         }
     }
 
@@ -1459,6 +1488,7 @@ mod tests {
         config.ring_blockstore_check = true;
         let (mut ingest, _coord_rx, cmp_rx) = ingest(&f, config);
         ingest.poll_ring();
+        assert_eq!(solana_runtime::fast_lane_commit::known_slot(2, 1), None);
         // The ring claims batch 0 holds batch 1's entries.
         let (_, s0, e0) = &f.batches[0];
         let (b1, _, _) = &f.batches[1];
@@ -1476,6 +1506,8 @@ mod tests {
             &wincode::serialize(b1).unwrap(),
         );
         ingest.poll_ring();
+        // First sight of slot 2 (parent 1): published to agave's replay as known.
+        assert_eq!(solana_runtime::fast_lane_commit::known_slot(2, 1), Some(true));
         ingest.on_tap(tap(vec![sets(&f)[0].clone()]));
         assert!(cmp_rx.try_iter().any(|m| matches!(
             m,
@@ -1484,6 +1516,8 @@ mod tests {
                 ..
             }
         )));
+        // Skipped: agave's replay executes a bank of it at once.
+        assert_eq!(solana_runtime::fast_lane_commit::known_slot(2, 1), Some(false));
     }
 
     #[test]

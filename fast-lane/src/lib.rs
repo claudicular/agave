@@ -359,6 +359,7 @@ fn start_threads(
     solana_runtime::fast_lane_commit::set_follow_spin(Duration::from_micros(config.follow_spin_us));
     solana_runtime::fast_lane_commit::set_sample_mode(config.sample_mode);
     solana_runtime::fast_lane_commit::set_bind_wait(Duration::from_micros(config.bind_wait_us));
+    solana_runtime::fast_lane_commit::set_bind_on(config.bind_wait_on);
     control::set_commit_on_workers(config.commit_on_workers);
     control::set_commit_csv_ppm(config.commit_csv_ppm);
     control::set_commit_spin_us(config.commit_spin_us);

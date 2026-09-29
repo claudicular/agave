@@ -903,8 +903,13 @@ impl Committer {
             .filter_map(|(_, p, _)| p.as_deref().map(pending_bytes))
             .sum();
         mem::COMMIT_PENDING_BYTES.sub(decline_bytes);
-        // The committer no longer binds this run: nobody should wait for it.
-        fast_lane_commit::unexpect_fl_run(cr.run.slot);
+        // The committer no longer binds this run: nobody should wait for it (and a bank of
+        // the slot it never bound is agave's alone).
+        if cr.board.is_some() {
+            fast_lane_commit::unexpect_fl_run(cr.run.slot);
+        } else {
+            fast_lane_commit::fl_skips_slot(cr.run.slot);
+        }
         if let Some(board) = &cr.board {
             if abandon {
                 board.abandon();
@@ -1113,11 +1118,101 @@ fn take(v: &Mutex<Vec<u32>>) -> Vec<u32> {
 /// The interval's commit report (fast_lane_commit log line and datapoint).
 pub struct CommitReport {
     prev: [u64; 22],
+    prev_wait_txs: [u64; 3],
+    prev_unbound: [u64; 10],
 }
 
 impl Default for CommitReport {
     fn default() -> Self {
-        Self { prev: [0; 22] }
+        Self {
+            prev: [0; 22],
+            prev_wait_txs: [0; 3],
+            prev_unbound: [0; 10],
+        }
+    }
+}
+
+/// Deltas of a cumulative counter array since `prev` (updated), as non-zero (name, n) pairs.
+fn named_deltas<const N: usize>(
+    names: &[&'static str; N],
+    now: &[AtomicU64; N],
+    prev: &mut [u64; N],
+) -> Vec<(&'static str, u64)> {
+    let mut out = Vec::new();
+    for i in 0..N {
+        let v = now[i].load(Ordering::Relaxed);
+        let d = v.saturating_sub(prev[i]);
+        prev[i] = v;
+        if d > 0 {
+            out.push((names[i], d));
+        }
+    }
+    out
+}
+
+fn unbound_class(classes: &[(&'static str, u64)], name: &str) -> i64 {
+    classes
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(0, |(_, c)| *c as i64)
+}
+
+/// The interval's per-bank binding waits: count, outcomes and µs percentiles per reason.
+struct BindWaitReport {
+    boards: Vec<(&'static str, u64)>,
+    outcomes: Vec<(String, u64)>,
+    /// (reason, p50, p90, max) µs.
+    us: Vec<(&'static str, u32, u32, u32)>,
+    known: (u64, u32, u32, u32, u64),
+    parent: (u64, u32, u32, u32, u64),
+}
+
+impl BindWaitReport {
+    fn new(waits: Vec<fast_lane_commit::BindWait>) -> Self {
+        let reasons = fast_lane_commit::BIND_WAIT_REASONS;
+        let outcomes_names = fast_lane_commit::BIND_WAIT_OUTCOMES;
+        let mut boards = Vec::new();
+        let mut outcomes = Vec::new();
+        let mut us = Vec::new();
+        let per = |reason: usize| {
+            let mut v: Vec<u32> = waits
+                .iter()
+                .filter(|w| w.reason as usize == reason)
+                .map(|w| w.us)
+                .collect();
+            let timeouts = waits
+                .iter()
+                .filter(|w| w.reason as usize == reason && w.outcome == 1)
+                .count() as u64;
+            let n = v.len() as u64;
+            let max = v.iter().max().copied().unwrap_or(0);
+            (n, pct(&mut v, 0.5), pct(&mut v, 0.9), max, timeouts)
+        };
+        let known = per(1);
+        let parent = per(2);
+        for (i, name) in reasons.iter().enumerate() {
+            let (n, p50, p90, max, _) = per(i);
+            if n > 0 {
+                boards.push((*name, n));
+                us.push((*name, p50, p90, max));
+            }
+            for (o, oname) in outcomes_names.iter().enumerate() {
+                let c = waits
+                    .iter()
+                    .filter(|w| w.reason as usize == i && w.outcome as usize == o)
+                    .count() as u64;
+                if c > 0 {
+                    outcomes.push((format!("{name}:{oname}"), c));
+                }
+            }
+        }
+        Self {
+            boards,
+            outcomes,
+            us,
+            known,
+            parent,
+        }
     }
 }
 
@@ -1190,6 +1285,17 @@ impl CommitReport {
         let picked = metrics.samples_picked.swap(0, Ordering::Relaxed);
         let on_workers = metrics.on_workers.swap(0, Ordering::Relaxed);
         let follow_wait_avg = if d[10] > 0 { d[11] / d[10] } else { 0 };
+        let wait_txs = named_deltas(
+            &fast_lane_commit::BIND_WAIT_REASONS,
+            &s.bind_wait_txs,
+            &mut self.prev_wait_txs,
+        );
+        let unbound_why = named_deltas(
+            &fast_lane_commit::UNBOUND_CLASSES,
+            &s.unbound_why,
+            &mut self.prev_unbound,
+        );
+        let bw = BindWaitReport::new(fast_lane_commit::take_bind_waits());
         let line = format!(
             "fast_lane_commit secs={secs:.1} mode={} on={} sample_mode={} committed={} \
              committed_err={} on_workers={on_workers} agave_bound={} agave_unbound={} \
@@ -1199,7 +1305,9 @@ impl CommitReport {
              p99={} commit_service_us_p50={} p90={} p99={} blocker={blockers:?} \
              wait_ms={wait_ms:?} readers_ms={readers_ms} bank_ms={bank_ms} queue_ms={queue_ms} \
              service_ms={service_ms} bank_waits={} bank_wait_us_p50={} p90={} max={} \
-             bind_waits={} bind_wait_timeouts={} runs_bound={} runs_unbound={} follow_waits={} \
+             bind_waits={} bind_wait_timeouts={} bind_wait_on={} bind_wait_txs={wait_txs:?} \
+             bind_wait_banks={:?} bind_wait_outcomes={:?} bind_wait_us={:?} \
+             agave_unbound_why={unbound_why:?} runs_bound={} runs_unbound={} follow_waits={} \
              follow_wait_us_avg={follow_wait_avg} follow_timeouts={} follow_done={} \
              identity_mismatch={} replay_required={} samples={} samples_picked={picked} \
              sample_mismatch={} sample_timeouts={} unverified={} agave_only_slots={} \
@@ -1240,6 +1348,10 @@ impl CommitReport {
             wait.iter().max().copied().unwrap_or(0),
             d[20],
             d[21],
+            crate::config::bind_wait_on_name(fast_lane_commit::bind_on()),
+            bw.boards,
+            bw.outcomes,
+            bw.us,
             d[5],
             d[6],
             d[10],
@@ -1269,6 +1381,16 @@ impl CommitReport {
             ("queue_us_p90", i64::from(pct(&mut queue, 0.9)), i64),
             ("bank_wait_us_p90", i64::from(pct(&mut wait, 0.9)), i64),
             ("bind_wait_timeouts", d[21] as i64, i64),
+            ("known_waits", bw.known.0 as i64, i64),
+            ("known_wait_us_p50", i64::from(bw.known.1), i64),
+            ("known_wait_us_p90", i64::from(bw.known.2), i64),
+            ("known_wait_us_max", i64::from(bw.known.3), i64),
+            ("known_wait_timeouts", bw.known.4 as i64, i64),
+            ("parent_waits", bw.parent.0 as i64, i64),
+            ("parent_wait_us_p90", i64::from(bw.parent.2), i64),
+            ("parent_wait_timeouts", bw.parent.4 as i64, i64),
+            ("unbound_unknown", unbound_class(&unbound_why, "unknown"), i64),
+            ("unbound_timeout", unbound_class(&unbound_why, "timeout"), i64),
             ("follow_timeouts", d[9] as i64, i64),
             ("identity_mismatch", d[13] as i64, i64),
             ("replay_required", d[14] as i64, i64),
@@ -1282,7 +1404,7 @@ impl CommitReport {
 pub fn log_start(config: &crate::config::Config) {
     info!(
         "fast lane: commit threads {} (cores {:?}), commit_on {}, verify_sample_ppm {}, \
-         sample_mode {}, follow_wait_ms {}, follow_spin_us {}, bind_wait_us {}",
+         sample_mode {}, follow_wait_ms {}, follow_spin_us {}, bind_wait_us {}, bind_wait_on {}",
         config.commit_threads,
         config.commit_cores,
         if config.commit_on_workers { "workers" } else { "threads" },
@@ -1291,5 +1413,6 @@ pub fn log_start(config: &crate::config::Config) {
         config.follow_wait_ms,
         config.follow_spin_us,
         config.bind_wait_us,
+        crate::config::bind_wait_on_name(config.bind_wait_on),
     );
 }

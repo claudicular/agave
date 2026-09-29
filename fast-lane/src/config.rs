@@ -151,6 +151,12 @@ pub struct Config {
     /// Parts per million of committed transactions written to `fl_commit.*.csv`. Runtime
     /// toggle `commit_csv_ppm=N`.
     pub commit_csv_ppm: u32,
+    /// When a replay handler of an unbound bank waits (≤ `bind_wait_us` per bank) for FL's
+    /// binding: `run` (FL registered its run of the slot), `known` (also: FL's ingest has the
+    /// slot's input) or `parent` (also: FL ran the bank's parent and has not seen the slot's
+    /// input yet). Never for a slot FL skipped or cannot run. Runtime toggle
+    /// `bind_wait_on=run|known|parent`.
+    pub bind_wait_on: u8,
 }
 
 impl Default for Config {
@@ -205,6 +211,7 @@ impl Default for Config {
             commit_on_workers: false,
             sample_mode: solana_runtime::fast_lane_commit::SAMPLE_FL,
             bind_wait_us: 2_000,
+            bind_wait_on: solana_runtime::fast_lane_commit::BIND_ON_KNOWN,
             commit_csv_ppm: 100_000,
         }
     }
@@ -387,6 +394,10 @@ impl Config {
                 }
             }
             "bind_wait_us" => self.bind_wait_us = parse_scalar(key, value)?,
+            "bind_wait_on" => {
+                self.bind_wait_on = parse_bind_wait_on(value)
+                    .ok_or_else(|| ConfigError(format!("bad bind_wait_on {value}")))?
+            }
             "commit_csv_ppm" => self.commit_csv_ppm = parse_scalar(key, value)?,
             _ => return Err(ConfigError(format!("unknown key {key}"))),
         }
@@ -449,6 +460,25 @@ impl Config {
         let text = std::fs::read_to_string(&path)
             .map_err(|err| ConfigError(format!("reading {path}: {err}")))?;
         Self::parse(&text).map(Some)
+    }
+}
+
+/// `bind_wait_on` value (config key and control command).
+pub fn parse_bind_wait_on(value: &str) -> Option<u8> {
+    use solana_runtime::fast_lane_commit as flc;
+    match value {
+        "run" => Some(flc::BIND_ON_RUN),
+        "known" => Some(flc::BIND_ON_KNOWN),
+        "parent" => Some(flc::BIND_ON_PARENT),
+        _ => None,
+    }
+}
+
+pub fn bind_wait_on_name(on: u8) -> &'static str {
+    match on {
+        solana_runtime::fast_lane_commit::BIND_ON_RUN => "run",
+        solana_runtime::fast_lane_commit::BIND_ON_KNOWN => "known",
+        _ => "parent",
     }
 }
 
@@ -581,6 +611,27 @@ mod tests {
         assert!(Config::parse("commit_on = both").is_err());
         assert!(Config::parse("sample_mode = random").is_err());
         assert!(Config::parse("bind_wait_us = 100001").is_err());
+    }
+
+    /// The staged FRA config for the bind-wait build (`fast_lane.bind_wait.toml`).
+    #[test]
+    fn test_parse_fra_bind_wait_config() {
+        use solana_runtime::fast_lane_commit::{BIND_ON_KNOWN, BIND_ON_PARENT, BIND_ON_RUN};
+        let config = Config::parse(include_str!("fra_bind_wait.toml")).unwrap();
+        assert_eq!(config.commit, crate::control::COMMIT_ON);
+        assert_eq!(config.bind_wait_on, BIND_ON_KNOWN);
+        assert_eq!(config.bind_wait_us, 2000);
+        assert_eq!(Config::default().bind_wait_on, BIND_ON_KNOWN);
+        for (value, on) in [
+            ("run", BIND_ON_RUN),
+            ("known", BIND_ON_KNOWN),
+            ("parent", BIND_ON_PARENT),
+        ] {
+            let config = Config::parse(&format!("bind_wait_on = {value}")).unwrap();
+            assert_eq!(config.bind_wait_on, on);
+            assert_eq!(bind_wait_on_name(on), value);
+        }
+        assert!(Config::parse("bind_wait_on = always").is_err());
     }
 
     const FRA_REBASE_TOML: &str = r#"
