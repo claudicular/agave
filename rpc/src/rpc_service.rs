@@ -132,6 +132,7 @@ struct RpcRequestMiddleware {
     snapshot_config: Option<SnapshotConfig>,
     bank_forks: Arc<RwLock<BankForks>>,
     health: Arc<RpcHealth>,
+    disable_account_scans: bool,
 }
 
 impl RpcRequestMiddleware {
@@ -140,6 +141,7 @@ impl RpcRequestMiddleware {
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
         health: Arc<RpcHealth>,
+        disable_account_scans: bool,
     ) -> Self {
         Self {
             ledger_path,
@@ -154,6 +156,7 @@ impl RpcRequestMiddleware {
             snapshot_config,
             bank_forks,
             health,
+            disable_account_scans,
         }
     }
 
@@ -394,7 +397,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
         }
 
         if let Some(path) = match_supply_path(request.uri().path()) {
-            process_rest(self.bank_forks.clone(), path)
+            process_rest(self.bank_forks.clone(), path, self.disable_account_scans)
         } else if self.is_file_get_path(request.uri().path()) {
             self.process_file_get(request.uri().path())
         } else if request.uri().path() == "/health" {
@@ -433,8 +436,14 @@ async fn calculate_circulating_supply_async(bank: &Arc<Bank>) -> Result<u64, Sup
     Ok(total_supply.saturating_sub(non_circulating_supply.lamports))
 }
 
-async fn handle_rest(bank_forks: &RwLock<BankForks>, path: &str) -> Option<String> {
+async fn handle_rest(
+    bank_forks: &RwLock<BankForks>,
+    path: &str,
+    disable_account_scans: bool,
+) -> Option<String> {
     match path {
+        // Non-circulating supply is an accounts scan, see `JsonRpcConfig::disable_account_scans`
+        "/v0/circulating-supply" if disable_account_scans => None,
         "/v0/circulating-supply" => {
             let bank = bank_forks.read().unwrap().root_bank();
             let supply_result = calculate_circulating_supply_async(&bank).await;
@@ -452,13 +461,17 @@ async fn handle_rest(bank_forks: &RwLock<BankForks>, path: &str) -> Option<Strin
     }
 }
 
-fn process_rest(bank_forks: Arc<RwLock<BankForks>>, path: &str) -> RequestMiddlewareAction {
+fn process_rest(
+    bank_forks: Arc<RwLock<BankForks>>,
+    path: &str,
+    disable_account_scans: bool,
+) -> RequestMiddlewareAction {
     let path = path.to_string();
 
     RequestMiddlewareAction::Respond {
         should_validate_hosts: true,
         response: Box::pin(async move {
-            let result = handle_rest(&bank_forks, path.as_str()).await;
+            let result = handle_rest(&bank_forks, path.as_str(), disable_account_scans).await;
             match result {
                 Some(s) => Ok(hyper::Response::builder()
                     .status(hyper::StatusCode::OK)
@@ -671,6 +684,7 @@ impl JsonRpcService {
             };
 
         let full_api = config.full_api;
+        let disable_account_scans = config.disable_account_scans;
         let max_request_body_size = config
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
@@ -728,6 +742,7 @@ impl JsonRpcService {
                     snapshot_config,
                     bank_forks,
                     health.clone(),
+                    disable_account_scans,
                 );
                 let server = ServerBuilder::with_meta_extractor(
                     io,
@@ -958,18 +973,29 @@ mod tests {
         runtime.block_on(async {
             assert_eq!(
                 None,
-                handle_rest(&bank_forks, "not-a-supported-rest-api").await
+                handle_rest(&bank_forks, "not-a-supported-rest-api", false).await
             );
 
-            let circulating_supply = handle_rest(&bank_forks, "/v0/circulating-supply").await;
+            let circulating_supply =
+                handle_rest(&bank_forks, "/v0/circulating-supply", false).await;
             assert!(circulating_supply.is_some());
 
-            let total_supply = handle_rest(&bank_forks, "/v0/total-supply").await;
+            let total_supply = handle_rest(&bank_forks, "/v0/total-supply", false).await;
             assert!(total_supply.is_some());
 
             assert_eq!(
-                handle_rest(&bank_forks, "/v0/circulating-supply").await,
-                handle_rest(&bank_forks, "/v0/total-supply").await
+                handle_rest(&bank_forks, "/v0/circulating-supply", false).await,
+                handle_rest(&bank_forks, "/v0/total-supply", false).await
+            );
+
+            // With account scans disabled only the scanning endpoint is refused.
+            assert_eq!(
+                None,
+                handle_rest(&bank_forks, "/v0/circulating-supply", true).await
+            );
+            assert_eq!(
+                total_supply,
+                handle_rest(&bank_forks, "/v0/total-supply", true).await
             );
         });
     }
@@ -1018,12 +1044,14 @@ mod tests {
             None,
             bank_forks.clone(),
             health.clone(),
+            false,
         );
         let rrm_with_snapshot_config = RpcRequestMiddleware::new(
             ledger_path.path().to_path_buf(),
             Some(SnapshotConfig::default()),
             bank_forks,
             health,
+            false,
         );
 
         assert!(rrm.is_file_get_path(DEFAULT_GENESIS_DOWNLOAD_PATH));
@@ -1144,6 +1172,7 @@ mod tests {
             None,
             bank_forks,
             RpcHealth::stub(optimistically_confirmed_bank, blockstore),
+            false,
         );
 
         // File does not exist => request should fail.
