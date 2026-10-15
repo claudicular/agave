@@ -30,6 +30,7 @@ pub const JSON_RPC_SERVER_ERROR_SLOT_NOT_EPOCH_BOUNDARY: i64 = -32018;
 pub const JSON_RPC_SERVER_ERROR_LONG_TERM_STORAGE_UNREACHABLE: i64 = -32019;
 pub const JSON_RPC_SERVER_ERROR_FILTER_TRANSACTION_NOT_FOUND: i64 = -32020;
 pub const JSON_RPC_SERVER_ERROR_NO_SLOT_HISTORY: i64 = -32021;
+pub const JSON_RPC_SERVER_ERROR_ACCOUNT_SCANS_DISABLED: i64 = -32090;
 
 #[derive(Error, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -86,6 +87,8 @@ pub enum RpcCustomError {
     FilterTransactionNotFound { signature: String },
     #[error("NoSlotHistory")]
     NoSlotHistory,
+    #[error("AccountScansDisabled")]
+    AccountScansDisabled { method: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,6 +197,14 @@ impl From<RpcCustomError> for Error {
                 message: format!(
                     "{index_key} excluded from account secondary indexes; this RPC method \
                      unavailable for key"
+                ),
+                data: None,
+            },
+            RpcCustomError::AccountScansDisabled { method } => Self {
+                code: ErrorCode::ServerError(JSON_RPC_SERVER_ERROR_ACCOUNT_SCANS_DISABLED),
+                message: format!(
+                    "{method} is disabled on this node: accounts scans block accounts cleanup. \
+                     Use an RPC provider with account indexes"
                 ),
                 data: None,
             },

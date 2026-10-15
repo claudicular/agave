@@ -179,6 +179,11 @@ pub struct JsonRpcConfig {
     pub scan_results_limit_bytes: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
+    /// Reject the accounts-scan RPC methods (`rpc_accounts_scan`) and the
+    /// `/v0/circulating-supply` REST endpoint. Each scan pins its root in the
+    /// scan tracker, and clean cannot advance past a pinned root, so a single
+    /// slow or stuck scan stops accounts cleanup for the whole node.
+    pub disable_account_scans: bool,
 }
 
 impl Default for JsonRpcConfig {
@@ -200,6 +205,7 @@ impl Default for JsonRpcConfig {
             max_request_body_size: Option::default(),
             scan_results_limit_bytes: Option::default(),
             disable_health_check: Default::default(),
+            disable_account_scans: Default::default(),
         }
     }
 }
@@ -401,6 +407,17 @@ impl JsonRpcRequestProcessor {
 
     fn genesis_creation_time(&self) -> UnixTimestamp {
         self.bank(None).genesis_creation_time()
+    }
+
+    fn check_account_scans_enabled(&self, method: &str) -> Result<()> {
+        if self.config.disable_account_scans {
+            Err(RpcCustomError::AccountScansDisabled {
+                method: method.to_string(),
+            }
+            .into())
+        } else {
+            Ok(())
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3455,6 +3472,7 @@ pub mod rpc_accounts_scan {
         ) -> BoxFuture<Result<OptionalContext<Vec<RpcKeyedAccount>>>> {
             debug!("get_program_accounts rpc request received: {program_id_str:?}");
             async move {
+                meta.check_account_scans_enabled("getProgramAccounts")?;
                 let program_id = verify_pubkey(&program_id_str)?;
                 let (config, filters, with_context, sort_results) = if let Some(config) = config {
                     (
@@ -3479,7 +3497,11 @@ pub mod rpc_accounts_scan {
             config: Option<RpcLargestAccountsConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<RpcAccountBalance>>>> {
             debug!("get_largest_accounts rpc request received");
-            async move { Ok(meta.get_largest_accounts(config).await?) }.boxed()
+            async move {
+                meta.check_account_scans_enabled("getLargestAccounts")?;
+                Ok(meta.get_largest_accounts(config).await?)
+            }
+            .boxed()
         }
 
         fn get_supply(
@@ -3488,7 +3510,11 @@ pub mod rpc_accounts_scan {
             config: Option<RpcSupplyConfig>,
         ) -> BoxFuture<Result<RpcResponse<RpcSupply>>> {
             debug!("get_supply rpc request received");
-            async move { Ok(meta.get_supply(config).await?) }.boxed()
+            async move {
+                meta.check_account_scans_enabled("getSupply")?;
+                Ok(meta.get_supply(config).await?)
+            }
+            .boxed()
         }
 
         fn get_token_largest_accounts(
@@ -3499,6 +3525,7 @@ pub mod rpc_accounts_scan {
         ) -> BoxFuture<Result<RpcResponse<Vec<RpcTokenAccountBalance>>>> {
             debug!("get_token_largest_accounts rpc request received: {mint_str:?}");
             async move {
+                meta.check_account_scans_enabled("getTokenLargestAccounts")?;
                 let mint = verify_pubkey(&mint_str)?;
                 meta.get_token_largest_accounts(mint, commitment).await
             }
@@ -3514,6 +3541,7 @@ pub mod rpc_accounts_scan {
         ) -> BoxFuture<Result<RpcResponse<Vec<RpcKeyedAccount>>>> {
             debug!("get_token_accounts_by_owner rpc request received: {owner_str:?}");
             async move {
+                meta.check_account_scans_enabled("getTokenAccountsByOwner")?;
                 let owner = verify_pubkey(&owner_str)?;
                 let token_account_filter = verify_token_account_filter(token_account_filter)?;
                 meta.get_token_accounts_by_owner(owner, token_account_filter, config, true)
@@ -3531,6 +3559,7 @@ pub mod rpc_accounts_scan {
         ) -> BoxFuture<Result<RpcResponse<Vec<RpcKeyedAccount>>>> {
             debug!("get_token_accounts_by_delegate rpc request received: {delegate_str:?}");
             async move {
+                meta.check_account_scans_enabled("getTokenAccountsByDelegate")?;
                 let delegate = verify_pubkey(&delegate_str)?;
                 let token_account_filter = verify_token_account_filter(token_account_filter)?;
                 meta.get_token_accounts_by_delegate(delegate, token_account_filter, config, true)
@@ -4646,6 +4675,7 @@ pub mod tests {
         },
         solana_rpc_client_api::{
             custom_error::{
+                JSON_RPC_SERVER_ERROR_ACCOUNT_SCANS_DISABLED,
                 JSON_RPC_SERVER_ERROR_BLOCK_NOT_AVAILABLE,
                 JSON_RPC_SERVER_ERROR_TRANSACTION_HISTORY_NOT_AVAILABLE,
                 JSON_RPC_SERVER_ERROR_UNSUPPORTED_TRANSACTION_VERSION,
@@ -5984,6 +6014,41 @@ pub mod tests {
             result.value, expected,
             "should use data slice if parsing fails"
         );
+    }
+
+    #[test]
+    fn test_rpc_account_scans_disabled() {
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            disable_account_scans: true,
+            ..JsonRpcConfig::default()
+        });
+        let key = Pubkey::new_unique().to_string();
+        let token_filter = json!({"programId": spl_token_interface::id().to_string()});
+        let scan_requests = [
+            ("getProgramAccounts", Some(json!([key]))),
+            ("getLargestAccounts", None),
+            ("getSupply", None),
+            ("getTokenLargestAccounts", Some(json!([key]))),
+            ("getTokenAccountsByOwner", Some(json!([key, token_filter]))),
+            (
+                "getTokenAccountsByDelegate",
+                Some(json!([key, token_filter])),
+            ),
+        ];
+        for (method, params) in scan_requests {
+            let request = create_test_request(method, params);
+            let (code, message) = parse_failure_response(rpc.handle_request_sync(request));
+            assert_eq!(
+                code, JSON_RPC_SERVER_ERROR_ACCOUNT_SCANS_DISABLED,
+                "{method}"
+            );
+            assert!(message.starts_with(method), "{method}: {message}");
+        }
+
+        // Single-account reads are unaffected.
+        let request = create_test_request("getBalance", Some(json!([key])));
+        let result: RpcResponse<u64> = parse_success_result(rpc.handle_request_sync(request));
+        assert_eq!(result.value, 0);
     }
 
     #[test]

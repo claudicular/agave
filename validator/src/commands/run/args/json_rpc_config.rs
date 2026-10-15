@@ -63,6 +63,7 @@ impl FromClapArgMatches for JsonRpcConfig {
             .ok()
             .map(|mb| mb * MB),
             disable_health_check: false,
+            disable_account_scans: !matches.is_present("rpc_allow_account_scans"),
         })
     }
 }
@@ -164,6 +165,15 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
             .long("full-rpc-api")
             .takes_value(false)
             .help("Expose RPC methods for querying chain state and transaction history"),
+        Arg::with_name("rpc_allow_account_scans")
+            .long("rpc-allow-account-scans")
+            .takes_value(false)
+            .help(
+                "Serve the accounts-scan RPC methods (getProgramAccounts, \
+                 getTokenAccountsByOwner, getTokenAccountsByDelegate, getTokenLargestAccounts, \
+                 getLargestAccounts, getSupply) and /v0/circulating-supply. They are refused \
+                 by default because a running scan blocks accounts cleanup",
+            ),
         Arg::with_name("rpc_scan_and_fix_roots")
             .long("rpc-scan-and-fix-roots")
             .takes_value(false)
@@ -213,6 +223,7 @@ pub(super) mod tests {
             rpc_blocking_threads: DEFAULT_RPC_BLOCKING_THREADS.parse().unwrap(),
             rpc_niceness_adj: DEFAULT_RPC_NICENESS_ADJ.parse().unwrap(),
             max_request_body_size: Some(DEFAULT_RPC_MAX_REQUEST_BODY_SIZE.parse().unwrap()),
+            disable_account_scans: true,
             ..JsonRpcConfig::default()
         }
     }
@@ -430,6 +441,24 @@ pub(super) mod tests {
                 expected_args,
             );
         }
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_rpc_allow_account_scans() {
+        let default_run_args = crate::commands::run::args::RunArgs::default();
+        assert!(default_run_args.json_rpc_config.disable_account_scans);
+        let expected_args = RunArgs {
+            json_rpc_config: JsonRpcConfig {
+                disable_account_scans: false,
+                ..default_run_args.json_rpc_config.clone()
+            },
+            ..default_run_args.clone()
+        };
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args,
+            vec!["--rpc-allow-account-scans"],
+            expected_args,
+        );
     }
 
     #[test]
