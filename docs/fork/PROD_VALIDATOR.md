@@ -36,6 +36,24 @@ against the identical interface crate and toolchain (`rust-toolchain.toml`).
   unbound bank) but its 10 pinned threads keep spinning. Making FL useful again means
   supporting Alpenglow banks (footer clock, block markers, UpdateParent bank clearing,
   migration) and re-proving exactness; until then `echo disable > fast_lane.ctl` is an option.
+- **FL safety net under Alpenglow** (branch `wip/fl-alpenglow-safety`, not deployed). The
+  TowerBFT net (gossip votes, duplicate confirmation, dump and repair) is dead under
+  Alpenglow. The reference hash is now the **leader's block-footer `bank_hash`**, compared at
+  freeze. This is the leader's claim, not a ≥52%-stake confirmation; detection is at freeze,
+  not ~130 ms after it.
+  - A footer mismatch on a bank FL committed into is not marked dead. FL is poisoned
+    provisionally, the bank is cleared, and the slot is replayed once agave-only. The verdict
+    comes from that replay's footer check:
+    - it matches: `fl_wrong`, sticky until restart;
+    - it still differs, with FL's hash: `leader_footer`, the poison is lifted and the slot
+      is marked dead as upstream;
+    - it still differs, with another hash: `fl_wrong` (FL changed the bank), slot dead;
+    - it is cleared or dies first, or another block is replayed: `unresolved`, sticky.
+  - A mismatch on a bank with no FL commits is upstream behaviour (`not_fl`, FL untouched).
+  - Every matching footer advances `fast_lane_cluster_check` (`consensus=alpenglow`) and the
+    out_ring rollback horizon. The vote and gossip-lag fields are omitted there, not zero.
+  - Every Alpenglow bank clear (UpdateParent, abandoned bank, switch) first stops the bank's
+    board. FL handles it as a dead slot: ROLLBACK, slot and children skipped.
 - Everything else in the fork is active: grouped notifications, RPC changes, no-coalesce,
   scheduler spin, VM shortcuts, receive diet, Yellowstone delivery runtime.
 - 4.4.1 rejects `--limit-blockstore-size` below 100,000,000 (4.3 accepted 50M).
