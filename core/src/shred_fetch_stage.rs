@@ -161,8 +161,13 @@ impl ShredFetchStage {
                     exit.clone(),
                     packet_sender.clone(),
                     receiver_stats.clone(),
-                    Some(Duration::from_millis(5)), // coalesce
-                    false,                          // is_staked_service
+                    // No coalescing: hand each recvmmsg read downstream as soon as the
+                    // socket drains. The 5 ms default held a batch's first shred until 64
+                    // packets or the deadline, delaying replay and geyser on this
+                    // non-voting latency node. Downstream stages drain without waiting and
+                    // the fetch channel holds SHRED_FETCH_CHANNEL_SIZE batches.
+                    None,  // coalesce
+                    false, // is_staked_service
                 )
             })
             .collect();
