@@ -50,7 +50,8 @@ impl Bank {
     }
 
     /// The consensus check function that runs before SVM in both block-production and replay.
-    pub(super) fn check_transactions_before_execution<Tx: TransactionWithMeta>(
+    /// (`pub`: the fast lane's external commit and its tests run it too.)
+    pub fn check_transactions_before_execution<Tx: TransactionWithMeta>(
         &self,
         txs: &[impl core::borrow::Borrow<Tx>],
         lock_results: &[TransactionResult<()>],
@@ -155,7 +156,27 @@ impl Bank {
         let fee_features = self.fee_features();
         let raise_cpi_limit = feature_snapshot.raise_cpi_nesting_limit_to_8;
 
-        let compute_budget_and_limits = tx.transaction_configuration(feature_set).map(|config| {
+        let compute_budget_and_limits =
+            self.compute_budget_and_limits(tx, feature_set, fee_features, raise_cpi_limit);
+
+        if compute_budget_and_limits.is_err() {
+            error_counters.invalid_compute_budget += 1;
+        }
+
+        compute_budget_and_limits
+    }
+
+    /// The compute budget, loaded-accounts limit and fee of one transaction, exactly as
+    /// `check_compute_budget_and_limits` computes them. Pure: reads only this bank's fee
+    /// structure and configured compute budget (the fast lane calls it for a child slot).
+    pub(super) fn compute_budget_and_limits(
+        &self,
+        tx: &impl StaticMessageWithMeta,
+        feature_set: &agave_feature_set::FeatureSet,
+        fee_features: solana_fee::FeeFeatures,
+        raise_cpi_limit: bool,
+    ) -> TransactionResult<SVMTransactionExecutionAndFeeBudgetLimits> {
+        tx.transaction_configuration(feature_set).map(|config| {
             let fee_details = calculate_fee_details(
                 tx,
                 self.fee_structure.lamports_per_signature,
@@ -181,13 +202,7 @@ impl Bank {
                     fee_details,
                 }
             }
-        });
-
-        if compute_budget_and_limits.is_err() {
-            error_counters.invalid_compute_budget += 1;
-        }
-
-        compute_budget_and_limits
+        })
     }
 
     fn check_blockhash_age(
@@ -207,6 +222,14 @@ impl Bank {
         tx: &impl SVMMessage,
         next_durable_nonce: &DurableNonce,
     ) -> Option<Pubkey> {
+        Self::durable_nonce_if_advanceable(tx, next_durable_nonce)
+    }
+
+    /// [`Self::check_nonce_semantics`] without a bank (the fast lane checks a child slot).
+    pub(super) fn durable_nonce_if_advanceable(
+        tx: &impl SVMMessage,
+        next_durable_nonce: &DurableNonce,
+    ) -> Option<Pubkey> {
         let nonce_is_advanceable = tx.recent_blockhash() != next_durable_nonce.as_hash();
         if !nonce_is_advanceable {
             return None;
@@ -221,7 +244,20 @@ impl Bank {
         nonce_address: Pubkey,
         strict_nonce_checks: bool,
     ) -> Option<NonceData> {
-        let nonce_account = self.get_account_with_fixed_root(&nonce_address)?;
+        Self::check_nonce_account_with(tx, nonce_address, strict_nonce_checks, |nonce_address| {
+            self.get_account_with_fixed_root(nonce_address)
+        })
+    }
+
+    /// [`Self::check_nonce_account`] with the nonce account supplied by `load_nonce_account`
+    /// instead of this bank's state. The fast lane reads it from its multi-version overlay.
+    pub(super) fn check_nonce_account_with(
+        tx: &impl SVMStaticMessage,
+        nonce_address: Pubkey,
+        strict_nonce_checks: bool,
+        load_nonce_account: impl FnOnce(&Pubkey) -> Option<solana_account::AccountSharedData>,
+    ) -> Option<NonceData> {
+        let nonce_account = load_nonce_account(&nonce_address)?;
 
         if strict_nonce_checks && nonce_account.data().len() != NonceState::size() {
             return None;

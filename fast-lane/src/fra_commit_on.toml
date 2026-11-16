@@ -1,0 +1,106 @@
+# Fast lane execute-once milestone 2 (FRA): the live config (/home/sol/fast_lane.toml =
+# fra_rebase.toml, 2026-09-28) + the commit settings at the end. Nothing else changed.
+# `commit = on`: FL commits its validated results into agave's bank N through agave's own
+# commit path (check_transactions, commit_transactions, cost tracker, votes, prioritization
+# fees, transaction status batch) and agave's replay follows: Yellowstone `transaction_accounts`,
+# `accounts` and `transactions` carry FL's latency. See DESIGN.md section 21.
+# Older binaries reject the new keys: deploy binary and config together.
+# Runtime control (no restart): `commit=off|shadow|on` (banks created afterwards),
+# `verify_sample_ppm=N`, `follow_wait_ms=N`, `follow_spin_us=N`; `disable` or a poison stops
+# commit mode at once (agave executes every transaction FL has not claimed).
+#
+# Fast lane shadow #4 (FRA): the live shadow #3 config (/home/sol/fast_lane.toml, 2026-09-28
+# 15:25Z) + `vm_opts = true` (result-identical VM shortcuts on FL's executor threads only,
+# DESIGN §20) + `rebase = true` (delta-rebase value prediction for fee-payer / fee-sink
+# chains, DESIGN §19). Nothing else changed.
+# Binary: /home/sol/fl-bin/agave-validator-f33fbabe35 (fast-lane f33fbabe35 = c3f25234d5 + rebase
+# + FL-only VM shortcuts).
+# The older binaries reject these keys (unknown keys fail the config parse): deploy binary
+# and config together. Runtime A/B without restart: `vm_opts=off|on`, `rebase=off|on` in the
+# control file.
+# Install: copy to /home/sol/fast_lane.toml (validator.sh exports AGAVE_FAST_LANE_CONFIG).
+# Layout (48 logical CPUs, SMT sibling of N is N+24):
+#   agave shared threads 0-7,24-31 · FL sched 8, ingest 9 (siblings 32,33 idle)
+#   FL workers 10-14 + 36-38 (K=8; siblings 34,35 idle) · replay handlers 15-21, scheduler 22 (siblings idle)
+#   geyserbench sampler 23 · agave receive chain 47
+# Input: dual (proxy shared-memory ring v2 + blockstore), ring from proxy fl-ring-v2 7311fee.
+# Runtime control: echo disable|enable|theta=X > /home/sol/fast_lane/fast_lane.ctl
+
+enabled = true
+
+workers = 8
+worker_cores = [10, 11, 12, 13, 14, 36, 37, 38]
+sched_core = 8
+ingest_core = 9
+shared_cores = [0-7, 24-31]
+nice = 5
+aux_nice = 10
+spin_us = 1000000
+worker_spin_us = 1000000
+ingest_spin_us = 1000000
+
+input = dual
+ring_path = "/dev/shm/shredstream.v2.ring"
+
+# Phase 2b: start a slot on FL's own complete run of its parent while agave has not frozen
+# the parent yet (P's freeze-time writes and C's SlotHashes are resolved when agave freezes P).
+# Set false to get shadow #2 behaviour with the new binary.
+chain = true
+
+# Phase 3: publish every FINAL transaction's account updates into a shared-memory ring for
+# consumers (geyserbench `fastlane_ring`, later the bot). Accounts: the transaction's
+# grouped-notification accounts owned by SPL Token / Token-2022 (`out_token`) or by an
+# `out_owners` program; transactions without one are not published. Written by the
+# coordinator (core 8) at FINAL; cost reported in `fast_lane_out` log lines every 10 s.
+out_ring = true
+out_ring_path = "/dev/shm/fastlane.out.ring"
+out_ring_mb = 256
+out_token = true
+out_owners = []
+
+speculation = true
+theta = 0.5
+max_incarnations = 3
+eager_reexec = true
+# Delta rebase (needs eager_reexec): predicted outputs for chains through fee payers and fee
+# sinks, and rebase-aware speculation gating. Exactness does not depend on it (predictions are
+# never final or emitted). Runtime toggle: rebase=on|off in the control file.
+rebase = true
+# FL executor threads run agave's SOLANA_VM_HEAP_ZERO_OPT / _PDA_CACHE / _SER_POOL shortcuts
+# (result-identical; per-thread pools, `mem_vm_pool_kb`); agave's own threads are unchanged.
+# Runtime toggle: vm_opts=on|off in the control file.
+vm_opts = true
+
+# Execute once (milestone 2).
+commit = on
+# Commit threads: with agave's 7 replay handlers still on 15-21, unpinned (niced) on the shared
+# cores. Milestone 3 (2 handlers on 15-16): `commit_cores = [17, 18, 19]` and
+# `commit_spin_us = 1000000` (dedicated cores, never park).
+commit_threads = 3
+commit_cores = []
+commit_spin_us = 200
+# Agave executes 0.05% of transactions itself at their position and compares them with FL's
+# result before committing its own (any difference poisons FL; the slot is replayed without FL
+# if FL committed into it).
+verify_sample_ppm = 500
+# A replay handler waits up to 100 ms for FL to claim a transaction, spinning 200 us and then
+# sleeping 20 us between checks.
+follow_wait_ms = 100
+follow_spin_us = 200
+
+parent_wait_ms = 300
+max_runs = 4
+# Hard cap on FL-held memory (overlays, comparator frames/records, queues, pending entries,
+# hints; `mem_*` in fast_lane_summary). Above it FL disables itself and releases everything
+# (stays off until `echo enable > fast_lane.ctl`); new runs stop at half of it. Normal
+# operation is expected well below 4 GiB; lower it once `mem_total_mb` has been observed.
+mem_cap_mb = 4096
+
+comparator = true
+export_dir = "/home/sol/fast_lane"
+control_file = "/home/sol/fast_lane/fast_lane.ctl"
+export_file_mb = 256
+export_files = 8
+export_votes = false
+mismatch_samples_per_min = 20
+summary_interval_s = 10

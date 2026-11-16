@@ -96,6 +96,16 @@ pub fn curve_cache_stats() -> (u64, u64) {
     )
 }
 
+/// Bytes one thread's on-curve cache holds once allocated (lazily, on the thread's first
+/// cached PDA check).
+pub fn curve_cache_bytes() -> usize {
+    let sets = clamp_entries(configured_entries())
+        .checked_div(WAYS)
+        .unwrap_or(1)
+        .max(1);
+    sets.saturating_mul(std::mem::size_of::<Set>())
+}
+
 fn configured_entries() -> usize {
     std::env::var(PDA_CACHE_ENTRIES_ENV)
         .ok()

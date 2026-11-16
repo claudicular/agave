@@ -30,6 +30,7 @@ members = [
     "cpu-utils",
     "download-utils",
     "entry",
+    "fast-lane",
     "faucet",
     "faucet-cli",
     "feature-set",
@@ -174,6 +175,7 @@ agave-bls-cert-verify = { path = "bls-cert-verify", version = "=4.4.1", features
 agave-bls-sigverify = { path = "bls-sigverify", version = "=4.4.1", features = ["agave-unstable-api"] }
 agave-cpu-utils = { path = "cpu-utils", version = "=4.4.1", features = ["agave-unstable-api"] }
 agave-feature-set = { path = "feature-set", version = "=4.4.1", features = ["agave-unstable-api"] }
+agave-fast-lane = { path = "fast-lane", version = "=4.4.1", features = ["agave-unstable-api"] }
 agave-fs = { path = "fs", version = "=4.4.1", features = ["agave-unstable-api"] }
 # Vendored (crates.io 5.0.0 + the fork's transaction-grouped account notifications).
 agave-geyser-plugin-interface = { path = "geyser-plugin-interface", version = "=5.0.0" }

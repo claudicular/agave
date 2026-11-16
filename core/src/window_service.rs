@@ -231,6 +231,9 @@ where
         metrics,
     )?;
 
+    // Fast lane (no-op unless enabled): observe the data sets replay is about to read.
+    agave_fast_lane::tap::on_completed_data_sets(&completed_data_sets);
+
     if tracing {
         for data_set in &completed_data_sets {
             trace_data_set(TraceStage::DataSetCompleted, data_set);

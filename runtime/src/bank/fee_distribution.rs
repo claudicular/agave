@@ -148,37 +148,11 @@ impl Bank {
             return 0;
         }
 
-        // Per SIMD-0232: the commission collector address should be fetched
-        // from the state of the vote account at the beginning of the previous
-        // epoch. This is the vote account state used to build the leader
-        // schedule for the current epoch, which *DOES NOT* correspond to
-        // `Bank::current_epoch_stakes()`.
         let feature_snapshot = self.feature_set.snapshot();
-        let (collector_id, commission_bps) = if feature_snapshot.custom_commission_collector {
-            let vote_account = self
-                .epoch_stakes
-                .get(&self.epoch)
-                .and_then(|stakes| {
-                    stakes
-                        .stakes()
-                        .vote_accounts()
-                        .get(&self.leader.vote_address)
-                })
-                .expect("The vote account for the leader must exist");
-            (
-                // Protection in case the leader is on a vote state without a
-                // collector id, which can happen if a dormant pre-v4 vote state
-                // accrues stake.
-                vote_account
-                    .vote_state_view()
-                    .block_revenue_collector()
-                    .unwrap_or(&self.leader.id),
-                // For pre-v4 vote states, defaults to the max of 10_000 bps
-                vote_account.vote_state_view().block_revenue_commission(),
-            )
-        } else {
-            (&self.leader.id, MAX_BPS)
-        };
+        let (collector_id, commission_bps) = self
+            .fee_collector_and_commission()
+            .expect("The vote account for the leader must exist");
+        let collector_id = &collector_id;
 
         let (validator_fee, delegator_fee) = if feature_snapshot.block_revenue_sharing {
             let clamped_commission_bps = u128::from(commission_bps.min(MAX_BPS));
@@ -209,6 +183,51 @@ impl Bank {
             });
 
         validator_fee_to_burn + delegator_fee_to_burn
+    }
+
+    /// The account the slot's validator fees are deposited into at freeze and the leader's
+    /// block-revenue commission. `None` when SIMD-0232 is active and the leader's vote account
+    /// is missing from the epoch stakes (the fast lane asks before agave freezes).
+    pub(super) fn fee_collector_and_commission(&self) -> Option<(Pubkey, u16)> {
+        // Per SIMD-0232: the commission collector address should be fetched
+        // from the state of the vote account at the beginning of the previous
+        // epoch. This is the vote account state used to build the leader
+        // schedule for the current epoch, which *DOES NOT* correspond to
+        // `Bank::current_epoch_stakes()`.
+        let feature_snapshot = self.feature_set.snapshot();
+        if !feature_snapshot.custom_commission_collector {
+            return Some((self.leader.id, MAX_BPS));
+        }
+        let vote_account = self.epoch_stakes.get(&self.epoch).and_then(|stakes| {
+            stakes
+                .stakes()
+                .vote_accounts()
+                .get(&self.leader.vote_address)
+        })?;
+        Some((
+            // Protection in case the leader is on a vote state without a
+            // collector id, which can happen if a dormant pre-v4 vote state
+            // accrues stake.
+            *vote_account
+                .vote_state_view()
+                .block_revenue_collector()
+                .unwrap_or(&self.leader.id),
+            // For pre-v4 vote states, defaults to the max of 10_000 bps
+            vote_account.vote_state_view().block_revenue_commission(),
+        ))
+    }
+
+    /// Every account freeze-time fee distribution may write: the validator-fee collector and,
+    /// with SIMD-0123 block revenue sharing, the leader's vote account (delegator fees).
+    pub(super) fn fee_deposit_accounts(&self) -> Option<Vec<Pubkey>> {
+        let (collector_id, _) = self.fee_collector_and_commission()?;
+        let mut accounts = vec![collector_id];
+        if self.feature_set.snapshot().block_revenue_sharing
+            && self.leader.vote_address != collector_id
+        {
+            accounts.push(self.leader.vote_address);
+        }
+        Some(accounts)
     }
 
     fn try_deposit_and_report(

@@ -243,6 +243,7 @@ pub mod bank_hash_details;
 pub mod builtins;
 mod check_transactions;
 pub mod entry_bytes_budget;
+pub mod fast_lane;
 mod fee_distribution;
 mod metrics;
 pub(crate) mod partitioned_epoch_rewards;
@@ -3181,33 +3182,12 @@ impl Bank {
         epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
     ) -> Option<UnixTimestamp> {
         let mut get_timestamp_estimate_time = Measure::start("get_timestamp_estimate");
-        let slots_per_epoch = self.epoch_schedule().slots_per_epoch;
-        let vote_accounts = self.vote_accounts();
-        let recent_timestamps = vote_accounts.iter().filter_map(|(pubkey, (_, account))| {
-            let vote_state = account.vote_state_view();
-            let last_timestamp = vote_state.last_timestamp();
-            let slot_delta = self.slot().checked_sub(last_timestamp.slot)?;
-            (slot_delta <= slots_per_epoch)
-                .then_some((*pubkey, (last_timestamp.slot, last_timestamp.timestamp)))
-        });
-        let elapsed_slot_duration = |from_slot: Slot, to_slot: Slot| {
-            if from_slot >= to_slot {
-                Duration::ZERO
-            } else {
-                Duration::from_nanos_u128(
-                    self.slot_range_duration_nanos(from_slot.saturating_add(1), to_slot),
-                )
-            }
-        };
-        let epoch = self.epoch_schedule().get_epoch(self.slot());
-        let stakes = self.epoch_vote_accounts(epoch)?;
-        let stake_weighted_timestamp = calculate_stake_weighted_timestamp(
-            recent_timestamps,
-            stakes,
+        // Preserve the historical early return (no datapoint) when the epoch has no stakes.
+        self.epoch_vote_accounts(self.epoch_schedule().get_epoch(self.slot()))?;
+        let stake_weighted_timestamp = self.get_timestamp_estimate_for_slot(
             self.slot(),
-            elapsed_slot_duration,
-            epoch_start_timestamp,
             max_allowable_drift,
+            epoch_start_timestamp,
         );
         get_timestamp_estimate_time.stop();
         datapoint_info!(
@@ -3219,6 +3199,76 @@ impl Bank {
             ),
         );
         stake_weighted_timestamp
+    }
+
+    /// The stake-weighted timestamp estimate for `slot`, computed from this bank's
+    /// vote accounts (stakes cache), epoch stakes and slot params. With `slot ==
+    /// self.slot()` this is exactly what `update_clock` uses; the fast lane calls it on a
+    /// frozen parent with the child's slot (the child clones the parent's stakes cache and
+    /// epoch stakes, so the inputs are identical). Pure: no datapoints, no state changes.
+    pub(crate) fn get_timestamp_estimate_for_slot(
+        &self,
+        slot: Slot,
+        max_allowable_drift: MaxAllowableDrift,
+        epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
+    ) -> Option<UnixTimestamp> {
+        self.get_timestamp_estimate_for_slot_with(
+            slot,
+            max_allowable_drift,
+            epoch_start_timestamp,
+            &HashMap::new(),
+        )
+    }
+
+    /// [`Self::get_timestamp_estimate_for_slot`] with this bank's vote accounts overridden:
+    /// `Some((slot, timestamp))` replaces (or adds) a vote account's last timestamp, `None`
+    /// removes the vote account (as the stakes cache would after the account was closed or
+    /// became invalid). The fast lane uses it for a child of an unfrozen parent P, passing
+    /// the vote accounts FL's own execution of P wrote.
+    pub(crate) fn get_timestamp_estimate_for_slot_with(
+        &self,
+        slot: Slot,
+        max_allowable_drift: MaxAllowableDrift,
+        epoch_start_timestamp: Option<(Slot, UnixTimestamp)>,
+        vote_overrides: &HashMap<Pubkey, Option<(Slot, UnixTimestamp)>>,
+    ) -> Option<UnixTimestamp> {
+        let slots_per_epoch = self.epoch_schedule().slots_per_epoch;
+        let vote_accounts = self.vote_accounts();
+        let within_epoch = |(timestamp_slot, timestamp): (Slot, UnixTimestamp)| {
+            let slot_delta = slot.checked_sub(timestamp_slot)?;
+            (slot_delta <= slots_per_epoch).then_some((timestamp_slot, timestamp))
+        };
+        let recent_timestamps = vote_accounts
+            .iter()
+            .filter(|(pubkey, _)| !vote_overrides.contains_key(*pubkey))
+            .filter_map(|(pubkey, (_, account))| {
+                let vote_state = account.vote_state_view();
+                let last_timestamp = vote_state.last_timestamp();
+                within_epoch((last_timestamp.slot, last_timestamp.timestamp))
+                    .map(|ts| (*pubkey, ts))
+            })
+            .chain(vote_overrides.iter().filter_map(|(pubkey, ts)| {
+                ts.and_then(within_epoch).map(|ts| (*pubkey, ts))
+            }));
+        let elapsed_slot_duration = |from_slot: Slot, to_slot: Slot| {
+            if from_slot >= to_slot {
+                Duration::ZERO
+            } else {
+                Duration::from_nanos_u128(
+                    self.slot_range_duration_nanos(from_slot.saturating_add(1), to_slot),
+                )
+            }
+        };
+        let epoch = self.epoch_schedule().get_epoch(slot);
+        let stakes = self.epoch_vote_accounts(epoch)?;
+        calculate_stake_weighted_timestamp(
+            recent_timestamps,
+            stakes,
+            slot,
+            elapsed_slot_duration,
+            epoch_start_timestamp,
+            max_allowable_drift,
+        )
     }
 
     /// Recalculates the bank hash
@@ -4302,18 +4352,35 @@ impl Bank {
         // Accumulate the transaction batch execution timings.
         timings.accumulate(&sanitized_output.execute_timings);
 
+        self.finish_load_and_execute(
+            sanitized_txs,
+            sanitized_output.processing_results,
+            sanitized_output.balance_collector,
+            timings,
+            error_counters,
+        )
+    }
+
+    /// The part of [`Self::load_and_execute_transactions`] after execution: log collection
+    /// and the processed-transaction counts the commit consumes. Also used to commit a result
+    /// the fast lane executed (`transaction_execution::commit_external`), so that such a
+    /// commit takes exactly this code path.
+    pub fn finish_load_and_execute(
+        &self,
+        sanitized_txs: &[impl TransactionWithMeta],
+        processing_results: Vec<TransactionProcessingResult>,
+        balance_collector: Option<BalanceCollector>,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> LoadAndExecuteTransactionsOutput {
         let ((), collect_logs_us) =
-            measure_us!(self.collect_logs(sanitized_txs, &sanitized_output.processing_results));
+            measure_us!(self.collect_logs(sanitized_txs, &processing_results));
         timings.saturating_add_in_place(ExecuteTimingType::CollectLogsUs, collect_logs_us);
 
         let mut processed_counts = ProcessedTransactionCounts::default();
         let err_count = &mut error_counters.total;
 
-        for (processing_result, tx) in sanitized_output
-            .processing_results
-            .iter()
-            .zip(sanitized_txs)
-        {
+        for (processing_result, tx) in processing_results.iter().zip(sanitized_txs) {
             if let Some(debug_keys) = &self.transaction_debug_keys {
                 for key in tx.account_keys().iter() {
                     if debug_keys.contains(key) {
@@ -4351,9 +4418,9 @@ impl Bank {
         }
 
         LoadAndExecuteTransactionsOutput {
-            processing_results: sanitized_output.processing_results,
+            processing_results,
             processed_counts,
-            balance_collector: sanitized_output.balance_collector,
+            balance_collector,
         }
     }
 
