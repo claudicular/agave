@@ -1,0 +1,20 @@
+# /etc/systemd/system/agave.service (FRA). No drop-ins: settings live in validator.sh.
+[Unit]
+Description=Solana Agave Validator (claudicular/agave fork, non-voting RPC)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=sol
+LimitMEMLOCK=infinity
+LimitNOFILE=1000000
+TasksMax=infinity
+LogRateLimitIntervalSec=0
+Environment=PATH=/bin:/usr/bin
+ExecStart=/home/sol/bin/validator.sh
+
+[Install]
+WantedBy=multi-user.target
