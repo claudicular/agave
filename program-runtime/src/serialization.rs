@@ -168,6 +168,18 @@ thread_local! {
         RefCell::new(Vec::with_capacity(MAX_POOLED_PARAMETER_BUFFERS));
 }
 
+/// Bytes of idle program-input allocations the calling thread's pool retains
+/// (`SOLANA_VM_SER_POOL`; at most `MAX_POOLED_PARAMETER_BUFFERS` × 4 MiB).
+pub fn pooled_parameter_bytes() -> usize {
+    PARAMETER_BUFFER_POOL
+        .try_with(|pool| {
+            pool.try_borrow()
+                .map(|pool| pool.iter().map(|raw| raw.capacity).sum())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
 /// A program-input (parameter) buffer whose allocation is recycled through a per-thread pool
 /// (`SOLANA_VM_SER_POOL`, see [`crate::vm_opts::SER_POOL`]).
 ///

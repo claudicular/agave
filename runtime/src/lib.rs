@@ -16,6 +16,7 @@ pub mod block_component_processor;
 pub mod commitment;
 pub mod dependency_tracker;
 pub mod epoch_stakes;
+pub mod fast_lane_commit;
 pub mod genesis_utils;
 pub mod inflation_rewards;
 pub mod installed_scheduler_pool;

@@ -1,0 +1,89 @@
+# Fast lane production config for FRA (sol@64.130.41.179), the source of truth for
+# /home/sol/fast_lane.toml (docs/fork/PROD_VALIDATOR.md installs it). Production since
+# 2026-09-29 (execute once: FL executes and commits each transaction into agave's bank;
+# agave follows). Design and measurements: arb_bot docs/research/shred-to-geyser-2026-09-27/.
+#
+# Unknown keys fail the parse: deploy binary and config together.
+# Runtime control without a restart: write a command into `control_file`, e.g.
+#   echo disable > /home/sol/fast_lane/fast_lane.ctl        (FL off; agave executes everything)
+#   echo enable  > /home/sol/fast_lane/fast_lane.ctl
+#   echo commit=shadow > /home/sol/fast_lane/fast_lane.ctl  (FL runs, agave commits; new banks)
+# The control file is applied at startup, so whatever it holds survives restarts.
+#
+# CPU layout (48 logical CPUs, SMT sibling of N is N+24; each 3-core group shares an L3):
+#   agave 0-7,24-29 · PoH 30 (SCHED_IDLE) · Yellowstone delivery 31 (pinned by agave-cpu-layout)
+#   FL sched 8, ingest 9, executors 10-14 + 36-38 (they also commit) · bot partition 15-23,39-47
+
+enabled = true
+
+workers = 8
+worker_cores = [10, 11, 12, 13, 14, 36, 37, 38]
+sched_core = 8
+ingest_core = 9
+# CPUs for FL threads without a dedicated core.
+shared_cores = [0-7, 24-31]
+nice = 5
+aux_nice = 10
+# Spin, never park (the cores above are dedicated).
+spin_us = 1000000
+worker_spin_us = 1000000
+ingest_spin_us = 1000000
+
+# Input: the shredstream proxy's shared-memory ring v2 plus the blockstore (position gate).
+input = dual
+ring_path = "/dev/shm/shredstream.v2.ring"
+
+# Start a slot on FL's own run of its parent before agave freezes the parent.
+# Off: chaining does not model Alpenglow's parent block footer (FL refuses it on Alpenglow).
+chain = false
+
+# Shared-memory ring of every FINAL transaction's Token/Token-2022 account updates.
+out_ring = true
+out_ring_path = "/dev/shm/fastlane.out.ring"
+out_ring_mb = 256
+out_token = true
+out_owners = []
+
+speculation = true
+theta = 0.5
+max_incarnations = 3
+eager_reexec = true
+# Delta-rebase predictions for fee-payer / fee-sink chains (needs eager_reexec).
+rebase = true
+# agave's result-identical SOLANA_VM_* shortcuts on FL's executor threads only.
+vm_opts = true
+
+# Execute once: FL commits into agave's banks through agave's commit path.
+commit = on
+commit_threads = 3
+commit_cores = []
+commit_spin_us = 200
+# Commit on FL's pinned, spinning executors (not the commit threads).
+commit_on = workers
+# 0.1% of transactions are executed by agave at their position and fully compared
+# (any difference poisons FL; 1% cost +0.67 ms at Yellowstone p90).
+verify_sample_ppm = 1000
+sample_mode = hash
+# A replay handler waits up to 100 ms for FL to claim a transaction.
+follow_wait_ms = 100
+follow_spin_us = 200
+# A replay handler waits up to 2 ms for FL's binding of a bank whose input FL already has.
+bind_wait_us = 2000
+bind_wait_on = known
+# FINAL -> committed attribution CSVs (fl_commit.*.csv) are off in production.
+commit_csv_ppm = 0
+
+parent_wait_ms = 300
+max_runs = 4
+# Hard cap on FL-held memory: above it FL disables itself, releases everything and re-enables
+# once caught up.
+mem_cap_mb = 4096
+
+comparator = true
+export_dir = "/home/sol/fast_lane"
+control_file = "/home/sol/fast_lane/fast_lane.ctl"
+export_file_mb = 256
+export_files = 8
+export_votes = false
+mismatch_samples_per_min = 20
+summary_interval_s = 10
