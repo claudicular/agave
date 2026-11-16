@@ -13,7 +13,12 @@
 //! complete run of P (P's parent frozen, P's entries complete, no unprocessable
 //! transaction, agave's bank P created): see [`Run::new_chained`]. Its transaction 0 is a
 //! pseudo-transaction for P's freeze-time writes (and the child's SlotHashes), completed
-//! here when agave freezes P.
+//! here when agave freezes P. Chaining is never done once Alpenglow is active (the child's
+//! Clock comes from P's block footer): such a slot waits for P's freeze and runs over it.
+//!
+//! Alpenglow block markers carry no transactions (ordinals are unaffected). An UpdateParent
+//! marker (fast leader handover: the leader abandoned the slot's prefix and rebuilt the slot
+//! on another parent) skips the slot before anything past it is released.
 
 use {
     crate::{
@@ -720,13 +725,15 @@ impl Ingest {
                 }
             };
             self.stats.blockstore_read_us += t0.elapsed().as_micros() as u64;
-            let last_index = self
-                .deps
-                .blockstore
-                .meta(slot)
-                .ok()
-                .flatten()
-                .and_then(|meta| meta.last_index);
+            let meta = self.deps.blockstore.meta(slot).ok().flatten();
+            // The blockstore read turns markers into empty entry lists. An UpdateParent is
+            // recorded in the slot's meta when its shreds are inserted, before any data set
+            // at or past it completes: skip before the gate can release past the marker.
+            if meta.as_ref().is_some_and(|meta| meta.has_update_parent()) {
+                self.skip(slot, UPDATE_PARENT);
+                continue;
+            }
+            let last_index = meta.and_then(|meta| meta.last_index);
             let end = set.indices.end.saturating_sub(1);
             let piece = Piece {
                 batch_start: start,
@@ -813,6 +820,16 @@ impl Ingest {
                     Ok(solana_entry::block_component::BlockComponent::EntryBatch(entries)) => {
                         entries
                     }
+                    // Fast leader handover: what follows the marker is built on another
+                    // parent and indexed from it. Skip (aborting the run) before the gate
+                    // releases anything past the marker.
+                    Ok(solana_entry::block_component::BlockComponent::BlockMarker(marker))
+                        if marker.is_update_parent() =>
+                    {
+                        self.skip(slot, UPDATE_PARENT);
+                        continue;
+                    }
+                    // Header, footer and genesis-certificate markers: no transactions.
                     Ok(_) => Vec::new(),
                     Err(_) => {
                         self.stats.ring_decode_errors += 1;
@@ -899,7 +916,12 @@ impl Ingest {
         let created = match (frozen_parent, chain) {
             (Some(parent), _) => self.create_run(slot, &parent),
             (None, Some((parent_run, parent_bank, last_blockhash))) => {
-                self.create_chained_run(slot, &parent_run, &parent_bank, last_blockhash)
+                match self.create_chained_run(slot, &parent_run, &parent_bank, last_blockhash) {
+                    // Not chainable: the slot waits for its parent's freeze (the Frozen event
+                    // starts it over the frozen bank), it is not skipped.
+                    Err(CHAINED_ALPENGLOW) => return,
+                    created => created,
+                }
             }
             (None, None) => return,
         };
@@ -921,6 +943,10 @@ impl Ingest {
             || !parent_run.complete_ok.load(Ordering::SeqCst)
             || parent_run.chain.is_some()
         {
+            return None;
+        }
+        // Alpenglow: the child waits for P's freeze (`FastLaneUnsupported::ChainedAlpenglow`).
+        if !parent_run.parent.fast_lane_chaining_supported() {
             return None;
         }
         let last_blockhash = state.last_entry_hash?;
@@ -1188,7 +1214,9 @@ fn entry_bytes(entry: &Entry) -> i64 {
         .sum::<i64>()
 }
 
-/// [`unsupported_reason`] of a chained run on an Alpenglow parent.
+/// Skip reason of a slot carrying an UpdateParent marker.
+const UPDATE_PARENT: &str = "update_parent";
+/// [`unsupported_reason`] of a chained run on an Alpenglow parent (the slot is not skipped).
 const CHAINED_ALPENGLOW: &str = "chained_alpenglow";
 
 fn unsupported_reason(err: solana_runtime::bank::fast_lane::FastLaneUnsupported) -> &'static str {
@@ -1224,7 +1252,10 @@ mod tests {
         solana_message::Message,
         solana_runtime::{
             bank::SlotLeader,
-            genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
+            genesis_utils::{
+                GenesisConfigInfo, activate_all_features_alpenglow,
+                create_genesis_config_with_leader,
+            },
         },
         solana_signature::Signature,
         solana_signer::Signer,
@@ -1249,10 +1280,17 @@ mod tests {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn fixture() -> Fixture {
+        fixture_with(false)
+    }
+
+    /// With `alpenglow`, every bank is an Alpenglow bank (genesis certificate, every
+    /// feature including fast leader handover; slots 2 and 3 are not window starts).
+    fn fixture_with(alpenglow: bool) -> Fixture {
         let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         solana_runtime::fast_lane_commit::forget_slot_for_tests(2);
+        solana_runtime::fast_lane_commit::forget_slot_for_tests(3);
         let GenesisConfigInfo {
-            genesis_config,
+            mut genesis_config,
             mint_keypair,
             voting_keypair,
             validator_pubkey,
@@ -1261,8 +1299,12 @@ mod tests {
             &Pubkey::new_unique(),
             1_000_000_000,
         );
+        if alpenglow {
+            activate_all_features_alpenglow(&mut genesis_config);
+        }
         let (bank0, bank_forks) =
             Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        assert_eq!(bank0.is_alpenglow(), alpenglow);
         let parent =
             Bank::new_from_parent_with_bank_forks(&bank_forks, bank0, SlotLeader::default(), 1);
         parent.freeze();
@@ -1691,5 +1733,248 @@ mod tests {
         ingest.release("disabled");
         assert_eq!(ingest.frozen.len(), 0);
         assert!(ingest.slots.is_empty());
+    }
+
+    fn ring_meta(start: u32, end: u32, count: u32, flags: u16) -> ring::RecordMeta {
+        ring::RecordMeta {
+            slot: 2,
+            parent_slot: 1,
+            batch_start: start,
+            batch_end: end,
+            entry_offset: 0,
+            entry_count: count,
+            flags,
+            t_publish_ns: 7,
+        }
+    }
+
+    /// Ring input whose middle data set is `marker` (batches 0 and 2 carry entries), read in
+    /// two polls: batch 0, then the marker and batch 2.
+    fn ring_with_marker(
+        f: &Fixture,
+        marker: solana_entry::block_component::VersionedBlockMarker,
+    ) -> (Ingest, Receiver<CoordMsg>, Receiver<CmpMsg>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring");
+        let mut writer = TestWriter::create(&path, 1 << 20);
+        let mut config = Config::default();
+        config.input_dual = true;
+        config.ring_path = Some(path.clone());
+        config.ingest_spin_us = 1_000_000;
+        let (mut ingest, coord_rx, cmp_rx) = ingest(f, config);
+        assert!(!ingest.poll_ring(), "opens the ring, nothing to read yet");
+        let (b0, s0, e0) = &f.batches[0];
+        writer.publish(
+            &ring_meta(*s0, *e0, 4, ring::FLAG_FINAL),
+            &wincode::serialize(b0).unwrap(),
+        );
+        // Batch 0 starts the run before the marker arrives.
+        assert!(ingest.poll_ring());
+        let (_, s1, e1) = &f.batches[1];
+        let component = solana_entry::block_component::BlockComponent::new_block_marker(marker);
+        writer.publish(
+            &ring_meta(*s1, *e1, 0, ring::FLAG_FINAL),
+            &wincode::serialize(&component).unwrap(),
+        );
+        let (b2, s2, e2) = &f.batches[2];
+        writer.publish(
+            &ring_meta(*s2, *e2, 4, ring::FLAG_FINAL | ring::FLAG_LAST_IN_SLOT),
+            &wincode::serialize(b2).unwrap(),
+        );
+        assert!(ingest.poll_ring());
+        (ingest, coord_rx, cmp_rx, dir)
+    }
+
+    /// A ring UpdateParent marker (fast leader handover) skips the slot and aborts its run:
+    /// nothing past the marker is handed to the coordinator.
+    #[test]
+    fn test_ring_update_parent_marker_skips_slot() {
+        let f = fixture_with(true);
+        let marker = solana_entry::block_component::VersionedBlockMarker::from_update_parent(
+            solana_entry::block_component::UpdateParentV1 {
+                new_parent_slot: 0,
+                new_parent_block_id: Hash::new_unique(),
+            },
+        );
+        let (ingest, coord_rx, cmp_rx, _dir) = ring_with_marker(&f, marker);
+        let msgs: Vec<CoordMsg> = coord_rx.try_iter().collect();
+        let txs: usize = msgs
+            .iter()
+            .map(|m| match m {
+                CoordMsg::Txs { metas, .. } => metas.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(txs, f.batches[0].0.iter().map(|e| e.transactions.len()).sum::<usize>());
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, CoordMsg::AbortRun { reason: "update_parent", .. })),
+            "the run is aborted"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, CoordMsg::InputComplete { .. }))
+        );
+        assert!(cmp_rx.try_iter().any(|m| matches!(
+            m,
+            CmpMsg::SlotSkipped {
+                reason: "update_parent",
+                ..
+            }
+        )));
+        assert_eq!(ingest.stats.slots_skipped.get("update_parent"), Some(&1));
+        assert_eq!(ingest.stats.ring_decode_errors, 0);
+        // Agave's replay executes the slot itself.
+        assert_eq!(solana_runtime::fast_lane_commit::known_slot(2, 1), Some(false));
+    }
+
+    /// Header and footer markers carry no transactions: the slot runs through them.
+    #[test]
+    fn test_ring_header_marker_ignored() {
+        let f = fixture_with(true);
+        let marker = solana_entry::block_component::VersionedBlockMarker::from_block_header(
+            solana_entry::block_component::BlockHeaderV1 {
+                parent_slot: 1,
+                parent_block_id: Hash::new_unique(),
+            },
+        );
+        let (ingest, coord_rx, cmp_rx, _dir) = ring_with_marker(&f, marker);
+        let (mut run, mut next) = (None, 0);
+        let (order, complete) = drain(&coord_rx, &cmp_rx, &mut run, &mut next);
+        let expected: Vec<Signature> = [&f.batches[0].0, &f.batches[2].0]
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .flat_map(|entry| entry.transactions.iter().map(|tx| tx.signatures[0]))
+            .collect();
+        assert_eq!(order, expected);
+        assert_eq!(complete, Some(expected.len() as u32));
+        assert!(ingest.stats.slots_skipped.is_empty());
+        let run = run.unwrap();
+        assert!(run.env.alpenglow_migration_succeeded);
+    }
+
+    /// Blockstore input: once the slot's meta records an UpdateParent, the slot is skipped
+    /// before any later data set is released.
+    #[test]
+    fn test_blockstore_update_parent_skips_slot() {
+        let f = fixture_with(true);
+        let (mut ingest, coord_rx, cmp_rx) = ingest(&f, Config::default());
+        let s = sets(&f);
+        ingest.on_tap(tap(vec![s[0].clone()]));
+        let (mut run, mut next) = (None, 0);
+        let (order, _) = drain(&coord_rx, &cmp_rx, &mut run, &mut next);
+        assert_eq!(order.len(), 8);
+        // The leader switched parents at batch 1 (what blockstore records on insertion).
+        let mut meta = f.blockstore.meta(2).unwrap().unwrap();
+        meta.replay_fec_set_index = f.batches[1].1;
+        assert!(meta.has_update_parent());
+        f.blockstore.put_meta(2, &meta).unwrap();
+        ingest.on_tap(tap(vec![s[1].clone(), s[2].clone()]));
+        let msgs: Vec<CoordMsg> = coord_rx.try_iter().collect();
+        assert!(!msgs.iter().any(|m| matches!(m, CoordMsg::Txs { .. })));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, CoordMsg::AbortRun { reason: "update_parent", .. }))
+        );
+        assert_eq!(ingest.stats.slots_skipped.get("update_parent"), Some(&1));
+    }
+
+    /// With `chain = true` on Alpenglow, a child of FL's complete but unfrozen run is not
+    /// chained and not skipped: it starts over the parent once agave freezes it.
+    #[test]
+    fn test_alpenglow_child_waits_for_parent_freeze() {
+        use crate::sched::{RunSummary, SchedRun};
+        let f = fixture_with(true);
+        let bank1 = f.bank_forks.read().unwrap().get(1).unwrap();
+        assert!(bank1.is_alpenglow());
+        let bank2 =
+            Bank::new_from_parent_with_bank_forks(&f.bank_forks, bank1.clone(), f.leader, 2);
+        let entries = vec![Entry {
+            num_hashes: 1,
+            hash: Hash::default(),
+            transactions: vec![VersionedTransaction::from(Transaction::new(
+                &[&f.mint_keypair],
+                Message::new(
+                    &[system_instruction::transfer(
+                        &f.mint_keypair.pubkey(),
+                        &Pubkey::new_unique(),
+                        3_000_000,
+                    )],
+                    Some(&f.mint_keypair.pubkey()),
+                ),
+                bank1.last_blockhash(),
+            ))],
+        }];
+        let shreds: Vec<Shred> = Shredder::new(3, 2, 0, 0)
+            .unwrap()
+            .make_merkle_shreds_from_entries(
+                &Keypair::new(),
+                &entries,
+                true,
+                Hash::default(),
+                0,
+                0,
+                &ReedSolomonCache::default(),
+                &mut ProcessShredsStats::default(),
+            )
+            .into_iter()
+            .filter(Shred::is_data)
+            .collect();
+        let end = shreds.iter().map(|s| s.index()).max().unwrap();
+        f.blockstore.insert_shreds(shreds, true).unwrap();
+
+        let mut config = Config::default();
+        config.chain = true;
+        let (mut ingest, coord_rx, cmp_rx) = ingest(&f, config);
+        ingest.on_tap(tap(sets(&f)));
+        let (mut run_p, mut next) = (None, 0);
+        let (_, complete) = drain(&coord_rx, &cmp_rx, &mut run_p, &mut next);
+        assert_eq!(complete, Some(f.sigs.len() as u32));
+        let run_p = run_p.unwrap();
+        assert!(run_p.env.alpenglow_migration_succeeded);
+        ingest.on_tap(tap(vec![CompletedDataSetInfo {
+            slot: 3,
+            indices: 0..end + 1,
+        }]));
+        run_p.on_complete(&RunSummary::default());
+        let slot = ingest.complete_rx.try_recv().unwrap();
+        ingest.on_run_complete(slot);
+        assert!(coord_rx.try_iter().next().is_none(), "no chained run");
+        assert_eq!(ingest.stats.runs_chained, 0);
+        assert!(ingest.stats.slots_skipped.is_empty(), "{:?}", ingest.stats.slots_skipped);
+        assert_eq!(ingest.slots[&3].status, SlotStatus::Collecting);
+        // A chained attempt is refused by the bank and does not skip the slot either.
+        let parent_run = ingest.slots[&2].done_run.clone().unwrap();
+        assert_eq!(
+            ingest.create_chained_run(3, &parent_run, &bank2, Hash::new_unique()),
+            Err(CHAINED_ALPENGLOW)
+        );
+        // Agave freezes 2: slot 3 runs over the frozen bank.
+        bank2.freeze();
+        ingest.on_event(AgaveEvent::Frozen {
+            slot: 2,
+            bank_id: bank2.bank_id(),
+            parent_slot: 1,
+            t: Instant::now(),
+        });
+        let msgs: Vec<CoordMsg> = coord_rx.try_iter().collect();
+        let run_c = cmp_rx
+            .try_iter()
+            .find_map(|m| match m {
+                CmpMsg::RunStart { run, .. } => Some(run),
+                _ => None,
+            })
+            .unwrap();
+        assert!(run_c.chain.is_none());
+        assert_eq!(run_c.slot, 3);
+        assert_eq!(run_c.parent_slot, 2);
+        assert_eq!(run_c.parent_bank_id, bank2.bank_id());
+        assert_eq!(run_c.ordinal_base, 0);
+        assert!(run_c.env.alpenglow_migration_succeeded);
+        assert!(matches!(msgs[0], CoordMsg::NewRun { .. }));
+        assert!(matches!(&msgs[1], CoordMsg::Txs { first: 0, metas, .. } if metas.len() == 1));
+        assert!(matches!(msgs[2], CoordMsg::InputComplete { total: 1, .. }));
+        assert!(ingest.stats.slots_skipped.is_empty(), "{:?}", ingest.stats.slots_skipped);
     }
 }
