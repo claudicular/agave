@@ -11,6 +11,11 @@
 //! frozen (phase 2b), resolving P's freeze-time writes and C's SlotHashes at different
 //! points of C's execution; C contains transactions that depend on exactly those values
 //! (votes on P, transfers to and from P's fee collector) and on P's new blockhash.
+//!
+//! The Alpenglow test runs the same comparison over an Alpenglow parent (whose block footer
+//! set its Clock), with transactions reading the Clock and legacy votes (rejected on
+//! Alpenglow banks), and also commits FL's results into a fresh agave bank: its bank hash
+//! equals the serial bank's.
 
 // `AccountSharedData::new_data` (wincode; agave v4.4+).
 use solana_account::state_traits::StateMutWincode as _;
@@ -46,10 +51,15 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_runtime::{
-        bank::{Bank, SlotLeader},
+        bank::{Bank, SlotLeader, test_utils::update_vote_account_timestamp},
         bank_forks::BankForks,
-        genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
+        fast_lane_commit::Board,
+        genesis_utils::{
+            GenesisConfigInfo, activate_all_features_alpenglow, create_genesis_config_with_leader,
+        },
+        loader_utils::create_program_with_elf,
         runtime_config::RuntimeConfig,
+        transaction_execution::{CommitServices, ExternalCommit, commit_external},
     },
     solana_signature::Signature,
     solana_signer::Signer,
@@ -66,6 +76,7 @@ use {
         instruction as vote_instruction,
         state::{BLS_PUBLIC_KEY_COMPRESSED_SIZE, TowerSync},
     },
+    solana_vote_program::vote_state::BlockTimestamp,
     std::{
         collections::HashMap,
         sync::{
@@ -79,9 +90,19 @@ use {
 
 const TOKEN_PROGRAM: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Capture {
     frames: Mutex<HashMap<(Slot, Signature), Vec<(Pubkey, AccountSharedData)>>>,
+    readonly_owners: Vec<Pubkey>,
+}
+
+impl Capture {
+    fn new(readonly_owners: Vec<Pubkey>) -> Self {
+        Self {
+            frames: Mutex::default(),
+            readonly_owners,
+        }
+    }
 }
 
 impl AccountsUpdateNotifierInterface for Capture {
@@ -127,7 +148,7 @@ impl AccountsUpdateNotifierInterface for Capture {
         true
     }
     fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
-        vec![TOKEN_PROGRAM]
+        self.readonly_owners.clone()
     }
 }
 
@@ -145,19 +166,44 @@ struct World {
     leader_vote: Pubkey,
     /// (authorized voter and fee payer, vote account).
     voters: Vec<(Keypair, Pubkey)>,
+    /// Owners of the read-only accounts grouped notifications include.
+    readonly_owners: Vec<Pubkey>,
+    /// Alpenglow world: the clock-reading program deployed in the parent.
+    clock_program: Option<Pubkey>,
 }
 
+/// The clock-sysvar example program (SBPF v3): sets its return data to the Clock's
+/// `unix_timestamp` (big endian), read through the sysvar cache.
+const CLOCK_PROGRAM_ELF: &[u8] =
+    include_bytes!("../../svm/tests/example-programs/clock-sysvar/clock_sysvar_program.so");
+
+/// The Alpenglow parent's block footer time, relative to its genesis-derived time: behind
+/// it, so a TowerBFT vote-timestamp estimate for the child would differ.
+const FOOTER_OFFSET_S: i64 = -100;
+
 fn world() -> World {
+    world_with(false)
+}
+
+/// With `alpenglow`, every bank is an Alpenglow bank (genesis certificate, every feature)
+/// and the frozen parent (slot 1) went through its block footer.
+fn world_with(alpenglow: bool) -> World {
     // The leader of the chained test's slot 2 is the genesis validator (its vote account is
     // in the epoch stakes, as SIMD-0232 fee collection requires).
     let leader = Keypair::new();
     let GenesisConfigInfo {
-        genesis_config,
+        mut genesis_config,
         mint_keypair: _,
         voting_keypair,
         ..
     } = create_genesis_config_with_leader(1_000_000_000_000_000, &leader.pubkey(), 1_000_000_000_000);
-    let capture = Arc::new(Capture::default());
+    let mut readonly_owners = vec![TOKEN_PROGRAM];
+    if alpenglow {
+        activate_all_features_alpenglow(&mut genesis_config);
+        // Read-only sysvars (the Clock) appear in the grouped notifications.
+        readonly_owners.push(solana_sdk_ids::sysvar::id());
+    }
+    let capture = Arc::new(Capture::new(readonly_owners.clone()));
     let mut bank0 = Bank::new_from_genesis(
         &genesis_config,
         Arc::new(RuntimeConfig::default()),
@@ -241,6 +287,28 @@ fn world() -> World {
             (voter, vote)
         })
         .collect();
+    let clock_program = alpenglow.then(|| {
+        assert!(parent.is_alpenglow());
+        let program = create_program_with_elf(
+            &parent,
+            &solana_sdk_ids::bpf_loader_upgradeable::id(),
+            &Pubkey::new_unique(),
+            CLOCK_PROGRAM_ELF,
+        );
+        // A vote timestamp far ahead (moves a TowerBFT estimate), then P's block footer.
+        update_vote_account_timestamp(
+            BlockTimestamp {
+                slot: 1,
+                timestamp: parent.unix_timestamp_from_genesis() + 1_000_000,
+            },
+            &parent,
+            &voting_keypair.pubkey(),
+        );
+        let footer_s = parent.unix_timestamp_from_genesis() + FOOTER_OFFSET_S;
+        parent.update_clock_from_footer(footer_s * 1_000_000_000 + 987_654_321);
+        assert_eq!(parent.clock().unix_timestamp, footer_s);
+        program
+    });
     parent.freeze();
     World {
         parent,
@@ -254,6 +322,8 @@ fn world() -> World {
         leader,
         leader_vote: voting_keypair.pubkey(),
         voters,
+        readonly_owners,
+        clock_program,
     }
 }
 
@@ -509,7 +579,7 @@ fn run_fast_lane(
             2,
             &w.parent,
             &mut programs,
-            Arc::new(vec![TOKEN_PROGRAM]),
+            Arc::new(w.readonly_owners.clone()),
         )
         .unwrap(),
     );
@@ -694,8 +764,13 @@ const LOG_LIMIT: usize = 100 * 1000;
 /// agave's commit consumes: post accounts, fees, rollback accounts, status, logs, inner
 /// instructions, return data, units, deltas, loaded size, programs, balances) equals
 /// agave's, for every schedule.
+/// Tests that switch the process-global commit mode to shadow (FL keeps full processing
+/// results) run one at a time.
+static SHADOW: Mutex<()> = Mutex::new(());
+
 #[test]
 fn test_full_processing_result_against_agave() {
+    let _shadow = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
     agave_fast_lane::control::set_agave_execution(agave_fast_lane::control::AgaveExecution {
         record: true,
         log_messages_bytes_limit: Some(LOG_LIMIT),
@@ -1122,4 +1197,260 @@ fn test_output_ring_matches_agave_frames() {
             txs.len() - tx_records.len()
         );
     }
+}
+
+/// The Alpenglow child's transactions: the usual workload, plus transactions reading the
+/// Clock (through the sysvar cache, with the Clock account also an instruction account so
+/// the grouped notifications carry the value each side read) and legacy TowerBFT votes
+/// (rejected on an Alpenglow bank). Returns them with the Clock readers' and the votes'
+/// signatures.
+fn alpenglow_transactions(w: &World) -> (Vec<VersionedTransaction>, Vec<Signature>, Vec<Signature>) {
+    let blockhash = w.parent.last_blockhash();
+    let clock_program = w.clock_program.unwrap();
+    let mut txs = transactions_with(w, 13, blockhash, w.nonce_hash);
+    let mut clock_readers = Vec::new();
+    let mut extra = Vec::new();
+    for (i, payer) in w.payers.iter().enumerate() {
+        let read_clock = solana_instruction::Instruction::new_with_bytes(
+            clock_program,
+            &[i as u8],
+            vec![solana_instruction::AccountMeta::new_readonly(
+                solana_sdk_ids::sysvar::clock::id(),
+                false,
+            )],
+        );
+        // The Clock read is the last instruction: a later one would reset the return data.
+        let mut ixs = Vec::new();
+        if i % 2 == 1 {
+            ixs.push(system_instruction::transfer(
+                &payer.pubkey(),
+                &w.keys[2 + i].pubkey(),
+                1_000 + i as u64,
+            ));
+        }
+        ixs.push(read_clock);
+        let tx = Transaction::new(&[payer], Message::new(&ixs, Some(&payer.pubkey())), blockhash);
+        clock_readers.push(tx.signatures[0]);
+        extra.push(tx);
+    }
+    let mut votes = Vec::new();
+    for (voter, vote) in &w.voters {
+        let tx = Transaction::new(
+            &[voter],
+            Message::new(
+                &[vote_instruction::tower_sync(
+                    vote,
+                    &voter.pubkey(),
+                    TowerSync::new_from_slots(vec![1], w.parent.hash(), None),
+                )],
+                Some(&voter.pubkey()),
+            ),
+            blockhash,
+        );
+        votes.push(tx.signatures[0]);
+        extra.push(tx);
+    }
+    for (i, tx) in extra.into_iter().enumerate() {
+        let at = (i * 31 + 5).min(txs.len());
+        txs.insert(at, VersionedTransaction::from(tx));
+    }
+    (txs, clock_readers, votes)
+}
+
+/// The return data of an executed transaction.
+fn return_data(result: &TransactionProcessingResult) -> Option<Vec<u8>> {
+    match result {
+        Ok(ProcessedTransaction::Executed(executed)) => executed
+            .execution_details
+            .return_data
+            .as_ref()
+            .map(|data| data.data.clone()),
+        _ => None,
+    }
+}
+
+/// Alpenglow parent: FL's per-transaction statuses, grouped notifications and full
+/// processing results equal agave's serial execution on a real Alpenglow child bank, for
+/// every schedule; transactions read the parent's footer Clock and legacy votes fail on
+/// both sides; and FL's results committed into a fresh child bank through agave's commit
+/// path give the serial bank's hash.
+#[test]
+fn test_alpenglow_differential_against_agave() {
+    let _shadow = SHADOW.lock().unwrap_or_else(|e| e.into_inner());
+    agave_fast_lane::control::set_agave_execution(agave_fast_lane::control::AgaveExecution {
+        record: true,
+        log_messages_bytes_limit: Some(LOG_LIMIT),
+    });
+    agave_fast_lane::control::set_commit_mode(agave_fast_lane::control::COMMIT_SHADOW);
+    let w = world_with(true);
+    assert!(w.parent.is_alpenglow());
+    let footer_timestamp = w.parent.clock().unix_timestamp;
+    let (txs, clock_readers, votes) = alpenglow_transactions(&w);
+    let clock_id = solana_sdk_ids::sysvar::clock::id();
+
+    // The slot's leader is the genesis validator (freeze deposits its fees, SIMD-0232).
+    let leader = SlotLeader {
+        id: w.leader.pubkey(),
+        vote_address: w.leader_vote,
+    };
+    // Agave, serially, on a real Alpenglow child of P.
+    let child =
+        Bank::new_from_parent_with_bank_forks(&w.bank_forks, w.parent.clone(), leader, 2);
+    assert!(child.is_alpenglow());
+    let child_clock = child.clock();
+    assert_eq!(child_clock.slot, 2);
+    assert_eq!(child_clock.unix_timestamp, footer_timestamp);
+    assert_ne!(footer_timestamp, child.unix_timestamp_from_genesis());
+    let agave = execute_serially_full(&child, &txs);
+    let frames = std::mem::take(&mut *w.capture.frames.lock().unwrap());
+    let statuses: HashMap<Signature, Result<(), TransactionError>> = agave
+        .iter()
+        .map(|(sig, (result, _))| {
+            let status = match result {
+                Ok(processed) => processed.status(),
+                Err(err) => Err(err.clone()),
+            };
+            (*sig, status)
+        })
+        .collect();
+    assert!(statuses.values().filter(|s| s.is_err()).count() > 5);
+    for sig in &clock_readers {
+        assert_eq!(statuses[sig], Ok(()), "agave: clock reader {sig}");
+        assert_eq!(
+            return_data(&agave[sig].0),
+            Some(footer_timestamp.to_be_bytes().to_vec()),
+            "agave reads P's footer time (logs {:?})",
+            match &agave[sig].0 {
+                Ok(ProcessedTransaction::Executed(executed)) => {
+                    executed.execution_details.log_messages.clone()
+                }
+                _ => None,
+            }
+        );
+        let frame = &frames[&(2, *sig)];
+        let (_, clock_account) = frame.iter().find(|(key, _)| *key == clock_id).unwrap();
+        assert_eq!(Some(clock_account), child.get_account(&clock_id).as_ref());
+    }
+    for sig in &votes {
+        assert_eq!(
+            format!("{:?}", statuses[sig]),
+            "Err(InstructionError(0, InvalidInstructionData))",
+            "agave rejects legacy votes on Alpenglow"
+        );
+    }
+
+    let mut committed = None;
+    for (i, (workers, speculation, theta, rebase)) in [
+        (1usize, false, 0.2f32, false),
+        (2, true, 0.2, false),
+        (6, true, 1000.0, false),
+        (3, true, 0.5, true),
+        (8, true, 0.5, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let what = format!("alpenglow K={workers} spec={speculation} theta={theta} rebase={rebase}");
+        let (outcomes, summary, run) =
+            run_fast_lane(&w, &txs, workers, speculation, theta, rebase);
+        assert!(run.env.alpenglow_migration_succeeded, "{what}");
+        assert_eq!(run.ctx.clock, child_clock, "{what}: Clock");
+        assert_eq!(outcomes.len(), txs.len(), "{what}: every tx final");
+        assert_eq!(summary.unprocessable, 0, "{what}");
+        let last = i == 4;
+        let mut kept = Vec::new();
+        for mut outcome in outcomes {
+            let sig = outcome.signature;
+            assert_eq!(&outcome.status, &statuses[&sig], "{what}: status of {sig}");
+            assert_frames_equal(
+                &format!("{what} tx {} {sig}", outcome.ordinal),
+                &outcome.frame,
+                frames.get(&(2, sig)),
+            );
+            let processed = outcome.processed.take().expect("kept with commit = shadow");
+            assert!(processed.recorded, "{what}");
+            if last {
+                // Committed below; compared through the bank hash.
+                kept.push((outcome.ordinal, sig, processed));
+                continue;
+            }
+            let fl = agave_fast_lane::full_cmp::FlFull::new(
+                outcome.slot,
+                outcome.parent_slot,
+                outcome.ordinal,
+                sig,
+                *processed,
+            );
+            let (agave_result, agave_balances) = &agave[&sig];
+            if clock_readers.contains(&sig) {
+                assert_eq!(return_data(&fl.result), return_data(agave_result), "{what}");
+            }
+            let mut fields = Vec::new();
+            agave_fast_lane::full_cmp::diff(
+                &fl.result,
+                fl.balances.as_ref(),
+                true,
+                agave_result,
+                agave_balances.as_ref(),
+                &mut fields,
+            );
+            assert!(fields.is_empty(), "{what}: {sig} differs in {fields:?}");
+        }
+        // Final state of every account FL wrote equals agave's child bank.
+        for key in run.overlay.written_keys() {
+            let fl = run.overlay.latest(&key).value;
+            let agave = child.get_account(&key);
+            assert!(same_value(&fl, &agave), "{what}: final state of {key}");
+        }
+        if last {
+            committed = Some((run, kept));
+        }
+        eprintln!("{what}: {summary:?}");
+    }
+
+    // The serial bank's footer (after its last transaction) and freeze.
+    let child_footer_nanos = (footer_timestamp + 1) * 1_000_000_000 + 1;
+    child.update_clock_from_footer(child_footer_nanos);
+    child.freeze();
+    let serial_hash = child.hash();
+    drop(child);
+    w.bank_forks.write().unwrap().clear_bank(2, false);
+
+    // A fresh child bank of P with FL's results committed through agave's commit path, in
+    // block order, then the same footer and freeze.
+    let (run, mut kept) = committed.unwrap();
+    kept.sort_by_key(|(ordinal, _, _)| *ordinal);
+    let bank = Bank::new_from_parent_with_bank_forks(&w.bank_forks, w.parent.clone(), leader, 2);
+    let board = Board::new_for_tests(2, bank.bank_id(), 0);
+    for (index, (ordinal, sig, processed)) in kept.into_iter().enumerate() {
+        assert_eq!(ordinal as usize, index);
+        assert_eq!(txs[index].signatures[0], sig);
+        let entry = run.tx(ordinal).unwrap();
+        let processed = *processed;
+        let result = commit_external(
+            &bank,
+            &board,
+            index,
+            &entry.rtx,
+            &processed.check,
+            processed.result,
+            processed.balances,
+            CommitServices {
+                transaction_status_sender: None,
+                replay_vote_sender: None,
+                prioritization_fee_cache: None,
+            },
+            &mut ExecuteTimings::default(),
+        );
+        assert_eq!(result, ExternalCommit::Committed(Ok(())), "commit of {sig}");
+    }
+    let committed_frames = std::mem::take(&mut *w.capture.frames.lock().unwrap());
+    assert_eq!(committed_frames.len(), frames.len(), "grouped notification count");
+    for (key, frame) in &frames {
+        assert_eq!(Some(frame), committed_frames.get(key), "grouped notification of {key:?}");
+    }
+    bank.update_clock_from_footer(child_footer_nanos);
+    bank.freeze();
+    assert_eq!(bank.hash(), serial_hash, "bank hash");
+    agave_fast_lane::control::set_commit_mode(agave_fast_lane::control::COMMIT_OFF);
 }
