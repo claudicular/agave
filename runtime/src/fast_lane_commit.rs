@@ -41,7 +41,9 @@
 //! fast-lane commit agave's replay never verified, or a replay error on a bank the fast lane
 //! committed into makes replay clear the bank and replay the slot without the fast lane
 //! ([`close_bank`], [`abandon_bank`], [`mark_agave_only`]). Poisoning the fast lane stops
-//! commit mode at once: agave's handlers stop waiting and claim every free cell.
+//! commit mode at once: agave's handlers stop waiting and claim every free cell. Every other
+//! bank replay clears (Alpenglow UpdateParent restart, abandoned bank, switch to another block
+//! version, and their descendants) is stopped first as well ([`on_bank_clearing`]).
 
 use {
     crate::{bank::Bank, transaction_balances::compile_collected_balances},
@@ -1248,6 +1250,10 @@ pub static BOARD_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 static BOARDS: RwLock<Option<HashMap<BankId, Arc<Board>>>> = RwLock::new(None);
 static AGAVE_ONLY: Mutex<VecDeque<Slot>> = Mutex::new(VecDeque::new());
+/// (slot, parent's bank hash) of banks replay cleared ([`on_bank_clearing`]): a replacement bank
+/// of the slot over the same parent gets no board.
+static CLEARED: Mutex<VecDeque<(Slot, Hash)>> = Mutex::new(VecDeque::new());
+const CLEARED_MAX: usize = 256;
 
 thread_local! {
     static LAST_BOARD: RefCell<Option<Arc<Board>>> = const { RefCell::new(None) };
@@ -1307,32 +1313,55 @@ pub fn mark_agave_only(slot: Slot) {
     }
 }
 
+fn is_cleared_replacement(slot: Slot, parent_hash: Hash) -> bool {
+    CLEARED
+        .lock()
+        .map(|c| c.contains(&(slot, parent_hash)))
+        .unwrap_or(true)
+}
+
+fn register_board(bank: &Bank) -> Arc<Board> {
+    let board = Arc::new(Board::new(bank, SAMPLE_PPM.load(Ordering::Relaxed)));
+    if let Ok(mut guard) = BOARDS.write() {
+        let boards = guard.get_or_insert_with(HashMap::new);
+        // Bounded: forget boards far behind the newest slot (their banks are gone).
+        if boards.len() >= 512 {
+            let horizon = bank.slot().saturating_sub(512);
+            let before = boards.len();
+            boards.retain(|_, b| b.slot >= horizon);
+            COMMIT_BOARDS.fetch_sub(before - boards.len(), Ordering::AcqRel);
+        }
+        if boards.insert(bank.bank_id(), Arc::clone(&board)).is_none() {
+            COMMIT_BOARDS.fetch_add(1, Ordering::AcqRel);
+        }
+        STATS.boards_created.fetch_add(1, Ordering::Relaxed);
+    }
+    board
+}
+
 /// `BankForks::insert`: a bank inserted while the commit mode is on gets a board.
 pub fn on_bank_inserted(bank: &Arc<Bank>) {
     let mode = MODE.load(Ordering::SeqCst);
     if mode == MODE_OFF {
         return;
     }
-    if mode == MODE_ON && !is_agave_only(bank.slot()) && bank.parent().is_some() {
-        let board = Arc::new(Board::new(bank, SAMPLE_PPM.load(Ordering::Relaxed)));
-        if let Ok(mut guard) = BOARDS.write() {
-            let boards = guard.get_or_insert_with(HashMap::new);
-            // Bounded: forget boards far behind the newest slot (their banks are gone).
-            if boards.len() >= 512 {
-                let horizon = bank.slot().saturating_sub(512);
-                let before = boards.len();
-                boards.retain(|_, b| b.slot >= horizon);
-                COMMIT_BOARDS.fetch_sub(before - boards.len(), Ordering::AcqRel);
-            }
-            if boards.insert(bank.bank_id(), board).is_none() {
-                COMMIT_BOARDS.fetch_add(1, Ordering::AcqRel);
-            }
-            STATS.boards_created.fetch_add(1, Ordering::Relaxed);
-        }
+    if mode == MODE_ON
+        && !is_agave_only(bank.slot())
+        && bank.parent().is_some()
+        && !is_cleared_replacement(bank.slot(), bank.parent_hash())
+    {
+        register_board(bank);
     }
     if let Some(hooks) = hooks() {
         hooks.on_bank_inserted(bank);
     }
+}
+
+/// Tests: give `bank` a commit board now, whatever the (process-global) mode and the
+/// agave-only set, so that a test can commit into it through [`Board::begin_commit`].
+#[cfg(feature = "dev-context-only-utils")]
+pub fn insert_board_for_tests(bank: &Bank) -> Arc<Board> {
+    register_board(bank)
 }
 
 /// `BankForks::remove`: a bank leaves bank forks (pruned, dumped, cleared). No fast-lane
@@ -1342,6 +1371,48 @@ pub fn on_bank_removed(bank_id: BankId) {
         board.abandon();
         board.close();
     }
+}
+
+/// `ReplayStage::clear_slots` is about to clear `bank`: an Alpenglow UpdateParent restart or
+/// abandoned bank, a switch to another version of the block, a descendant of one of those, or
+/// a replay without the fast lane (whose board [`close_bank`] / [`abandon_bank`] already
+/// removed). Called before replay waits for the bank's scheduler.
+/// - The board is abandoned and closed at once: replay's handlers stop waiting for the fast
+///   lane (they claim every free cell) and no new fast-lane commit starts; commits in flight
+///   finish first. It stays registered until `BankForks::remove`, so a cell the fast lane
+///   already committed still returns its stored result instead of executing a second time.
+/// - The slot is published as skipped: no handler of a replacement bank waits for a binding.
+/// - A replacement bank of the slot over the same parent (e.g. the other block version of a
+///   switch) gets no board, so a fast-lane run of the cleared version can never bind it.
+///   The slot is not marked agave-only: a replacement over another parent (UpdateParent) is
+///   left to the fast lane's own decision.
+///
+/// Returns the number of fast-lane commits in the bank.
+pub fn on_bank_clearing(bank: &Bank) -> u32 {
+    fl_skips_slot(bank.slot());
+    if let Ok(mut cleared) = CLEARED.lock() {
+        let key = (bank.slot(), bank.parent_hash());
+        if !cleared.contains(&key) {
+            cleared.push_back(key);
+            while cleared.len() > CLEARED_MAX {
+                cleared.pop_front();
+            }
+        }
+    }
+    let Some(board) = board_of(bank.bank_id()) else {
+        return 0;
+    };
+    board.abandon();
+    board.close();
+    let fl_commits = board.fl_committed();
+    if fl_commits > 0 {
+        warn!(
+            "fast lane commit: slot {} (bank {}) is cleared by replay with {fl_commits} \
+             fast-lane commits",
+            board.slot, board.bank_id
+        );
+    }
+    fl_commits
 }
 
 /// Replay's handler for task `index` of `bank` (the unified scheduler's `DefaultTaskHandler`).
@@ -1805,6 +1876,66 @@ mod tests {
         set_fl_live(false);
         forget_slot_for_tests(1);
         forget_slot_for_tests(40);
+    }
+
+    /// A bank replay clears (Alpenglow UpdateParent, abandoned bank, switch): its board stops at
+    /// once, keeps what the fast lane committed for replay to verify, and fences a replacement
+    /// bank of the slot over the same parent.
+    #[test]
+    fn test_bank_clearing_stops_board_and_fences_replacement() {
+        use crate::{bank::SlotLeader, genesis_utils::create_genesis_config};
+        let genesis = create_genesis_config(1_000_000_000).genesis_config;
+        let (parent, bank_forks) = Bank::new_for_tests(&genesis).wrap_with_bank_forks_for_tests();
+        parent.freeze();
+        let slot = 3;
+        let bank = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            parent.clone(),
+            SlotLeader::default(),
+            slot,
+        );
+        let board = insert_board_for_tests(&bank);
+        assert!(board.bind());
+        let hash = Hash::new_unique();
+        board.begin_commit(0).unwrap().done(&Ok(()), &hash);
+        fl_knows_slot(slot, 0);
+        assert!(!is_cleared_replacement(slot, parent.hash()));
+
+        assert_eq!(on_bank_clearing(&bank), 1);
+        assert!(board.is_closed());
+        assert!(
+            !board.is_bound(),
+            "abandoned: handlers claim free cells at once"
+        );
+        assert!(
+            board.begin_commit(1).is_none(),
+            "no fast-lane commit starts any more"
+        );
+        assert!(
+            board_of(bank.bank_id()).is_some(),
+            "registered until BankForks::remove"
+        );
+        assert_eq!(board.state_of(0), FL_DONE, "kept for replay to verify");
+        assert_eq!(known_slot(slot, 0), Some(false), "published as skipped");
+        assert!(is_cleared_replacement(slot, parent.hash()));
+        assert!(
+            !is_cleared_replacement(slot, Hash::new_unique()),
+            "another parent"
+        );
+        assert!(!is_agave_only(slot), "not agave-only");
+        // A bank without a board: nothing to stop.
+        let other = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            parent.clone(),
+            SlotLeader::default(),
+            slot + 1,
+        );
+        assert_eq!(on_bank_clearing(&other), 0);
+
+        on_bank_removed(bank.bank_id());
+        assert!(board_of(bank.bank_id()).is_none());
+        forget_slot_for_tests(slot);
+        forget_slot_for_tests(slot + 1);
     }
 
     #[test]
