@@ -1,0 +1,21 @@
+# /etc/systemd/system/agave-cpu-layout.service (FRA): re-pins agave's threads (and the
+# shredstream proxy) by name every 0.5 s; waits 30 s after an agave start so agave sizes its
+# thread pools from the full CPU set first. Layout: /home/sol/agave-cpu-layout.env.
+[Unit]
+Description=CPU layout for agave + fast lane + shredstream proxy (pin_layout.py)
+After=agave.service
+PartOf=agave.service
+# Never hit the start limit: an agave crash loop restarts this unit with it every time.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/home/sol/agave-cpu-layout.env
+ExecStart=/usr/bin/python3 /home/sol/bin/pin_layout.py
+Restart=always
+RestartSec=2
+# The pinner itself runs on agave's shared CPUs; keep in sync with AGAVE_CPUS.
+AllowedCPUs=0-7,24-29
+
+[Install]
+WantedBy=agave.service
