@@ -7648,6 +7648,7 @@ dependencies = [
  "solana-rent",
  "solana-sbpf",
  "solana-sdk-ids",
+ "solana-sha256-hasher",
  "solana-slot-hashes",
  "solana-stable-layout 4.0.0",
  "solana-stake-history",

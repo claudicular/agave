@@ -13,7 +13,7 @@ use {
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::Slot,
-    solana_measure::{measure::Measure, measure_us},
+    solana_measure::{clock::Timestamp, measure::Measure, measure_us},
     solana_pubkey::Pubkey,
     std::{
         mem::ManuallyDrop,
@@ -22,7 +22,7 @@ use {
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::Duration,
     },
 };
 
@@ -93,8 +93,8 @@ pub(crate) struct ReadOnlyAccountsCache {
     stats: Arc<AtomicReadOnlyCacheStats>,
     highest_slot_stored: AtomicU64,
 
-    /// Timer for generating timestamps for entries.
-    timer: Instant,
+    /// Timer for generating timestamps for entries (recency for eviction sampling only).
+    timer: Timestamp,
 
     /// To the evictor goes the spoiled [sic]
     ///
@@ -126,7 +126,7 @@ impl ReadOnlyAccountsCache {
         let data_size = Arc::new(AtomicUsize::default());
         let cache_len = Arc::new(AtomicUsize::default());
         let stats = Arc::new(AtomicReadOnlyCacheStats::default());
-        let timer = Instant::now();
+        let timer = Timestamp::now();
         let evictor_control = Arc::new(EvictorControl {
             exit: Mutex::new(false),
             wake: Condvar::new(),

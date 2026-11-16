@@ -306,7 +306,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         // num-traits is incorrect, but it's the existing behavior.
         let signers = signer_seeds
             .iter()
-            .map(|seeds| Pubkey::create_program_address(seeds, &caller_program_id))
+            .map(|seeds| crate::pda::create_program_address(seeds, &caller_program_id))
             .collect::<Result<Vec<Pubkey>, solana_pubkey::PubkeyError>>()
             .map_err(|e| e as u64)?;
         self.prepare_next_cpi_instruction(instruction, &signers)?;
@@ -732,6 +732,12 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
     /// Get this invocation's compute budget
     pub fn get_compute_budget(&self) -> &SVMTransactionExecutionBudget {
         &self.compute_budget
+    }
+
+    /// Set the VM heap size (as requested via `RequestHeapFrame`) for tests.
+    #[cfg(test)]
+    pub(crate) fn set_heap_size_for_tests(&mut self, heap_size: u32) {
+        self.compute_budget.heap_size = heap_size;
     }
 
     /// Get this invocation's compute budget
