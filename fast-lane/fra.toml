@@ -34,7 +34,8 @@ input = dual
 ring_path = "/dev/shm/shredstream.v2.ring"
 
 # Start a slot on FL's own run of its parent before agave freezes the parent.
-chain = true
+# Off: chaining does not model Alpenglow's parent block footer (FL refuses it on Alpenglow).
+chain = false
 
 # Shared-memory ring of every FINAL transaction's Token/Token-2022 account updates.
 out_ring = true

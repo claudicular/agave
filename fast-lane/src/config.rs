@@ -575,7 +575,9 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.workers, 8);
         assert_eq!(config.worker_cores, vec![10, 11, 12, 13, 14, 36, 37, 38]);
-        assert!(config.input_dual && config.chain && config.out_ring);
+        assert!(config.input_dual && config.out_ring);
+        // Alpenglow: chained runs are refused (the parent's block footer is not modeled).
+        assert!(!config.chain);
         assert!(config.rebase && config.vm_opts);
         assert_eq!(config.commit, crate::control::COMMIT_ON);
         assert!(config.commit_on_workers);
