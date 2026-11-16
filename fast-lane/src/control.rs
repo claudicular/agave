@@ -305,6 +305,17 @@ pub fn is_poisoned_sticky() -> bool {
     FL_STICKY.load(Ordering::SeqCst)
 }
 
+/// The reasons of the provisional poisons still open (diagnostics and tests).
+pub fn open_provisional_reasons() -> Vec<String> {
+    PROVISIONAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .open
+        .iter()
+        .map(|(_, reason)| reason.clone())
+        .collect()
+}
+
 /// Disable the fast lane like [`poison`], but liftable: the cluster check takes this when our
 /// bank hash disagrees with the cluster's and it cannot yet tell whether the fast lane or a
 /// duplicate block is at fault. [`make_sticky`] turns it into a permanent poison;

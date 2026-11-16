@@ -41,12 +41,41 @@
 //! A disagreement on a slot whose parent version was itself found wrong is inherited from the
 //! parent's verdict. A fast signal that the cluster then contradicts (it confirms our hash) is
 //! lifted as a false alarm.
+//!
+//! **Alpenglow.** None of the TowerBFT signals above exists once Alpenglow is enabled: votes
+//! certify block ids, not bank hashes, the vote listener returns before [`on_vote`], and replay
+//! never runs the cluster-slot-state verifier. The reference becomes the bank hash the **leader**
+//! put in the block footer, compared by replay at freeze (`freeze_and_verify_bank_hash`). It is
+//! the leader's claim, not a stake-weighted confirmation, but every honest validator votes for a
+//! block only after the same comparison passed, and detection is at freeze. Replay calls:
+//! - [`on_block_footer_match`] for every checked freeze that matched: the slot counts as matched
+//!   (source `block_footer`, so [`last_matched_slot`], the output ring's rollback horizon and
+//!   the `fast_lane_cluster_check` metrics advance);
+//! - [`on_block_footer_mismatch`] when it differs. Upstream marks such a slot dead. If FL
+//!   committed into the bank, replay instead clears the bank and replays the slot once without
+//!   FL, with FL disabled provisionally; that replay's footer check decides:
+//!   - it matches, on the same block: **`fl_wrong`**, sticky until restart;
+//!   - it still differs, on the same block, with FL's hash: **`leader_footer`** (the leader's
+//!     claim or agave's own replay is at fault, not FL): the provisional poison is lifted and
+//!     replay marks the slot dead as upstream would;
+//!   - it still differs, with another hash than FL's: FL changed the bank, **`fl_wrong`**
+//!     (sticky), and the slot is marked dead;
+//!   - the replay's bank is cleared ([`on_bank_cleared`]: switch, UpdateParent) or dies
+//!     ([`on_replay_dead`]) first, a different block is replayed, or nothing within 2 min:
+//!     **`unresolved`**, sticky.
+//!
+//!   A mismatch on a bank FL committed nothing into is recorded (`not_fl`) and leaves FL as it
+//!   is. The vote-based fast signal and the gossip-lag metrics are TowerBFT-only: the report is
+//!   labelled `consensus=alpenglow` once a footer was checked and leaves them out.
 
 use {
-    crate::control,
+    crate::{
+        control::{self, TapStats},
+        tees::AgaveEvent,
+    },
     log::{error, info, warn},
     parking_lot::Mutex,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     std::{
@@ -98,7 +127,8 @@ pub enum EventKind {
     /// poisoned.
     FastSignal { stake_pct: u64 },
     /// A disagreement was attributed (see the module docs): `duplicate_block`, `fl_wrong`,
-    /// `unresolved`, `inherited`, `false_alarm`, or `lifted` (FL back after a duplicate block).
+    /// `unresolved`, `inherited`, `false_alarm`, `lifted` (FL back after a duplicate block),
+    /// and for Alpenglow block footers `leader_footer` and `not_fl`.
     Attribution { verdict: &'static str },
 }
 
@@ -140,6 +170,20 @@ struct Attribution {
     created: Instant,
     /// Duplicate block: FL comes back once a slot above this is frozen.
     lift_above: Option<Slot>,
+    /// Alpenglow block-footer disagreement: the bank FL committed into (`first`). The verdict
+    /// comes from the footer check of the slot's next bank over the same parent, which replay
+    /// creates and replays without FL.
+    footer_bank: Option<BankId>,
+}
+
+impl Attribution {
+    /// `bank_id` (over `parent`) is the replay without FL that decides this footer
+    /// disagreement: another bank of the slot over the same parent version.
+    fn is_footer_rereplay(&self, slot: Slot, bank_id: BankId, parent: (Slot, Hash)) -> bool {
+        self.slot == slot
+            && self.footer_bank.is_some_and(|first| first != bank_id)
+            && (self.first.parent_slot, self.first.parent_hash) == parent
+    }
 }
 
 /// Open attributions older than this without a verdict become sticky.
@@ -207,6 +251,15 @@ struct Stats {
     attrib_inherited: u64,
     attrib_false_alarm: u64,
     lifted: u64,
+    /// Alpenglow: freezes checked against the leader's block footer, and their outcome.
+    footer_matched: u64,
+    footer_mismatched: u64,
+    /// Footer mismatches on a bank FL committed into: replayed once without FL.
+    footer_retries: u64,
+    attrib_leader_footer: u64,
+    attrib_not_fl: u64,
+    /// Banks replay cleared (UpdateParent, abandoned bank, switch, replay without FL).
+    cleared: u64,
 }
 
 struct State {
@@ -223,6 +276,8 @@ struct State {
     /// Frozen versions found wrong.
     bad: VecDeque<(Slot, Hash)>,
     attributions: Vec<Attribution>,
+    /// A block footer was checked: Alpenglow is enabled (the TowerBFT signals are dead).
+    alpenglow: bool,
 }
 
 impl State {
@@ -238,6 +293,7 @@ impl State {
             versions: BTreeMap::new(),
             bad: VecDeque::new(),
             attributions: Vec::new(),
+            alpenglow: false,
         }
     }
 
@@ -254,6 +310,8 @@ impl State {
                 "inherited" => stats.attrib_inherited += 1,
                 "false_alarm" => stats.attrib_false_alarm += 1,
                 "lifted" => stats.lifted += 1,
+                "leader_footer" => stats.attrib_leader_footer += 1,
+                "not_fl" => stats.attrib_not_fl += 1,
                 _ => stats.attrib_unresolved += 1,
             }
         }
@@ -346,6 +404,7 @@ impl State {
             horizon: self.max_slot.max(slot),
             created: Instant::now(),
             lift_above: None,
+            footer_bank: None,
         });
     }
 
@@ -353,7 +412,12 @@ impl State {
     fn resolve(&mut self, slot: Slot, version: &BlockVersion) {
         let mut decided = Vec::new();
         for (i, a) in self.attributions.iter().enumerate() {
-            if a.slot != slot || a.lift_above.is_some() || version.hash == a.first.hash {
+            // Footer disagreements are decided by the replay's own footer check.
+            if a.slot != slot
+                || a.lift_above.is_some()
+                || a.footer_bank.is_some()
+                || version.hash == a.first.hash
+            {
                 continue;
             }
             let Some(cluster) = a.cluster_hash else {
@@ -557,8 +621,13 @@ impl State {
             .filter(|r| r.our_hash.is_some() && !r.verdict)
             .count();
         let poisoned = control::is_poisoned();
+        if self.alpenglow {
+            self.report_alpenglow(&i, pending, poisoned);
+            return;
+        }
         info!(
-            "fast_lane_cluster_check frozen={} matched={} at_freeze={} mismatched={} \
+            "fast_lane_cluster_check consensus=towerbft frozen={} matched={} at_freeze={} \
+             mismatched={} \
              dead_confirmed={} recovered={} fast_fired={} unchecked={} pending={pending} \
              lag_ms_p50={lag50} p90={lag90} p99={lag99} max={lagmax} gossip52_ms_p50={g50} \
              p90={g90} p99={g99} max={gmax} gossip52_reached={} gossip52_never={} votes={} \
@@ -592,6 +661,7 @@ impl State {
         );
         solana_metrics::datapoint_info!(
             "fast_lane_cluster_check",
+            ("consensus", "towerbft", String),
             ("attrib_duplicate", t.attrib_duplicate as i64, i64),
             ("attrib_fl_wrong", t.attrib_fl_wrong as i64, i64),
             ("attrib_unresolved", t.attrib_unresolved as i64, i64),
@@ -624,6 +694,63 @@ impl State {
             ("poisoned", poisoned, bool),
         );
     }
+
+    /// Alpenglow: the reference is the leader's block footer, checked at freeze. The vote-based
+    /// fast signal, the freeze-to-confirmation lag and the gossip-only measurements do not exist
+    /// (TowerBFT only) and are left out rather than reported as zeros.
+    fn report_alpenglow(&self, i: &Stats, pending: usize, poisoned: bool) {
+        let t = &self.total;
+        info!(
+            "fast_lane_cluster_check consensus=alpenglow reference=block_footer frozen={} \
+             matched={} mismatched={} footer_retries={} recovered={} unchecked={} \
+             pending={pending} cleared={} total_matched={} total_mismatched={} \
+             total_footer_retries={} total_unchecked={} poisoned={poisoned} sticky={} \
+             attrib_fl_wrong={} attrib_leader_footer={} attrib_not_fl={} attrib_unresolved={} \
+             open_attributions={} last_matched={} (TowerBFT vote/gossip signals: n/a)",
+            i.frozen,
+            i.footer_matched,
+            i.footer_mismatched,
+            i.footer_retries,
+            i.recovered,
+            i.unchecked,
+            i.cleared,
+            t.footer_matched,
+            t.footer_mismatched,
+            t.footer_retries,
+            t.unchecked,
+            control::is_poisoned_sticky(),
+            t.attrib_fl_wrong,
+            t.attrib_leader_footer,
+            t.attrib_not_fl,
+            t.attrib_unresolved,
+            self.attributions.len(),
+            last_matched_slot(),
+        );
+        solana_metrics::datapoint_info!(
+            "fast_lane_cluster_check",
+            ("consensus", "alpenglow", String),
+            ("frozen", i.frozen as i64, i64),
+            ("matched", i.footer_matched as i64, i64),
+            ("mismatched", i.footer_mismatched as i64, i64),
+            ("footer_retries", i.footer_retries as i64, i64),
+            ("recovered", i.recovered as i64, i64),
+            ("unchecked", i.unchecked as i64, i64),
+            ("pending", pending as i64, i64),
+            ("cleared", i.cleared as i64, i64),
+            ("total_matched", t.footer_matched as i64, i64),
+            ("total_mismatched", t.footer_mismatched as i64, i64),
+            ("total_footer_retries", t.footer_retries as i64, i64),
+            ("total_unchecked", t.unchecked as i64, i64),
+            ("attrib_fl_wrong", t.attrib_fl_wrong as i64, i64),
+            ("attrib_leader_footer", t.attrib_leader_footer as i64, i64),
+            ("attrib_not_fl", t.attrib_not_fl as i64, i64),
+            ("attrib_unresolved", t.attrib_unresolved as i64, i64),
+            ("open_attributions", self.attributions.len() as i64, i64),
+            ("last_matched", last_matched_slot() as i64, i64),
+            ("poisoned", poisoned, bool),
+            ("sticky", control::is_poisoned_sticky(), bool),
+        );
+    }
 }
 
 /// (p50, p90, p99, max) of `samples`, 0s when empty.
@@ -642,41 +769,166 @@ fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::new()))
 }
 
+impl State {
+    /// Replay froze `slot` with `hash`.
+    fn frozen(&mut self, slot: Slot, hash: Hash, now: Instant) {
+        self.max_slot = self.max_slot.max(slot);
+        {
+            let rec = self.slots.entry(slot).or_default();
+            rec.our_hash = Some(hash);
+            rec.frozen_at = Some(now);
+            rec.verdict = false;
+            rec.fast_fired = false;
+            rec.gossip_cross = [None; 3];
+            // Gossip votes for our hash may have crossed thresholds before the freeze.
+            if rec.total_stake > 0
+                && let Some(v) = rec.votes.iter().find(|v| v.hash == hash)
+            {
+                for (i, pct) in [33u64, DUPLICATE_PCT, 67].into_iter().enumerate() {
+                    if at_least_pct(v.gossip_stake, rec.total_stake, pct) {
+                        rec.gossip_cross[i] = Some(now);
+                    }
+                }
+            }
+        }
+        for stats in [&mut self.interval, &mut self.total] {
+            stats.frozen += 1;
+        }
+        self.check_fast(slot, now);
+        self.prune();
+    }
+
+    /// The reference hash for `slot` (the cluster's, or under Alpenglow the leader's footer
+    /// claim: `footer`) equals our frozen hash.
+    fn matched(&mut self, slot: Slot, hash: Hash, now: Instant, footer: bool) {
+        LAST_MATCHED.fetch_max(slot, std::sync::atomic::Ordering::Relaxed);
+        let lag_ms = self.lag_ms(slot, now);
+        let recovered = match self.mismatched.iter().position(|m| *m == (slot, hash)) {
+            Some(i) => {
+                self.mismatched.remove(i);
+                true
+            }
+            None => false,
+        };
+        let gossip52 = {
+            let rec = self.slots.entry(slot).or_default();
+            let first_verdict = !rec.verdict;
+            rec.verdict = true;
+            if rec.our_hash.is_none() {
+                rec.our_hash = Some(hash);
+            }
+            first_verdict.then(|| (rec.frozen_at, rec.gossip_cross[1]))
+        };
+        for stats in [&mut self.interval, &mut self.total] {
+            stats.matched += 1;
+            if recovered {
+                stats.recovered += 1;
+            }
+            if footer {
+                stats.footer_matched += 1;
+            } else if lag_ms.is_some_and(|lag| lag < 1) {
+                stats.matched_at_freeze += 1;
+            }
+        }
+        // Only the interval keeps samples. A footer is checked at the freeze itself: no lag.
+        if !footer {
+            if let Some(lag) = lag_ms {
+                self.interval.lag_ms.push(lag);
+            }
+            if let Some((Some(frozen_at), Some(crossed))) = gossip52 {
+                self.interval
+                    .gossip52_ms
+                    .push(crossed.saturating_duration_since(frozen_at).as_millis() as u64);
+            }
+        }
+        if recovered {
+            warn!(
+                "fast lane: cluster check: slot {slot} replayed to the {} hash {hash} after a \
+                 mismatch (recovered)",
+                if footer {
+                    "block footer's"
+                } else {
+                    "cluster's"
+                }
+            );
+        }
+        // A fast signal the cluster contradicts: it confirmed our own hash.
+        if let Some(i) = self
+            .attributions
+            .iter()
+            .position(|a| a.slot == slot && a.cluster_hash.is_none() && a.first.hash == hash)
+        {
+            let a = self.attributions.remove(i);
+            control::lift_provisional(
+                a.token,
+                &format!("the cluster confirmed our hash for slot {slot}"),
+            );
+            self.attribution_event(
+                slot,
+                "false_alarm",
+                Some(&a.first),
+                hash,
+                a.source,
+                "the cluster confirmed our hash",
+            );
+        }
+        let fl_was_active = control::is_active();
+        self.push_event(Event {
+            slot,
+            kind: EventKind::Match { recovered },
+            our_hash: Some(hash),
+            cluster_hash: hash,
+            lag_ms,
+            fl_was_active,
+        });
+    }
+
+    /// The footer attribution of `slot` that `bank_id` (over `parent`) decides, if any.
+    fn footer_attribution(
+        &self,
+        slot: Slot,
+        bank_id: BankId,
+        parent: (Slot, Hash),
+    ) -> Option<usize> {
+        self.attributions
+            .iter()
+            .position(|a| a.is_footer_rereplay(slot, bank_id, parent))
+    }
+
+    /// Close footer attribution `i` as unresolved: sticky.
+    fn footer_unresolved(&mut self, i: usize, detail: &str) {
+        let a = self.attributions.remove(i);
+        control::make_sticky(
+            a.token,
+            &format!(
+                "cannot attribute the block footer disagreement in slot {}: {detail}",
+                a.slot
+            ),
+        );
+        self.attribution_event(
+            a.slot,
+            "unresolved",
+            Some(&a.first),
+            a.cluster_hash.unwrap_or_default(),
+            a.source,
+            detail,
+        );
+    }
+}
+
 /// Replay froze `slot` with `hash` (also after a repair re-replay: a new version).
 pub fn on_bank_frozen(slot: Slot, hash: Hash) {
     let now = Instant::now();
     let mut guard = state().lock();
     let st = &mut *guard;
-    st.max_slot = st.max_slot.max(slot);
-    {
-        let rec = st.slots.entry(slot).or_default();
-        rec.our_hash = Some(hash);
-        rec.frozen_at = Some(now);
-        rec.verdict = false;
-        rec.fast_fired = false;
-        rec.gossip_cross = [None; 3];
-        // Gossip votes for our hash may have crossed thresholds before the freeze.
-        if rec.total_stake > 0
-            && let Some(v) = rec.votes.iter().find(|v| v.hash == hash)
-        {
-            for (i, pct) in [33u64, DUPLICATE_PCT, 67].into_iter().enumerate() {
-                if at_least_pct(v.gossip_stake, rec.total_stake, pct) {
-                    rec.gossip_cross[i] = Some(now);
-                }
-            }
-        }
-    }
-    for stats in [&mut st.interval, &mut st.total] {
-        stats.frozen += 1;
-    }
-    st.check_fast(slot, now);
-    st.prune();
+    st.frozen(slot, hash, now);
     st.maybe_report(now);
 }
 
-/// Replay froze a version of `slot` (called right after the freeze, before
-/// [`on_bank_frozen`]): its block identity, for attributing a later disagreement, and the
-/// verdict of an open one when this is the re-replay of a dumped slot.
+/// Replay froze a version of `slot` (called right after the freeze, before the block-footer
+/// verdict and [`on_bank_frozen`], so that a mismatch at freeze always finds its version): its
+/// block identity, for attributing a later disagreement, and the verdict of an open TowerBFT
+/// one when this is the re-replay of a dumped slot.
 pub fn on_bank_version(slot: Slot, version: BlockVersion) {
     let mut guard = state().lock();
     let st = &mut *guard;
@@ -699,69 +951,10 @@ pub fn last_matched_slot() -> Slot {
 
 /// The cluster confirmed `hash` for `slot`, and it equals our frozen hash.
 pub fn on_cluster_match(slot: Slot, hash: Hash) {
-    LAST_MATCHED.fetch_max(slot, std::sync::atomic::Ordering::Relaxed);
     let now = Instant::now();
     let mut guard = state().lock();
     let st = &mut *guard;
-    let lag_ms = st.lag_ms(slot, now);
-    let recovered = match st.mismatched.iter().position(|m| *m == (slot, hash)) {
-        Some(i) => {
-            st.mismatched.remove(i);
-            true
-        }
-        None => false,
-    };
-    let gossip52 = {
-        let rec = st.slots.entry(slot).or_default();
-        let first_verdict = !rec.verdict;
-        rec.verdict = true;
-        if rec.our_hash.is_none() {
-            rec.our_hash = Some(hash);
-        }
-        first_verdict.then(|| (rec.frozen_at, rec.gossip_cross[1]))
-    };
-    for stats in [&mut st.interval, &mut st.total] {
-        stats.matched += 1;
-        if recovered {
-            stats.recovered += 1;
-        }
-        if lag_ms.is_some_and(|lag| lag < 1) {
-            stats.matched_at_freeze += 1;
-        }
-    }
-    // Only the interval keeps samples.
-    if let Some(lag) = lag_ms {
-        st.interval.lag_ms.push(lag);
-    }
-    if let Some((Some(frozen_at), Some(crossed))) = gossip52 {
-        st.interval
-            .gossip52_ms
-            .push(crossed.saturating_duration_since(frozen_at).as_millis() as u64);
-    }
-    if recovered {
-        warn!(
-            "fast lane: cluster check: slot {slot} replayed to the cluster's hash {hash} after a \
-             mismatch (recovered)"
-        );
-    }
-    // A fast signal the cluster contradicts: it confirmed our own hash.
-    if let Some(i) = st.attributions.iter().position(|a| {
-        a.slot == slot && a.cluster_hash.is_none() && a.first.hash == hash
-    }) {
-        let a = st.attributions.remove(i);
-        control::lift_provisional(a.token, &format!("the cluster confirmed our hash for slot {slot}"));
-        st.attribution_event(slot, "false_alarm", Some(&a.first), hash, a.source,
-            "the cluster confirmed our hash");
-    }
-    let fl_was_active = control::is_active();
-    st.push_event(Event {
-        slot,
-        kind: EventKind::Match { recovered },
-        our_hash: Some(hash),
-        cluster_hash: hash,
-        lag_ms,
-        fl_was_active,
-    });
+    st.matched(slot, hash, now, false);
     st.maybe_report(now);
 }
 
@@ -832,6 +1025,270 @@ pub fn on_cluster_mismatch(
         fl_was_active,
     });
     st.maybe_report(now);
+}
+
+/// Alpenglow: replay froze `version` of `slot` (bank `bank_id`) and its hash equals the bank
+/// hash the leader put in the block footer (see the module docs). The slot counts as matched
+/// (source `block_footer`). If the bank is the replay without the fast lane of a footer
+/// disagreement on the same block, the fast lane's result was wrong: `fl_wrong`, sticky.
+pub fn on_block_footer_match(slot: Slot, bank_id: BankId, version: &BlockVersion) {
+    let now = Instant::now();
+    let mut guard = state().lock();
+    let st = &mut *guard;
+    st.alpenglow = true;
+    if let Some(i) =
+        st.footer_attribution(slot, bank_id, (version.parent_slot, version.parent_hash))
+    {
+        let first = &st.attributions[i].first;
+        if first.same_block(version) {
+            let a = st.attributions.remove(i);
+            let footer = a.cluster_hash.unwrap_or_default();
+            control::make_sticky(
+                a.token,
+                &format!(
+                    "fast lane result was wrong in slot {slot}: the same block replayed without \
+                     the fast lane gives its block footer's bank hash {footer} (with {} \
+                     fast-lane commits our bank hash was {})",
+                    a.first.fl_commits, a.first.hash
+                ),
+            );
+            st.attribution_event(
+                slot,
+                "fl_wrong",
+                Some(&a.first),
+                footer,
+                a.source,
+                "same block, replay without FL matches the leader's footer hash",
+            );
+        } else {
+            let detail = format!(
+                "another block was replayed without the fast lane (last entry {} vs {})",
+                version.last_entry_hash, first.last_entry_hash
+            );
+            st.footer_unresolved(i, &detail);
+        }
+    }
+    st.frozen(slot, version.hash, now);
+    st.matched(slot, version.hash, now, true);
+    st.maybe_report(now);
+}
+
+/// Alpenglow: the hash of `version` of `slot` (bank `bank_id`) differs from the bank hash the
+/// leader put in the block footer, `footer_hash`. Replay marks such a slot dead, except when the
+/// fast lane committed into the bank (`version.fl_commits > 0`): it then clears the bank and
+/// replays the slot once without the fast lane, which this disables provisionally first. When
+/// the bank is that replay, the disagreement is decided here (see the module docs). A mismatch
+/// on a bank the fast lane committed nothing into leaves the fast lane as it is (`not_fl`).
+pub fn on_block_footer_mismatch(
+    slot: Slot,
+    bank_id: BankId,
+    version: &BlockVersion,
+    footer_hash: Hash,
+) {
+    let now = Instant::now();
+    let fl_was_active = control::is_active();
+    let (ours, fl_commits) = (version.hash, version.fl_commits);
+    let mut guard = state().lock();
+    let st = &mut *guard;
+    st.alpenglow = true;
+    st.frozen(slot, ours, now);
+    if let Some(rec) = st.slots.get_mut(&slot) {
+        rec.verdict = true;
+    }
+    if st.mismatched.len() >= MAX_MISMATCHED {
+        st.mismatched.pop_front();
+    }
+    st.mismatched.push_back((slot, footer_hash));
+    for stats in [&mut st.interval, &mut st.total] {
+        stats.mismatched += 1;
+        stats.footer_mismatched += 1;
+        if fl_commits > 0 {
+            stats.footer_retries += 1;
+        }
+    }
+    solana_metrics::datapoint_error!(
+        "fast_lane_cluster_mismatch",
+        ("slot", slot as i64, i64),
+        ("our_hash", ours.to_string(), String),
+        ("cluster_hash", footer_hash.to_string(), String),
+        ("source", "block_footer", String),
+        ("fl_was_active", fl_was_active, bool),
+        ("fl_commits", i64::from(fl_commits), i64),
+    );
+    st.push_event(Event {
+        slot,
+        kind: EventKind::Mismatch {
+            source: "block_footer",
+        },
+        our_hash: Some(ours),
+        cluster_hash: footer_hash,
+        lag_ms: Some(0),
+        fl_was_active,
+    });
+    if let Some(i) =
+        st.footer_attribution(slot, bank_id, (version.parent_slot, version.parent_hash))
+    {
+        let first = &st.attributions[i].first;
+        if first.same_block(version) && fl_commits == 0 && first.hash != ours {
+            // Agave alone gives another hash for the same block: the fast lane's commits
+            // changed the bank (the footer is wrong as well).
+            let a = st.attributions.remove(i);
+            control::make_sticky(
+                a.token,
+                &format!(
+                    "fast lane result was wrong in slot {slot}: the same block replayed without \
+                     the fast lane gives bank hash {ours}, ours with {} fast-lane commits was {} \
+                     (the block footer's {footer_hash} matches neither)",
+                    a.first.fl_commits, a.first.hash
+                ),
+            );
+            st.attribution_event(
+                slot,
+                "fl_wrong",
+                Some(&a.first),
+                footer_hash,
+                a.source,
+                &format!(
+                    "same block, replay without FL gives {ours}, another hash; the footer \
+                     matches neither; agave marks the slot dead"
+                ),
+            );
+        } else if first.same_block(version) && fl_commits == 0 {
+            // The same block without the fast lane gives the same hash, which disagrees with
+            // the footer: the leader's claim (or agave itself) is at fault, not the fast lane.
+            let a = st.attributions.remove(i);
+            let back = control::lift_provisional(
+                a.token,
+                &format!(
+                    "slot {slot}: replayed without the fast lane, the block still differs from \
+                     its footer's bank hash; not the fast lane's fault"
+                ),
+            );
+            st.attribution_event(
+                slot,
+                "leader_footer",
+                Some(&a.first),
+                footer_hash,
+                a.source,
+                &format!(
+                    "replay without FL gives {ours}, not the footer's hash either; agave marks \
+                     the slot dead; fast lane back: {back}"
+                ),
+            );
+        } else {
+            let detail = if fl_commits > 0 {
+                format!("its replay committed {fl_commits} fast-lane results again")
+            } else {
+                format!(
+                    "another block was replayed without the fast lane (last entry {} vs {})",
+                    version.last_entry_hash, first.last_entry_hash
+                )
+            };
+            st.footer_unresolved(i, &detail);
+        }
+    } else if fl_commits > 0 {
+        let reason = format!(
+            "slot {slot}: our bank hash {ours} ({fl_commits} fast-lane commits) differs from the \
+             block footer's {footer_hash}"
+        );
+        error!(
+            "fast lane: BLOCK FOOTER BANK HASH MISMATCH: {reason}; fast lane was {}; disabling it \
+             pending attribution; replay clears the bank and replays the slot without the fast \
+             lane instead of marking it dead",
+            if fl_was_active { "active" } else { "inactive" }
+        );
+        let token = control::poison_provisional(&reason);
+        let horizon = st.max_slot.max(slot);
+        st.attributions.push(Attribution {
+            slot,
+            token,
+            first: version.clone(),
+            cluster_hash: Some(footer_hash),
+            source: "block_footer",
+            horizon,
+            created: now,
+            lift_above: None,
+            footer_bank: Some(bank_id),
+        });
+    } else {
+        warn!(
+            "fast lane: block footer bank hash mismatch in slot {slot} (ours {ours}, footer \
+             {footer_hash}) on a bank the fast lane committed nothing into: agave marks the slot \
+             dead; the fast lane is not involved"
+        );
+        st.attribution_event(
+            slot,
+            "not_fl",
+            Some(version),
+            footer_hash,
+            "block_footer",
+            "no fast-lane commits in this bank",
+        );
+    }
+    st.maybe_report(now);
+}
+
+/// Replay is clearing bank `bank_id` of `slot` (child of `parent_slot` with `parent_hash`): an
+/// Alpenglow UpdateParent restart or abandoned bank, a switch to another block version, a
+/// descendant of one of those, or a replay without the fast lane.
+/// `solana_runtime::fast_lane_commit::on_bank_clearing` has stopped the bank's board.
+/// - A footer disagreement whose replay without the fast lane is cleared before it froze is
+///   unresolved (sticky). Clearing the bank the fast lane committed into (the retry) is not.
+/// - The fast lane's ingest is told through the existing dead-slot path: it aborts the slot's
+///   run, which publishes ROLLBACK for it on the output ring, and skips the slot and its
+///   children.
+pub fn on_bank_cleared(slot: Slot, bank_id: BankId, parent_slot: Slot, parent_hash: Hash) {
+    {
+        let mut guard = state().lock();
+        let st = &mut *guard;
+        for stats in [&mut st.interval, &mut st.total] {
+            stats.cleared += 1;
+        }
+        if let Some(i) = st.footer_attribution(slot, bank_id, (parent_slot, parent_hash)) {
+            st.footer_unresolved(
+                i,
+                &format!(
+                    "its replay without the fast lane (bank {bank_id}) was cleared before it \
+                     froze"
+                ),
+            );
+        }
+    }
+    notify_ingest_cleared(slot);
+}
+
+/// Replay marks `slot` dead after a replay error it does not retry (bank `bank_id`, child of
+/// `parent_slot` with `parent_hash`): a footer disagreement whose replay without the fast lane
+/// failed is unresolved (sticky).
+pub fn on_replay_dead(slot: Slot, bank_id: BankId, parent_slot: Slot, parent_hash: Hash) {
+    let mut guard = state().lock();
+    let st = &mut *guard;
+    if let Some(i) = st.footer_attribution(slot, bank_id, (parent_slot, parent_hash)) {
+        st.footer_unresolved(
+            i,
+            &format!("its replay without the fast lane (bank {bank_id}) failed; slot marked dead"),
+        );
+    }
+}
+
+/// Tell the fast lane's ingest that replay cleared `slot`, as for a dead slot (`tees`'s
+/// slot-status tee): wait-free, only while the fast lane is active.
+fn notify_ingest_cleared(slot: Slot) {
+    if !control::is_active() {
+        return;
+    }
+    let Some(shared) = crate::shared() else {
+        return;
+    };
+    TapStats::inc(&shared.tap_stats.events);
+    if shared.event_tx.try_send(AgaveEvent::Dead { slot }).is_err() {
+        TapStats::inc(&shared.tap_stats.event_drops);
+    }
+}
+
+/// Whether a block footer was checked (Alpenglow is enabled; the TowerBFT signals are dead).
+pub fn is_alpenglow() -> bool {
+    state().lock().alpenglow
 }
 
 /// A vote (gossip or replayed) whose last voted slot is `slot` with bank hash `hash`, from a
