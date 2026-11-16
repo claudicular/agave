@@ -7,8 +7,10 @@
 //! slot on drop). Everything the child's execution environment needs is computed here as a
 //! pure function of P and N, mirroring `_new_from_parent` / `prepare_for_block_execution` /
 //! `load_and_execute_transactions` for the supported case: P frozen, N in P's epoch, N not
-//! the last slot of the epoch, no reward distribution, not Alpenglow, and no hard-fork
-//! restart slot change. Every other child is refused with [`FastLaneUnsupported`].
+//! the last slot of the epoch, no reward distribution, no hard-fork restart slot change, and
+//! either a TowerBFT P (alpenglow feature inactive) or an Alpenglow P whose child cannot
+//! switch parents mid-slot (no fast leader handover window start). Every other child is
+//! refused with [`FastLaneUnsupported`].
 //!
 //! Nothing in this module mutates any bank, accounts-db or program-cache state, and account
 //! reads use `LoadHint::Unspecified` (the fast lane runs off the replay thread, so the root
@@ -17,7 +19,10 @@
 use {
     super::{Bank, EpochRewardStatus},
     agave_feature_set::FeatureSet,
-    crate::sysvar_account::{create_account, from_account},
+    crate::{
+        leader_schedule_utils::leader_slot_index,
+        sysvar_account::{create_account, from_account},
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::{accounts::Accounts, blockhash_queue::BlockhashQueue},
     solana_address_lookup_table_interface::error::AddressLookupError,
@@ -71,11 +76,20 @@ pub enum FastLaneUnsupported {
     UnknownFeeCollector,
     /// The child slot is not greater than the parent slot.
     ChildNotAfterParent,
-    /// Alpenglow is active on the parent (footer clock, markers, migration): paused.
-    Alpenglow,
-    /// The alpenglow feature is active but the parent is not yet an alpenglow bank
-    /// (migration blocks may be in flight): paused.
+    /// The alpenglow feature is active but the parent is not an Alpenglow bank: the
+    /// migration is in flight (TowerBFT or vote-only banks), or the child is the first
+    /// Alpenglow block (its GenesisCertificate marker turns it Alpenglow mid-slot, over a
+    /// TowerBFT start Clock).
     AlpenglowMigration,
+    /// Alpenglow fast leader handover is active and the child is the first slot of its
+    /// leader window: its leader may abandon the slot's prefix with an UpdateParent marker
+    /// and rebuild it on another parent.
+    FastLeaderHandover,
+    /// The child's unfrozen parent is (or may become) an Alpenglow bank: the child's Clock
+    /// and the parent's footer writes (nanosecond clock, vote rewards) come from the
+    /// parent's block footer, which chained contexts do not model. The child must wait for
+    /// the parent's freeze.
+    ChainedAlpenglow,
     /// The child starts a new epoch (feature activation, rewards, stake history ...).
     EpochBoundary,
     /// The child is the last slot of its epoch: its deployment environment may be the next
@@ -128,6 +142,8 @@ pub struct FastLaneChildContext {
     execution_environment: ProgramRuntimeEnvironment,
     deployment_environment: ProgramRuntimeEnvironment,
     rent: Rent,
+    /// The child bank's `is_alpenglow()` (inherited from the parent).
+    alpenglow_migration_succeeded: bool,
 }
 
 impl FastLaneChildContext {
@@ -136,8 +152,8 @@ impl FastLaneChildContext {
         TransactionProcessingEnvironment {
             blockhash: self.blockhash,
             blockhash_lamports_per_signature: self.blockhash_lamports_per_signature,
-            // `fast_lane_support` refuses alpenglow parents.
-            alpenglow_migration_succeeded: false,
+            // Agave passes the child bank's `is_alpenglow()`: legacy vote instructions fail.
+            alpenglow_migration_succeeded: self.alpenglow_migration_succeeded,
             epoch_total_stake: self.epoch_total_stake,
             feature_set: self.feature_set.runtime_features(),
             program_runtime_environments: ProgramRuntimeEnvironments::new(
@@ -292,10 +308,10 @@ impl Bank {
         if child_slot <= self.slot() {
             return Err(FastLaneUnsupported::ChildNotAfterParent);
         }
-        if self.is_alpenglow() {
-            return Err(FastLaneUnsupported::Alpenglow);
-        }
-        if self.feature_set.snapshot().alpenglow {
+        let features = self.feature_set.snapshot();
+        // An Alpenglow parent's child is an Alpenglow bank from its creation
+        // (`is_alpenglow` is inherited): footer Clock and markers, no TowerBFT votes.
+        if features.alpenglow && !self.is_alpenglow() {
             return Err(FastLaneUnsupported::AlpenglowMigration);
         }
         let epoch_schedule = self.epoch_schedule();
@@ -307,6 +323,16 @@ impl Bank {
             != child_epoch
         {
             return Err(FastLaneUnsupported::LastSlotOfEpoch);
+        }
+        // Replay accepts an UpdateParent marker only with fast leader handover active
+        // (`BlockComponentProcessor::on_marker`, checked on the child's feature set, which
+        // equals this bank's within an epoch) and only in the first slot of a leader window
+        // (`leader_slot_index(slot) == 0`, enforced by blockstore and replay).
+        if self.is_alpenglow()
+            && features.alpenglow_fast_leader_handover
+            && leader_slot_index(child_slot) == 0
+        {
+            return Err(FastLaneUnsupported::FastLeaderHandover);
         }
         if matches!(self.epoch_reward_status, EpochRewardStatus::Active(_)) {
             return Err(FastLaneUnsupported::RewardDistribution);
@@ -332,8 +358,19 @@ impl Bank {
         Ok(())
     }
 
-    /// The child's Clock, exactly as `update_clock(Some(parent_epoch))` computes it in a
-    /// same-epoch TowerBFT child created from this frozen bank.
+    /// Whether a grandchild of this (frozen) bank can be built on top of FL's own run of its
+    /// unfrozen child ([`Self::fast_lane_chained_child_context`]): never once the alpenglow
+    /// feature is active (the unfrozen child is, or may become, an Alpenglow bank whose
+    /// block footer sets the grandchild's Clock).
+    pub fn fast_lane_chaining_supported(&self) -> bool {
+        !self.is_alpenglow() && !self.feature_set.snapshot().alpenglow
+    }
+
+    /// The child's Clock, exactly as `prepare_for_block_execution` writes it in a same-epoch
+    /// child created from this frozen bank: `update_clock_slot_for_alpenglow` for an
+    /// Alpenglow parent (this bank's Clock with the child's slot fields: the timestamps are
+    /// the ones this bank's block footer wrote), else the TowerBFT
+    /// `update_clock(Some(parent_epoch))` vote-timestamp estimate.
     fn fast_lane_child_clock(
         &self,
         child_slot: Slot,
@@ -348,38 +385,101 @@ impl Bank {
 
         let parent_epoch = self.epoch();
         let epoch_schedule = self.epoch_schedule();
-        let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(parent_epoch);
-        let epoch_start_timestamp = Some((first_slot_in_epoch, parent_clock.epoch_start_timestamp));
-        let max_allowable_drift = super::MaxAllowableDrift {
-            fast: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST,
-            slow: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
-        };
-        let ancestor_timestamp = parent_clock.unix_timestamp;
-        let mut unix_timestamp = parent_clock.unix_timestamp;
-        if let Some(timestamp_estimate) = self.get_timestamp_estimate_for_slot(
-            child_slot,
-            max_allowable_drift,
-            epoch_start_timestamp,
-        ) {
-            unix_timestamp = timestamp_estimate;
-            if timestamp_estimate < ancestor_timestamp {
-                unix_timestamp = ancestor_timestamp;
+        let clock = if self.is_alpenglow() {
+            // `update_clock_slot_for_alpenglow` in the child, where `self.clock()` is this
+            // bank's Clock and `self.parent()` is this bank. Its `(0, _)` arm (genesis)
+            // cannot apply to a child.
+            let child_epoch = epoch_schedule.get_epoch(child_slot);
+            let epoch_start_timestamp = if parent_epoch != child_epoch {
+                parent_clock.unix_timestamp
+            } else {
+                parent_clock.epoch_start_timestamp
+            };
+            Clock {
+                slot: child_slot,
+                epoch: child_epoch,
+                leader_schedule_epoch: epoch_schedule.get_leader_schedule_epoch(child_slot),
+                epoch_start_timestamp,
+                unix_timestamp: parent_clock.unix_timestamp,
             }
-        }
-        // Same epoch as the parent (checked by `fast_lane_support`): no epoch start update.
-        let clock = Clock {
-            slot: child_slot,
-            epoch_start_timestamp: parent_clock.epoch_start_timestamp,
-            epoch: epoch_schedule.get_epoch(child_slot),
-            leader_schedule_epoch: epoch_schedule.get_leader_schedule_epoch(child_slot),
-            unix_timestamp,
+        } else {
+            let first_slot_in_epoch = epoch_schedule.get_first_slot_in_epoch(parent_epoch);
+            let epoch_start_timestamp =
+                Some((first_slot_in_epoch, parent_clock.epoch_start_timestamp));
+            let max_allowable_drift = super::MaxAllowableDrift {
+                fast: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST,
+                slow: super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
+            };
+            let ancestor_timestamp = parent_clock.unix_timestamp;
+            let mut unix_timestamp = parent_clock.unix_timestamp;
+            if let Some(timestamp_estimate) = self.get_timestamp_estimate_for_slot(
+                child_slot,
+                max_allowable_drift,
+                epoch_start_timestamp,
+            ) {
+                unix_timestamp = timestamp_estimate;
+                if timestamp_estimate < ancestor_timestamp {
+                    unix_timestamp = ancestor_timestamp;
+                }
+            }
+            // Same epoch as the parent (checked by `fast_lane_support`): no epoch start
+            // update.
+            Clock {
+                slot: child_slot,
+                epoch_start_timestamp: parent_clock.epoch_start_timestamp,
+                epoch: epoch_schedule.get_epoch(child_slot),
+                leader_schedule_epoch: epoch_schedule.get_leader_schedule_epoch(child_slot),
+                unix_timestamp,
+            }
         };
+        // `update_sysvar_account`: fields inherited from the old account, then rent-adjusted.
         let mut account = create_account(
             &clock,
             self.inherit_specially_retained_account_fields(&old_account),
         );
         self.adjust_sysvar_balance_for_rent(&mut account);
         Ok((clock, account))
+    }
+
+    /// The Clock sysvar account this frozen bank's transactions read. An Alpenglow bank's
+    /// block footer rewrites the Clock after the slot's last transaction
+    /// (`update_clock_from_footer`: the footer's time, and on an epoch's first slot also the
+    /// epoch start); this rebuilds the value `update_clock_slot_for_alpenglow` wrote at the
+    /// bank's creation: the frozen Clock's slot fields with the parent's timestamps (the
+    /// footer keeps the account's lamports and rent epoch). `None` when the parent is no
+    /// longer linked (squashed into a root). Not exact for the first Alpenglow block, which
+    /// starts with a TowerBFT Clock (the fast lane never runs it).
+    pub fn fast_lane_execution_clock_account(&self) -> Option<AccountSharedData> {
+        let account = self.get_account(&sysvar::clock::id())?;
+        if !self.is_alpenglow() {
+            return Some(account);
+        }
+        let frozen: Clock = from_account(&account)?;
+        let parent = self.parent()?;
+        let parent_clock = parent.clock();
+        let epoch_start_timestamp = if parent.epoch() != self.epoch() {
+            parent_clock.unix_timestamp
+        } else {
+            frozen.epoch_start_timestamp
+        };
+        let clock = Clock {
+            epoch_start_timestamp,
+            unix_timestamp: parent_clock.unix_timestamp,
+            ..frozen
+        };
+        let mut start = create_account(
+            &clock,
+            self.inherit_specially_retained_account_fields(&Some(account)),
+        );
+        self.adjust_sysvar_balance_for_rent(&mut start);
+        Some(start)
+    }
+
+    /// The accounts an Alpenglow bank's block footer writes after the slot's last
+    /// transaction besides vote accounts (`update_bank_with_footer_fields`): the Clock
+    /// sysvar and the nanosecond clock account.
+    pub fn fast_lane_alpenglow_footer_accounts() -> [Pubkey; 2] {
+        [sysvar::clock::id(), *super::NANOSECOND_CLOCK_ACCOUNT]
     }
 
     /// The child's SlotHashes, exactly as `update_slot_hashes` computes it in a child of
@@ -447,6 +547,7 @@ impl Bank {
             execution_environment,
             deployment_environment,
             rent: self.rent_collector.rent.clone(),
+            alpenglow_migration_succeeded: self.is_alpenglow(),
         })
     }
 
@@ -471,9 +572,15 @@ impl Bank {
         if p.parent_slot != self.slot() || child_slot <= p.child_slot {
             return Err(FastLaneUnsupported::ChildNotAfterParent);
         }
+        // An Alpenglow child's Clock is P's footer time and P's footer rewrites the
+        // nanosecond clock and vote accounts after P's transactions: none of it is known
+        // here. The child runs over the frozen P instead.
+        if !self.fast_lane_chaining_supported() || p.alpenglow_migration_succeeded {
+            return Err(FastLaneUnsupported::ChainedAlpenglow);
+        }
         // The child must itself be supported relative to P: same epoch, not the epoch's last
-        // slot, no rewards (P's reward status equals self's within an epoch), not Alpenglow,
-        // no LastRestartSlot change.
+        // slot, no rewards (P's reward status equals self's within an epoch), no
+        // LastRestartSlot change.
         self.fast_lane_support(child_slot)?;
 
         let overrides: HashMap<Pubkey, Option<(Slot, i64)>> = parent
@@ -564,6 +671,7 @@ impl Bank {
                 .transaction_processor
                 .program_runtime_environment_for_epoch(effective_epoch_of_deployments),
             rent: p.rent.clone(),
+            alpenglow_migration_succeeded: p.alpenglow_migration_succeeded,
         })
     }
 
@@ -836,11 +944,16 @@ mod tests {
         super::*,
         crate::{
             bank::{SlotLeader, test_utils::update_vote_account_timestamp},
-            genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
+            bank_forks::BankForks,
+            genesis_utils::{
+                GenesisConfigInfo, activate_all_features_alpenglow,
+                create_genesis_config_with_leader, deactivate_features,
+            },
         },
+        agave_votor_messages::migration::GENESIS_CERTIFICATE_ACCOUNT,
         solana_signer::Signer,
         solana_vote_program::vote_state::BlockTimestamp,
-        std::sync::Arc,
+        std::sync::{Arc, RwLock},
         test_case::test_case,
     };
 
@@ -905,6 +1018,8 @@ mod tests {
             assert_same_account(&ctx.slot_hashes_account, &child_slot_hashes, "slot_hashes");
 
             let env = ctx.processing_environment();
+            assert!(!child.is_alpenglow());
+            assert!(!env.alpenglow_migration_succeeded);
             let (blockhash, lps) = child.last_blockhash_and_lamports_per_signature();
             assert_eq!(env.blockhash, blockhash);
             assert_eq!(env.blockhash_lamports_per_signature, lps);
@@ -1109,6 +1224,16 @@ mod tests {
             Err(FastLaneUnsupported::EpochBoundary)
         );
         assert_eq!(parent.fast_lane_support(5), Ok(()));
+        // TowerBFT: fast leader handover (active in this genesis) does not apply, and
+        // children of unfrozen children can be chained.
+        assert!(parent.feature_set.snapshot().alpenglow_fast_leader_handover);
+        assert_eq!(parent.fast_lane_support(8), Ok(()));
+        assert!(parent.fast_lane_chaining_supported());
+        // The execution Clock of a TowerBFT bank is its frozen Clock.
+        assert_eq!(
+            parent.fast_lane_execution_clock_account(),
+            parent.get_account(&sysvar::clock::id())
+        );
     }
 
     #[test]
@@ -1129,5 +1254,310 @@ mod tests {
             setup.execution_cost,
             parent.transaction_processor.execution_cost()
         );
+    }
+
+    const VALIDATOR_STAKE: u64 = 1_000_000_000;
+
+    /// An Alpenglow genesis (every feature, a genesis certificate), optionally without fast
+    /// leader handover or without the certificate (the alpenglow feature active but the
+    /// banks not yet Alpenglow, as during the migration).
+    fn alpenglow_genesis(
+        handover: bool,
+        certificate: bool,
+    ) -> (
+        solana_genesis_config::GenesisConfig,
+        solana_keypair::Keypair,
+    ) {
+        let leader = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            voting_keypair,
+            ..
+        } = create_genesis_config_with_leader(5_000_000_000, &leader, VALIDATOR_STAKE);
+        activate_all_features_alpenglow(&mut genesis_config);
+        if !handover {
+            deactivate_features(
+                &mut genesis_config,
+                &vec![agave_feature_set::alpenglow_fast_leader_handover::id()],
+            );
+        }
+        if !certificate {
+            genesis_config.accounts.remove(&GENESIS_CERTIFICATE_ACCOUNT);
+        }
+        (genesis_config, voting_keypair)
+    }
+
+    /// A frozen Alpenglow parent at `parent_slot`. Its block footer set its Clock to
+    /// `footer_offset` seconds from the genesis-derived time (plus a sub-second remainder),
+    /// and its vote account carries a timestamp far ahead, so a TowerBFT estimate for its
+    /// children differs from the Alpenglow Clock.
+    fn frozen_alpenglow_parent(
+        parent_slot: Slot,
+        footer_offset: i64,
+        handover: bool,
+    ) -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
+        let (genesis_config, voting_keypair) = alpenglow_genesis(handover, true);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        assert!(bank0.is_alpenglow());
+        let mut parent = bank0;
+        for slot in 1..=parent_slot {
+            parent = Bank::new_from_parent_with_bank_forks(
+                &bank_forks,
+                parent,
+                SlotLeader::default(),
+                slot,
+            );
+        }
+        assert!(parent.is_alpenglow());
+        update_vote_account_timestamp(
+            BlockTimestamp {
+                slot: parent_slot,
+                timestamp: parent
+                    .unix_timestamp_from_genesis()
+                    .saturating_add(1_000_000),
+            },
+            &parent,
+            &voting_keypair.pubkey(),
+        );
+        let footer_s = parent
+            .unix_timestamp_from_genesis()
+            .saturating_add(footer_offset);
+        parent.update_clock_from_footer(
+            footer_s
+                .saturating_mul(1_000_000_000)
+                .saturating_add(123_456_789),
+        );
+        assert_eq!(parent.clock().unix_timestamp, footer_s);
+        parent.freeze();
+        (parent, bank_forks)
+    }
+
+    /// For an Alpenglow parent the child's Clock is the parent's footer Clock with the
+    /// child's slot fields (no vote-timestamp estimate), and the child executes with
+    /// `alpenglow_migration_succeeded`: FL's context equals `Bank::new_from_parent`'s.
+    #[test_case(5, -100; "footer behind the PoH estimate")]
+    #[test_case(5, 0; "footer at the PoH estimate")]
+    #[test_case(9, 1_000; "footer far ahead")]
+    fn test_alpenglow_child_context_matches_new_from_parent(parent_slot: Slot, footer_offset: i64) {
+        let (parent, _bank_forks) = frozen_alpenglow_parent(parent_slot, footer_offset, true);
+        let parent_clock = parent.clock();
+        // Children in the parent's epoch, none the first slot of a leader window.
+        let children: Vec<Slot> = (parent_slot + 1..parent_slot + 6)
+            .filter(|slot| leader_slot_index(*slot) != 0)
+            .collect();
+        assert!(children.len() >= 3);
+        for child_slot in children {
+            let ctx = parent.fast_lane_child_context(child_slot).unwrap();
+            let child =
+                Bank::new_from_parent(Arc::clone(&parent), SlotLeader::default(), child_slot);
+            assert!(child.is_alpenglow());
+            let child_clock = child.get_account(&sysvar::clock::id()).unwrap();
+            assert_same_account(&ctx.clock_account, &child_clock, "clock");
+            assert_eq!(ctx.clock, child.clock());
+            assert_eq!(ctx.clock.slot, child_slot);
+            assert_eq!(ctx.clock.unix_timestamp, parent_clock.unix_timestamp);
+            assert_eq!(
+                ctx.clock.epoch_start_timestamp,
+                parent_clock.epoch_start_timestamp
+            );
+            // The TowerBFT estimate (what FL used to compute) would differ for most of
+            // these parents: the test exercises the Alpenglow branch, not a coincidence.
+            if footer_offset < 0 {
+                let drift = super::super::MaxAllowableDrift {
+                    fast: super::super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST,
+                    slow: super::super::MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
+                };
+                let start = Some((
+                    parent
+                        .epoch_schedule()
+                        .get_first_slot_in_epoch(parent.epoch()),
+                    parent_clock.epoch_start_timestamp,
+                ));
+                let tower = parent
+                    .get_timestamp_estimate_for_slot(child_slot, drift, start)
+                    .map(|estimate| estimate.max(parent_clock.unix_timestamp))
+                    .unwrap_or(parent_clock.unix_timestamp);
+                assert_ne!(tower, ctx.clock.unix_timestamp, "child {child_slot}");
+            }
+            let child_slot_hashes = child.get_account(&sysvar::slot_hashes::id()).unwrap();
+            assert_same_account(&ctx.slot_hashes_account, &child_slot_hashes, "slot_hashes");
+
+            let env = ctx.processing_environment();
+            assert!(env.alpenglow_migration_succeeded);
+            let (blockhash, lps) = child.last_blockhash_and_lamports_per_signature();
+            assert_eq!(env.blockhash, blockhash);
+            assert_eq!(env.blockhash_lamports_per_signature, lps);
+            assert_eq!(env.epoch_total_stake, child.get_current_epoch_total_stake());
+            assert_eq!(env.rent, child.rent_collector.rent);
+            assert_eq!(
+                env.program_runtime_environments.get_env_for_execution(),
+                &child.transaction_processor.program_runtime_environment
+            );
+            assert_eq!(
+                *ctx.next_durable_nonce(),
+                child.blockhash_queue.read().unwrap().next_durable_nonce()
+            );
+            assert_eq!(ctx.max_processing_age, child.max_processing_age());
+
+            // Every other sysvar the child's sysvar cache holds equals the parent's.
+            #[allow(deprecated)]
+            let others = [
+                sysvar::rent::id(),
+                sysvar::epoch_schedule::id(),
+                sysvar::epoch_rewards::id(),
+                sysvar::stake_history::id(),
+                sysvar::last_restart_slot::id(),
+                sysvar::fees::id(),
+                sysvar::recent_blockhashes::id(),
+            ];
+            for key in others {
+                assert!(ctx.sysvar_override(&key).is_none());
+                assert_eq!(
+                    parent.get_account(&key),
+                    child.get_account(&key),
+                    "sysvar {key}"
+                );
+            }
+            let cache = child.transaction_processor.sysvar_cache();
+            assert_eq!(
+                cache.sysvar_id_to_buffer(&sysvar::clock::id()).as_deref(),
+                Some(ctx.clock_account.data())
+            );
+            assert_eq!(
+                cache
+                    .sysvar_id_to_buffer(&sysvar::slot_hashes::id())
+                    .as_deref(),
+                Some(ctx.slot_hashes_account.data())
+            );
+            drop(cache);
+
+            // The child's own footer rewrites its Clock after its last transaction; the
+            // comparator's execution Clock still rebuilds the value its transactions read.
+            assert_eq!(
+                child.fast_lane_execution_clock_account().as_ref(),
+                Some(&child_clock)
+            );
+            let footer_s = parent_clock.unix_timestamp.saturating_add(7);
+            child.update_clock_from_footer(footer_s.saturating_mul(1_000_000_000));
+            child.freeze();
+            assert_eq!(child.clock().unix_timestamp, footer_s);
+            assert_ne!(
+                child.get_account(&sysvar::clock::id()).as_ref(),
+                Some(&child_clock)
+            );
+            let execution_clock = child.fast_lane_execution_clock_account().unwrap();
+            assert_same_account(&execution_clock, &ctx.clock_account, "execution clock");
+        }
+    }
+
+    #[test]
+    fn test_alpenglow_support_refusals() {
+        // Fast leader handover active: no first slot of a leader window.
+        let (parent, _bank_forks) = frozen_alpenglow_parent(5, 0, true);
+        assert_eq!(parent.fast_lane_support(6), Ok(()));
+        assert_eq!(parent.fast_lane_support(7), Ok(()));
+        assert_eq!(
+            parent.fast_lane_support(8),
+            Err(FastLaneUnsupported::FastLeaderHandover)
+        );
+        assert_eq!(parent.fast_lane_support(9), Ok(()));
+        assert!(matches!(
+            parent.fast_lane_child_context(8),
+            Err(FastLaneUnsupported::FastLeaderHandover)
+        ));
+        let schedule = parent.epoch_schedule().clone();
+        let last_slot = schedule.get_last_slot_in_epoch(parent.epoch());
+        assert_eq!(
+            parent.fast_lane_support(last_slot),
+            Err(FastLaneUnsupported::LastSlotOfEpoch)
+        );
+        assert_eq!(
+            parent.fast_lane_support(last_slot + 1),
+            Err(FastLaneUnsupported::EpochBoundary)
+        );
+        assert!(!parent.fast_lane_chaining_supported());
+
+        // Without fast leader handover every slot of the window is supported.
+        let (parent, _bank_forks) = frozen_alpenglow_parent(5, 0, false);
+        assert!(!parent.feature_set.snapshot().alpenglow_fast_leader_handover);
+        for child_slot in 6..=9 {
+            assert_eq!(parent.fast_lane_support(child_slot), Ok(()), "{child_slot}");
+        }
+
+        // The alpenglow feature active but the bank not an Alpenglow bank (migration in
+        // flight, vote-only banks, the first Alpenglow block's parent): refused.
+        let (genesis_config, _) = alpenglow_genesis(true, false);
+        let (bank0, bank_forks) =
+            Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+        assert!(!bank0.is_alpenglow());
+        assert!(bank0.feature_set.snapshot().alpenglow);
+        let parent =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank0, SlotLeader::default(), 1);
+        parent.freeze();
+        assert_eq!(
+            parent.fast_lane_support(2),
+            Err(FastLaneUnsupported::AlpenglowMigration)
+        );
+        assert!(!parent.fast_lane_chaining_supported());
+    }
+
+    /// A child of an unfrozen Alpenglow parent cannot be chained (its Clock is the parent's
+    /// footer time): it must wait for the parent's freeze.
+    #[test]
+    fn test_alpenglow_chained_child_context_refused() {
+        let (grandparent, bank_forks) = frozen_alpenglow_parent(5, 0, true);
+        let p_ctx = Arc::new(grandparent.fast_lane_child_context(6).unwrap());
+        let parent = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            Arc::clone(&grandparent),
+            SlotLeader::default(),
+            6,
+        );
+        let chained = FastLaneChainedParent {
+            ctx: p_ctx,
+            last_blockhash: Hash::new_unique(),
+            lamports_per_signature: parent.fast_lane_lamports_per_signature(),
+            vote_accounts: Vec::new(),
+        };
+        assert!(matches!(
+            grandparent.fast_lane_chained_child_context(&chained, 7),
+            Err(FastLaneUnsupported::ChainedAlpenglow)
+        ));
+        // Once agave froze the parent, the same child runs over it.
+        parent.freeze();
+        let ctx = parent.fast_lane_child_context(7).unwrap();
+        let child = Bank::new_from_parent(Arc::clone(&parent), SlotLeader::default(), 7);
+        assert_same_account(
+            &ctx.clock_account,
+            &child.get_account(&sysvar::clock::id()).unwrap(),
+            "clock",
+        );
+        assert!(ctx.processing_environment().alpenglow_migration_succeeded);
+    }
+
+    #[test]
+    fn test_alpenglow_footer_accounts() {
+        let [clock, nanosecond_clock] = Bank::fast_lane_alpenglow_footer_accounts();
+        assert_eq!(clock, sysvar::clock::id());
+        assert_eq!(nanosecond_clock, *super::super::NANOSECOND_CLOCK_ACCOUNT);
+        // The footer writes exactly these two besides vote accounts.
+        let (parent, _bank_forks) = frozen_alpenglow_parent(5, 0, true);
+        let child = Bank::new_from_parent(Arc::clone(&parent), SlotLeader::default(), 6);
+        let before: Vec<_> = [clock, nanosecond_clock]
+            .iter()
+            .map(|key| child.get_account(key))
+            .collect();
+        child.update_clock_from_footer(
+            parent
+                .clock()
+                .unix_timestamp
+                .saturating_add(3)
+                .saturating_mul(1_000_000_000),
+        );
+        for (key, before) in [clock, nanosecond_clock].iter().zip(before) {
+            assert_ne!(child.get_account(key), before, "{key}");
+        }
+        assert!(child.get_nanosecond_clock().is_some());
     }
 }

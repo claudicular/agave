@@ -1188,14 +1188,18 @@ fn entry_bytes(entry: &Entry) -> i64 {
         .sum::<i64>()
 }
 
+/// [`unsupported_reason`] of a chained run on an Alpenglow parent.
+const CHAINED_ALPENGLOW: &str = "chained_alpenglow";
+
 fn unsupported_reason(err: solana_runtime::bank::fast_lane::FastLaneUnsupported) -> &'static str {
     use solana_runtime::bank::fast_lane::FastLaneUnsupported as U;
     match err {
         U::ParentNotFrozen => "parent_not_frozen",
         U::UnknownFeeCollector => "unknown_fee_collector",
         U::ChildNotAfterParent => "child_not_after_parent",
-        U::Alpenglow => "alpenglow",
         U::AlpenglowMigration => "alpenglow_migration",
+        U::FastLeaderHandover => "fast_leader_handover",
+        U::ChainedAlpenglow => CHAINED_ALPENGLOW,
         U::EpochBoundary => "epoch_boundary",
         U::LastSlotOfEpoch => "last_slot_of_epoch",
         U::RewardDistribution => "reward_distribution",
