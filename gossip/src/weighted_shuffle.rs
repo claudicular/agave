@@ -168,6 +168,20 @@ impl WeightedShuffle {
             self.zeros.remove(index);
         }
     }
+
+    /// Returns true if index `k` currently has zero weight, i.e. `shuffle` yields it only after
+    /// every index with a positive weight. Weights that overflowed the total sum count as zero,
+    /// as do removed and out-of-range indices.
+    pub fn is_zero_weight(&self, k: usize) -> bool {
+        let index = self.num_nodes + k; // leaf node
+        let offset = (index - 1) & BIT_MASK;
+        let index = (index - 1) >> BIT_SHIFT; // parent node
+        self.tree
+            .get(index)
+            .map(|node| node[offset])
+            .unwrap_or_default()
+            == 0
+    }
 }
 
 impl WeightedShuffle {
@@ -612,5 +626,43 @@ mod tests {
                 assert_eq!(shuffle.shuffle(&mut rng).collect::<Vec<_>>(), shuffle_slow);
             }
         }
+    }
+
+    #[test]
+    fn test_weighted_shuffle_is_zero_weight() {
+        let mut rng = rand::rng();
+        for size in [0, 1, 2, 15, 16, 17, 255, 256, 257, 997, 3618] {
+            let weights: Vec<u64> = repeat_with(|| {
+                if rng.random_bool(0.3) {
+                    random_u64_range(&mut rng, 1..1000)
+                } else {
+                    0
+                }
+            })
+            .take(size)
+            .collect();
+            let mut shuffle = WeightedShuffle::new("", &weights);
+            for (k, weight) in weights.iter().enumerate() {
+                assert_eq!(shuffle.is_zero_weight(k), *weight == 0);
+            }
+            assert!(shuffle.is_zero_weight(size));
+            // Every positive weight is yielded before every zero weight, so the number of
+            // positive weights is the first position at which a zero weight can appear.
+            let num_positive = (0..size).filter(|&k| !shuffle.is_zero_weight(k)).count();
+            let order: Vec<_> = shuffle.clone().shuffle(&mut rng).collect();
+            assert!(order[..num_positive].iter().all(|&k| weights[k] != 0));
+            assert!(order[num_positive..].iter().all(|&k| weights[k] == 0));
+            // Removed indices read as zero weight.
+            if let Some(k) = (0..size).find(|&k| weights[k] != 0) {
+                shuffle.remove_index(k);
+                assert!(shuffle.is_zero_weight(k));
+            }
+        }
+        // A weight that overflows the total sum is treated as zero.
+        let shuffle = WeightedShuffle::new("", [u64::MAX, 1, 0, 5]);
+        assert!(!shuffle.is_zero_weight(0));
+        assert!(shuffle.is_zero_weight(1));
+        assert!(shuffle.is_zero_weight(2));
+        assert!(shuffle.is_zero_weight(3));
     }
 }

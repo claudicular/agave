@@ -7,6 +7,7 @@ use {
         cluster_nodes::{
             ClusterNodes, ClusterNodesCache, DATA_PLANE_FANOUT, Error, MAX_NUM_TURBINE_HOPS,
         },
+        receive_diet::receive_diet,
     },
     agave_votor::event::VotorEvent,
     agave_votor_messages::migration::MigrationStatus,
@@ -41,7 +42,7 @@ use {
         net::{SocketAddr, UdpSocket},
         ops::AddAssign,
         sync::{
-            Arc, RwLock,
+            Arc, LazyLock, RwLock,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         thread::{self, Builder, JoinHandle},
@@ -55,6 +56,25 @@ const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 // Minimum number of shreds to use rayon parallel iterators.
 const PAR_ITER_MIN_NUM_SHREDS: usize = 2;
+
+// Shared "no addresses" answer of the leaf fast path (see receive_diet `leaf_retransmit`), so
+// that it costs a reference-count increment instead of an allocation per shred.
+static NO_RETRANSMIT_ADDRS: LazyLock<Arc<[SocketAddr]>> = LazyLock::new(|| Arc::from([]));
+
+/// True if the receive diet `leaf_retransmit` switch is on and this node provably has no children
+/// in the turbine tree of any of the given slots, i.e. retransmitting sends nothing and every
+/// shred's addresses are known without shuffling the cluster.
+fn is_leaf_for_all_slots<'a>(
+    leaf_retransmit: bool,
+    slots: impl IntoIterator<Item = (&'a Pubkey, &'a ClusterNodes<RetransmitStage>)>,
+) -> bool {
+    leaf_retransmit
+        && slots.into_iter().all(|(slot_leader, cluster_nodes)| {
+            cluster_nodes
+                .get_retransmit_addrs_if_leaf(slot_leader, DATA_PLANE_FANOUT)
+                .is_some()
+        })
+}
 
 const _: () = const {
     // From https://github.com/anza-xyz/agave/pull/1735#discussion_r1644899183:
@@ -423,6 +443,15 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
         })
         .collect();
     let socket_addr_space = cluster_info.socket_addr_space();
+    let leaf_retransmit = receive_diet().leaf_retransmit();
+    // When this node is a leaf of every slot's tree, the per-shred work is a few lookups, so the
+    // batch stays on this thread instead of paying rayon hand-offs (same outputs either way).
+    let leaf_for_all_slots = is_leaf_for_all_slots(
+        leaf_retransmit,
+        cache
+            .values()
+            .map(|(slot_leader, cluster_nodes)| (slot_leader, cluster_nodes.as_ref())),
+    );
     let record = |mut stats: HashMap<Slot, RetransmitSlotStats>, out: RetransmitShredOutput| {
         let now = timestamp();
         let entry = stats.entry(out.shred.slot()).or_default();
@@ -437,6 +466,7 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
             &cache,
             addr_cache,
             socket_addr_space,
+            leaf_retransmit,
             socket,
             stats,
         )
@@ -445,8 +475,10 @@ fn retransmit(context: &RetransmitContext, state: &mut RetransmitState) -> Resul
     let retransmit_socket =
         |index: usize| RetransmitSocket::new(index, retransmit_sockets, xdp_sender, cluster_info);
 
-    let slot_stats = if num_shreds < PAR_ITER_MIN_NUM_SHREDS {
-        stats.num_small_batches += 1;
+    let slot_stats = if num_shreds < PAR_ITER_MIN_NUM_SHREDS || leaf_for_all_slots {
+        if num_shreds < PAR_ITER_MIN_NUM_SHREDS {
+            stats.num_small_batches += 1;
+        }
         shred_buf
             .drain(..)
             .flatten()
@@ -497,6 +529,7 @@ fn retransmit_shred(
     cache: &HashMap<Slot, (/*leader:*/ Pubkey, Arc<ClusterNodes<RetransmitStage>>)>,
     addr_cache: &AddrCache,
     socket_addr_space: &SocketAddrSpace,
+    leaf_retransmit: bool,
     socket: RetransmitSocket<'_>,
     stats: &RetransmitStats,
 ) -> Option<RetransmitShredOutput> {
@@ -508,8 +541,14 @@ fn retransmit_shred(
         return None;
     }
     let mut compute_turbine_peers = Measure::start("turbine_start");
-    let (root_distance, addrs) =
-        get_retransmit_addrs(&key, cache, addr_cache, socket_addr_space, stats)?;
+    let (root_distance, addrs) = get_retransmit_addrs(
+        &key,
+        cache,
+        addr_cache,
+        socket_addr_space,
+        leaf_retransmit,
+        stats,
+    )?;
     compute_turbine_peers.stop();
     stats
         .compute_turbine_peers_total
@@ -573,6 +612,7 @@ fn get_retransmit_addrs<'a>(
     cache: &HashMap<Slot, (/*leader:*/ Pubkey, Arc<ClusterNodes<RetransmitStage>>)>,
     addr_cache: &'a AddrCache,
     socket_addr_space: &SocketAddrSpace,
+    leaf_retransmit: bool,
     stats: &RetransmitStats,
 ) -> Option<(/*root_distance:*/ u8, Cow<'a, Arc<[SocketAddr]>>)> {
     if let Some((root_distance, addrs)) = addr_cache.get(shred) {
@@ -580,6 +620,14 @@ fn get_retransmit_addrs<'a>(
         return Some((root_distance, Cow::Borrowed(addrs)));
     }
     let (slot_leader, cluster_nodes) = cache.get(&shred.slot())?;
+    if leaf_retransmit
+        && let Some(root_distance) =
+            cluster_nodes.get_retransmit_addrs_if_leaf(slot_leader, DATA_PLANE_FANOUT)
+    {
+        // Same answer as the full computation below, without shuffling the cluster.
+        stats.addr_cache_miss.fetch_add(1, Ordering::Relaxed);
+        return Some((root_distance, Cow::Owned(Arc::clone(&NO_RETRANSMIT_ADDRS))));
+    }
     let (root_distance, addrs) = cluster_nodes
         .get_retransmit_addrs(slot_leader, shred, DATA_PLANE_FANOUT, socket_addr_space)
         .inspect_err(|err| match err {
@@ -627,15 +675,28 @@ fn cache_retransmit_addrs(
         return false;
     }
     let socket_addr_space = cluster_info.socket_addr_space();
+    let leaf_retransmit = receive_diet().leaf_retransmit();
+    let leaf_for_all_slots = is_leaf_for_all_slots(
+        leaf_retransmit,
+        cache
+            .values()
+            .map(|(slot_leader, cluster_nodes)| (slot_leader, cluster_nodes.as_ref())),
+    );
     let get_retransmit_addrs = |shred: ShredId| {
         let (slot_leader, cluster_nodes) = cache.get(&shred.slot())?;
+        if leaf_retransmit
+            && let Some(root_distance) =
+                cluster_nodes.get_retransmit_addrs_if_leaf(slot_leader, DATA_PLANE_FANOUT)
+        {
+            return Some((shred, (root_distance, Arc::clone(&NO_RETRANSMIT_ADDRS))));
+        }
         let (root_distance, addrs) = cluster_nodes
             .get_retransmit_addrs(slot_leader, &shred, DATA_PLANE_FANOUT, socket_addr_space)
             .ok()?;
         Some((shred, (root_distance, Arc::from(addrs))))
     };
     let mut out = false;
-    if shreds.len() < PAR_ITER_MIN_NUM_SHREDS {
+    if shreds.len() < PAR_ITER_MIN_NUM_SHREDS || leaf_for_all_slots {
         for (shred, entry) in shreds.into_iter().filter_map(get_retransmit_addrs) {
             addr_cache.put(&shred, entry);
             out = true;

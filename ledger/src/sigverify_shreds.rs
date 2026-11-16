@@ -69,6 +69,22 @@ pub fn par_verify_shreds(
     });
 }
 
+/// Same as [`par_verify_shreds`], on the calling thread (no thread-pool hand-offs); for
+/// iterations holding only a few packets.
+pub fn verify_shreds_serial(
+    batches: &mut [PacketBatch],
+    slot_leaders: &SlotPubkeys,
+    cache: &RwLock<LruCache>,
+) {
+    batches.iter_mut().for_each(|batch| {
+        batch.iter_mut().for_each(|mut packet| {
+            if !packet.meta().discard() && !verify_shred_cpu(packet.as_ref(), slot_leaders, cache) {
+                packet.meta_mut().set_discard(true);
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 fn sign_shred_cpu(keypair: &Keypair, packet: &mut PacketRefMut) {
     let sig = shred::layout::SIGNATURE_RANGE;
@@ -440,6 +456,17 @@ mod tests {
                 .flatten()
                 .all(|packet| !packet.meta().discard())
         );
+        // The serial variant gives the same answer, with a warm and with a cold cache.
+        for serial_cache in [&cache, &RwLock::new(LruCache::new(128))] {
+            let mut serial = packets.clone();
+            verify_shreds_serial(&mut serial, &pubkeys, serial_cache);
+            assert!(
+                serial
+                    .iter()
+                    .flatten()
+                    .all(|packet| !packet.meta().discard())
+            );
+        }
         // Invalidate signatures for a random number of packets.
         let expected_discards = packets
             .iter_mut()
@@ -459,8 +486,7 @@ mod tests {
                     .collect::<Vec<bool>>()
             })
             .collect::<Vec<_>>();
-        verify_shreds(&thread_pool, &mut packets, &pubkeys, &cache);
-        assert!(
+        let matches_expected = |packets: &[PacketBatch]| {
             packets
                 .iter()
                 .zip(expected_discards.iter())
@@ -470,7 +496,15 @@ mod tests {
                         .zip(expected)
                         .all(|(packet, should_discard)| packet.meta().discard() == *should_discard)
                 })
-        );
+        };
+        let unverified = packets.clone();
+        verify_shreds(&thread_pool, &mut packets, &pubkeys, &cache);
+        assert!(matches_expected(&packets));
+        for serial_cache in [&cache, &RwLock::new(LruCache::new(128))] {
+            let mut serial = unverified.clone();
+            verify_shreds_serial(&mut serial, &pubkeys, serial_cache);
+            assert!(matches_expected(&serial));
+        }
     }
 
     #[test_case(true)]

@@ -28,6 +28,7 @@ use {
         simple_vote_transaction_checker::is_simple_vote_transaction_impl,
         versioned::VersionedTransaction,
     },
+    solana_turbine::receive_diet::{self, TraceStage},
     std::{
         sync::{
             Arc, RwLock,
@@ -148,6 +149,7 @@ impl CompletedDataSetsService {
     ) -> Result<(), RecvTimeoutError> {
         const RECV_TIMEOUT: Duration = Duration::from_secs(1);
         let first_completed_data_sets = completed_sets_receiver.recv_timeout(RECV_TIMEOUT)?;
+        let tracing = receive_diet::trace_enabled();
         let root_bank = deshred_transaction_notifier
             .as_ref()
             .filter(|notifier| notifier.alt_resolution_enabled())
@@ -162,11 +164,21 @@ impl CompletedDataSetsService {
             .chain(completed_sets_receiver.try_iter())
             .flatten()
             .map(|completed_data_set_info| {
+                if tracing {
+                    crate::window_service::trace_data_set(
+                        TraceStage::DataSetDequeued,
+                        &completed_data_set_info,
+                    );
+                }
                 let CompletedDataSetInfo { slot, indices } = completed_data_set_info;
                 let completed_data_set_starting_shred_index = indices.start;
                 let completed_data_set_ending_shred_index_exclusive = indices.end;
+                let trace_index = indices.end.saturating_sub(1);
                 match blockstore.get_entries_in_data_block(slot, indices, /*slot_meta:*/ None) {
                     Ok(entries) => {
+                        if tracing {
+                            receive_diet::trace(TraceStage::DataSetRead, slot, trace_index);
+                        }
                         if let Some(notifier) = deshred_transaction_notifier
                             && let Some(update_parent) = blockstore
                                 .meta(slot)
@@ -192,6 +204,9 @@ impl CompletedDataSetsService {
                             root_bank.as_deref(),
                             &mut stats,
                         );
+                        if tracing {
+                            receive_diet::trace(TraceStage::DataSetNotified, slot, trace_index);
+                        }
 
                         if let Some(rpc_subscriptions) = rpc_subscriptions {
                             let transactions = Self::get_transaction_signatures(entries);

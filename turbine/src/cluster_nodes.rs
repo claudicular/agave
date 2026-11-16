@@ -85,6 +85,8 @@ pub struct ClusterNodes<T> {
     index: HashMap<Pubkey, /*index:*/ usize>,
     // Shuffles by weights = stakes
     weighted_shuffle: WeightedShuffle,
+    // Number of indices with a positive weight in weighted_shuffle (before any removal).
+    num_positive_weights: usize,
     use_cha_cha_8: bool,
     _phantom: PhantomData<T>,
 }
@@ -294,6 +296,38 @@ impl ClusterNodes<RetransmitStage> {
         })
     }
 
+    /// Returns what [`Self::get_retransmit_addrs`] returns (the root distance, with no
+    /// addresses) without shuffling the cluster, when this node provably has no children in the
+    /// turbine tree of any shred of `slot_leader`; otherwise None (the caller then takes the
+    /// full path, which also reports the loopback error).
+    ///
+    /// Zero-weight nodes are shuffled after every positive-weight node, so an unstaked node's
+    /// index is at least the number of staked nodes other than the leader. When that is more
+    /// than `fanout`, the node sits in the 2nd layer or deeper, and every node there has its
+    /// first child at index `fanout * (fanout + 1) + 1` or later, which does not exist while the
+    /// shuffled cluster is not larger than that. The node is then in the 2nd layer exactly.
+    pub fn get_retransmit_addrs_if_leaf(&self, slot_leader: &Pubkey, fanout: usize) -> Option<u8> {
+        if slot_leader == &self.pubkey || fanout == 0 {
+            return None;
+        }
+        let Some(&self_index) = self.index.get(&self.pubkey) else {
+            // Excluded by dedup_tvu_addrs: get_retransmit_peers finds no position and returns
+            // index usize::MAX with no peers.
+            return Some(get_root_distance(usize::MAX, fanout));
+        };
+        if !self.weighted_shuffle.is_zero_weight(self_index) {
+            return None;
+        }
+        let leader_index = self.index.get(slot_leader).copied();
+        let leader_is_positive =
+            leader_index.is_some_and(|index| !self.weighted_shuffle.is_zero_weight(index));
+        let num_positive = self.num_positive_weights - usize::from(leader_is_positive);
+        let num_shuffled = self.nodes.len() - usize::from(leader_index.is_some());
+        let first_child_below_first_layer = fanout.checked_mul(fanout + 1)?.checked_add(1)?;
+        (num_positive > fanout && num_shuffled <= first_child_below_first_layer)
+            .then(|| get_root_distance(num_positive, fanout))
+    }
+
     // Returns the parent node in the turbine broadcast tree.
     // Returns None if the node is the root of the tree or if it is not staked.
     pub(crate) fn get_retransmit_parent(
@@ -355,6 +389,9 @@ pub fn new_cluster_nodes<T: 'static>(
     let broadcast = TypeId::of::<T>() == TypeId::of::<BroadcastStage>();
     let stakes = nodes.iter().map(|node| node.stake);
     let mut weighted_shuffle = WeightedShuffle::new("cluster-nodes", stakes);
+    let num_positive_weights = (0..nodes.len())
+        .filter(|&k| !weighted_shuffle.is_zero_weight(k))
+        .count();
     if broadcast {
         weighted_shuffle.remove_index(index[&self_pubkey]);
     }
@@ -363,6 +400,7 @@ pub fn new_cluster_nodes<T: 'static>(
         nodes,
         index,
         weighted_shuffle,
+        num_positive_weights,
         _phantom: PhantomData,
         use_cha_cha_8,
     }
@@ -724,7 +762,7 @@ mod tests {
         itertools::Itertools,
         rand::prelude::IndexedRandom as _,
         solana_hash::Hash as SolanaHash,
-        solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+        solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, ShredType, Shredder},
         std::{collections::VecDeque, fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -862,6 +900,106 @@ mod tests {
                     assert_eq!(cluster_nodes[pubkey].stake, *stake);
                 }
             }
+        }
+    }
+
+    // make_test_cluster adds 100 staked nodes without contact-info to num_nodes.
+    #[test_case(10, 5, true, true)]
+    #[test_case(10, 5, false, true)]
+    #[test_case(12, 40, true, true)]
+    #[test_case(20, 200, false, true)]
+    #[test_case(4, 5, true, false; "cluster larger than two layers")]
+    #[test_case(200, 50, false, false; "fewer staked nodes than the fanout")]
+    fn test_get_retransmit_addrs_if_leaf(
+        fanout: usize,
+        num_nodes: usize,
+        use_cha_cha_8: bool,
+        expect_leaf: bool,
+    ) {
+        let mut rng = rand::rng();
+        let (_nodes, mut stakes, cluster_info) =
+            make_test_cluster(&mut rng, num_nodes, Some((1, 2)));
+        let self_pubkey = cluster_info.id();
+        stakes.remove(&self_pubkey); // this node is unstaked
+        let cluster_nodes = new_cluster_nodes::<RetransmitStage>(
+            &cluster_info,
+            ClusterType::Development,
+            &stakes,
+            use_cha_cha_8,
+        );
+        let num_staked = cluster_nodes
+            .nodes
+            .iter()
+            .filter(|node| node.stake > 0)
+            .count();
+        assert_eq!(cluster_nodes.num_positive_weights, num_staked);
+        let staked_leader = *cluster_nodes
+            .nodes
+            .iter()
+            .find(|node| node.stake > 0)
+            .unwrap()
+            .pubkey();
+        let unstaked_leader = cluster_nodes
+            .nodes
+            .iter()
+            .find(|node| node.stake == 0 && node.pubkey() != &self_pubkey)
+            .map(|node| *node.pubkey());
+        let unknown_leader = Pubkey::new_unique();
+        let leaders: Vec<_> = [Some(staked_leader), unstaked_leader, Some(unknown_leader)]
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut num_leaf = 0;
+        for &leader in &leaders {
+            let fast = cluster_nodes.get_retransmit_addrs_if_leaf(&leader, fanout);
+            let num_positive = num_staked - usize::from(leader == staked_leader);
+            let num_shuffled = cluster_nodes.nodes.len() - usize::from(leader != unknown_leader);
+            assert_eq!(
+                fast.is_some(),
+                num_positive > fanout && num_shuffled <= fanout * (fanout + 1) + 1
+            );
+            let Some(root_distance) = fast else {
+                continue;
+            };
+            num_leaf += 1;
+            assert_eq!(root_distance, 2);
+            // The full computation must agree for every shred.
+            for _ in 0..200 {
+                let shred = ShredId::new(
+                    rng.random_range(0..1_000_000),
+                    rng.random_range(0..32_768),
+                    if rng.random() {
+                        ShredType::Data
+                    } else {
+                        ShredType::Code
+                    },
+                );
+                let (full_root_distance, addrs) = cluster_nodes
+                    .get_retransmit_addrs(&leader, &shred, fanout, &SocketAddrSpace::Unspecified)
+                    .unwrap();
+                assert_eq!(full_root_distance, root_distance);
+                assert!(addrs.is_empty());
+            }
+        }
+        assert_eq!(num_leaf > 0, expect_leaf);
+        // The node itself as the leader keeps the full path (loopback error).
+        assert_eq!(
+            cluster_nodes.get_retransmit_addrs_if_leaf(&self_pubkey, fanout),
+            None
+        );
+        // A staked node is never answered by the fast path.
+        stakes.insert(self_pubkey, 1);
+        let cluster_nodes = new_cluster_nodes::<RetransmitStage>(
+            &cluster_info,
+            ClusterType::Development,
+            &stakes,
+            use_cha_cha_8,
+        );
+        for leader in &leaders {
+            assert_eq!(
+                cluster_nodes.get_retransmit_addrs_if_leaf(leader, fanout),
+                None
+            );
         }
     }
 
