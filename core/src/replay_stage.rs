@@ -2584,6 +2584,9 @@ impl ReplayStage {
         if slots_to_purge.is_empty() {
             return;
         }
+        // Fast lane: stop the banks' commit boards before waiting for their schedulers, and
+        // tell the fast lane (it rolls back what it published for these slots).
+        Self::fast_lane_before_clear(&banks_to_clear);
 
         // Wait for async verify to complete
         for slot in &slots_to_purge {
@@ -2657,6 +2660,12 @@ impl ReplayStage {
         async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
     ) -> bool {
         if !fast_lane_commit::abandon_bank(bank) {
+            agave_fast_lane::cluster_check::on_replay_dead(
+                bank.slot(),
+                bank.bank_id(),
+                bank.parent_slot(),
+                bank.parent_hash(),
+            );
             return false;
         }
         let slot = bank.slot();
@@ -2667,6 +2676,46 @@ impl ReplayStage {
         fast_lane_commit::mark_agave_only(slot);
         Self::clear_slots([slot], bank_forks, progress, async_verification_freelist);
         true
+    }
+
+    /// Alpenglow: `bank`'s hash differs from the bank hash in its block footer, and the fast
+    /// lane committed `fl_commits` transactions into it. Instead of marking the slot dead, clear
+    /// the bank and replay the slot without the fast lane (`cluster_check` has disabled it
+    /// provisionally; that replay's footer check attributes the disagreement). As in
+    /// [`Self::fast_lane_retry`]; a block whose footer is wrong fails again and is then marked
+    /// dead as upstream does.
+    fn fast_lane_footer_retry(
+        bank: &BankWithScheduler,
+        fl_commits: u32,
+        bank_forks: &RwLock<BankForks>,
+        progress: &mut ProgressMap,
+        async_verification_freelist: &mut Vec<AsyncVerificationProgress>,
+    ) {
+        // `close_bank` already closed and removed the board (a no-op then).
+        let _ = fast_lane_commit::abandon_bank(bank);
+        let slot = bank.slot();
+        warn!(
+            "slot {slot}: bank hash differs from the block footer after {fl_commits} fast-lane \
+             commits; replaying it without the fast lane"
+        );
+        fast_lane_commit::mark_agave_only(slot);
+        Self::clear_slots([slot], bank_forks, progress, async_verification_freelist);
+    }
+
+    /// `clear_slots` is about to clear `banks` (an Alpenglow UpdateParent restart or abandoned
+    /// bank, a switch to another block version, their descendants, or a fast-lane retry): stop
+    /// each bank's fast-lane commit board, so that no handler waits for the fast lane while the
+    /// bank's scheduler is drained, and tell the fast lane.
+    fn fast_lane_before_clear(banks: &[BankWithScheduler]) {
+        for bank in banks {
+            fast_lane_commit::on_bank_clearing(bank);
+            agave_fast_lane::cluster_check::on_bank_cleared(
+                bank.slot(),
+                bank.bank_id(),
+                bank.parent_slot(),
+                bank.parent_hash(),
+            );
+        }
     }
 
     fn recycle_async_verification(
@@ -4131,11 +4180,11 @@ impl ReplayStage {
                 // operating on a frozen bank.
                 // Also if we are not the leader, ensure that our computed hash matches the hash in
                 // the block footer.
-                let verify_result = if process_active_banks_context
+                let verify_footer = process_active_banks_context
                     .migration_status
                     .should_allow_block_markers(bank.slot())
-                    && !Self::leader_is_me(bank.leader_id(), my_pubkey)
-                {
+                    && !Self::leader_is_me(bank.leader_id(), my_pubkey);
+                let verify_result = if verify_footer {
                     bank.freeze_and_verify_bank_hash()
                 } else {
                     bank.freeze();
@@ -4148,16 +4197,23 @@ impl ReplayStage {
                     ("hash", bank.hash().to_string(), String),
                 );
 
+                // Fast lane safety net: the frozen version's block identity, recorded before
+                // the footer verdict so that a disagreement can be attributed (duplicate block,
+                // the leader's footer, or a wrong FL result).
+                let fl_version = agave_fast_lane::cluster_check::BlockVersion {
+                    hash: bank.hash(),
+                    parent_slot: bank.parent_slot(),
+                    parent_hash: bank.parent_hash(),
+                    block_id: bank.block_id(),
+                    last_entry_hash: bank.last_blockhash(),
+                    fl_commits,
+                };
+                agave_fast_lane::cluster_check::on_bank_version(bank_slot, fl_version.clone());
+
                 if let Err((expected_hash, computed_hash)) = verify_result {
                     warn!(
                         "For slot {bank_slot} the leader said the bank hash should be: \
                          {expected_hash} however we computed: {computed_hash}",
-                    );
-                    agave_fast_lane::cluster_check::on_cluster_mismatch(
-                        bank_slot,
-                        Some(computed_hash),
-                        expected_hash,
-                        "block_footer",
                     );
 
                     datapoint_warn!(
@@ -4166,6 +4222,26 @@ impl ReplayStage {
                         ("expected", expected_hash.to_string(), String),
                         ("computed", computed_hash.to_string(), String),
                     );
+
+                    // Fast lane: the footer is the only bank-hash reference under Alpenglow. If
+                    // the fast lane committed into this bank, replay the slot once without it
+                    // instead of marking it dead.
+                    agave_fast_lane::cluster_check::on_block_footer_mismatch(
+                        bank_slot,
+                        bank.bank_id(),
+                        &fl_version,
+                        expected_hash,
+                    );
+                    if fl_commits > 0 {
+                        Self::fast_lane_footer_retry(
+                            bank,
+                            fl_commits,
+                            bank_forks,
+                            progress,
+                            async_verification_freelist,
+                        );
+                        continue;
+                    }
 
                     mark_replay_dead_slot(
                         bank,
@@ -4185,6 +4261,15 @@ impl ReplayStage {
                     continue;
                 }
 
+                if verify_footer && bank.expected_bank_hash() == Some(bank.hash()) {
+                    // Fast lane safety net (Alpenglow): our hash matches the leader's footer.
+                    agave_fast_lane::cluster_check::on_block_footer_match(
+                        bank_slot,
+                        bank.bank_id(),
+                        &fl_version,
+                    );
+                }
+
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();
                 debug!(
@@ -4192,19 +4277,6 @@ impl ReplayStage {
                      {:?}",
                     bank.slot(),
                     r_replay_stats.batch_execute.totals
-                );
-                // Fast lane safety net: the frozen version's block identity, to attribute a
-                // later disagreement with the cluster (duplicate block vs. a wrong FL result).
-                agave_fast_lane::cluster_check::on_bank_version(
-                    bank_slot,
-                    agave_fast_lane::cluster_check::BlockVersion {
-                        hash: bank.hash(),
-                        parent_slot: bank.parent_slot(),
-                        parent_hash: bank.parent_hash(),
-                        block_id: bank.block_id(),
-                        last_entry_hash: bank.last_blockhash(),
-                        fl_commits,
-                    },
                 );
                 new_frozen_slots.push(bank.slot());
                 if process_active_banks_context
