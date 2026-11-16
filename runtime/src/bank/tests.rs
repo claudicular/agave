@@ -57,6 +57,7 @@ use {
         accounts_hash::AccountsLtHash,
         accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey},
         accounts_scan::ScanError,
+        accounts_update_notifier_interface::{AccountForGeyser, AccountsUpdateNotifierInterface},
         ancestors::Ancestors,
         blockhash_queue::BlockhashQueue,
         partitioned_rewards::PartitionedEpochRewardsConfig,
@@ -13967,5 +13968,210 @@ fn test_commit_noop_transaction_no_fees(relax_fee_payer_constraint: bool) {
     assert_eq!(
         bank.capitalization(),
         bank.calculate_capitalization_for_tests()
+    );
+}
+
+/// Records grouped transaction-account notifications.
+#[derive(Debug)]
+struct GroupedTransactionAccountsRecorder {
+    readonly_owner: Pubkey,
+    /// `(slot, bank_id)` of each grouped notification
+    banks: Mutex<Vec<(Slot, BankId)>>,
+    /// `(pubkey, write_version)` pairs of each grouped notification
+    grouped: Mutex<Vec<Vec<(Pubkey, u64)>>>,
+}
+
+impl GroupedTransactionAccountsRecorder {
+    fn new(readonly_owner: Pubkey) -> Self {
+        Self {
+            readonly_owner,
+            banks: Mutex::default(),
+            grouped: Mutex::default(),
+        }
+    }
+}
+
+impl AccountsUpdateNotifierInterface for GroupedTransactionAccountsRecorder {
+    fn snapshot_notifications_enabled(&self) -> bool {
+        false
+    }
+
+    fn notify_account_update(
+        &self,
+        _slot: Slot,
+        _bank_id: BankId,
+        _account: &AccountSharedData,
+        _txn: &Option<&SanitizedTransaction>,
+        _pubkey: &Pubkey,
+        _write_version: u64,
+    ) {
+    }
+
+    fn notify_account_restore_from_snapshot(
+        &self,
+        _slot: Slot,
+        _write_version: u64,
+        _account: &AccountForGeyser<'_>,
+    ) {
+    }
+
+    fn notify_end_of_restore_from_snapshot(&self) {}
+
+    fn notify_transaction_accounts(
+        &self,
+        slot: Slot,
+        bank_id: BankId,
+        _signature: &Signature,
+        _transaction_index: usize,
+        accounts: &[(&Pubkey, &AccountSharedData)],
+        write_version_start: u64,
+    ) {
+        let group = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, (pubkey, _account))| (**pubkey, write_version_start.saturating_add(i as u64)))
+            .collect();
+        self.banks.lock().unwrap().push((slot, bank_id));
+        self.grouped.lock().unwrap().push(group);
+    }
+
+    fn transaction_accounts_notifications_enabled(&self) -> bool {
+        true
+    }
+
+    fn transaction_accounts_include_readonly_owners(&self) -> Vec<Pubkey> {
+        vec![self.readonly_owner]
+    }
+}
+
+fn new_bank_with_grouped_recorder(
+    genesis_config: &GenesisConfig,
+    recorder: Arc<GroupedTransactionAccountsRecorder>,
+) -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
+    Bank::new_from_genesis(
+        genesis_config,
+        Arc::new(RuntimeConfig::default()),
+        Vec::new(),
+        None,
+        BankTestConfig::default().accounts_db_config,
+        Some(recorder),
+        None,
+        Arc::default(),
+        None,
+        None,
+    )
+    .wrap_with_bank_forks_for_tests()
+}
+
+#[test]
+fn test_grouped_transaction_accounts_write_versions() {
+    let (genesis_config, mint_keypair) = create_genesis_config(1_000_000_000);
+    let readonly_owner = Pubkey::new_unique();
+    let recorder = Arc::new(GroupedTransactionAccountsRecorder::new(readonly_owner));
+    let (bank, _bank_forks) = new_bank_with_grouped_recorder(&genesis_config, recorder.clone());
+
+    // A read-only account matched by the owner filter: it inflates the group
+    // beyond the stored-account count and appears in both transactions.
+    let readonly_matched = Pubkey::new_unique();
+    bank.store_account(
+        &readonly_matched,
+        &AccountSharedData::new(10_000_000, 0, &readonly_owner),
+    );
+    // A write-locked account no instruction touches: must not appear in groups.
+    let untouched_writable = Pubkey::new_unique();
+    bank.store_account(
+        &untouched_writable,
+        &AccountSharedData::new(10_000_000, 0, &system_program::id()),
+    );
+
+    let payer = mint_keypair.pubkey();
+    let make_transfer = |recipient: &Pubkey| {
+        let mut ix = system_instruction::transfer(&payer, recipient, 5_000_000);
+        ix.accounts.push(AccountMeta::new(untouched_writable, false));
+        ix.accounts
+            .push(AccountMeta::new_readonly(readonly_matched, false));
+        let message = Message::new(&[ix], Some(&payer));
+        Transaction::new(&[&mint_keypair], message, genesis_config.hash())
+    };
+
+    // Two separate commits in the same slot, sharing `payer` and
+    // `readonly_matched`.
+    bank.process_transaction(&make_transfer(&Pubkey::new_unique()))
+        .unwrap();
+    bank.process_transaction(&make_transfer(&Pubkey::new_unique()))
+        .unwrap();
+
+    let grouped = recorder.grouped.lock().unwrap();
+    assert_eq!(grouped.len(), 2);
+
+    // Touched filter: untouched write-locked accounts are excluded; read-only
+    // owner-matched accounts are included.
+    for group in grouped.iter() {
+        let pubkeys: Vec<Pubkey> = group.iter().map(|(pubkey, _)| *pubkey).collect();
+        assert!(pubkeys.contains(&payer));
+        assert!(pubkeys.contains(&readonly_matched));
+        assert!(!pubkeys.contains(&untouched_writable));
+    }
+
+    // Write versions are globally unique across all grouped notifications:
+    // each group must reserve its own disjoint block from the shared counter.
+    let all_versions: Vec<u64> = grouped
+        .iter()
+        .flat_map(|group| group.iter().map(|(_, version)| *version))
+        .collect();
+    let unique_versions: HashSet<u64> = all_versions.iter().copied().collect();
+    assert_eq!(
+        unique_versions.len(),
+        all_versions.len(),
+        "grouped write versions must be globally unique: {all_versions:?}"
+    );
+
+    // The later commit's block sits strictly above the earlier commit's, so
+    // every shared pubkey (payer, readonly_matched) strictly increases and
+    // `(slot, write_version)` is a valid staleness guard for consumers.
+    let first_max = grouped[0].iter().map(|(_, version)| *version).max().unwrap();
+    let second_min = grouped[1].iter().map(|(_, version)| *version).min().unwrap();
+    assert!(
+        second_min > first_max,
+        "later commit's write-version block must sit strictly above the earlier \
+         one's (first max {first_max}, second min {second_min})"
+    );
+}
+
+#[test]
+fn test_grouped_transaction_accounts_bank_id() {
+    let (genesis_config, mint_keypair) = create_genesis_config(1_000_000_000);
+    let recorder = Arc::new(GroupedTransactionAccountsRecorder::new(Pubkey::new_unique()));
+    let (bank, bank_forks) = new_bank_with_grouped_recorder(&genesis_config, recorder.clone());
+
+    bank.process_transaction(&system_transaction::transfer(
+        &mint_keypair,
+        &Pubkey::new_unique(),
+        5_000_000,
+        genesis_config.hash(),
+    ))
+    .unwrap();
+
+    // A child bank's id differs from its slot, so the notification must carry
+    // the committing bank's id rather than anything derived from the slot.
+    let child =
+        Bank::new_from_parent_with_bank_forks(&bank_forks, bank.clone(), SlotLeader::default(), 5);
+    assert_ne!(child.slot(), child.bank_id());
+    assert_ne!(child.bank_id(), bank.bank_id());
+    child
+        .process_transaction(&system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            5_000_000,
+            genesis_config.hash(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        *recorder.banks.lock().unwrap(),
+        vec![
+            (bank.slot(), bank.bank_id()),
+            (child.slot(), child.bank_id()),
+        ]
     );
 }
