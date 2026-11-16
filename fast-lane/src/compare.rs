@@ -24,7 +24,7 @@ use {
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{BankId, Slot},
     solana_pubkey::Pubkey,
-    solana_runtime::{bank_forks::BankForks, fast_lane_commit::AgaveProcessed},
+    solana_runtime::{bank::Bank, bank_forks::BankForks, fast_lane_commit::AgaveProcessed},
     solana_sdk_ids::incinerator,
     solana_signature::Signature,
     std::{
@@ -928,8 +928,11 @@ impl Comparator {
 
     /// Slot-level check: once FL's run is complete and agave froze the slot, every account
     /// FL wrote must equal the frozen bank's value (fee deposit accounts, incinerator and
-    /// SlotHistory excepted: agave writes them at freeze). The run's Clock and SlotHashes
-    /// (for a chained run: resolved when the parent froze) must equal the bank's.
+    /// SlotHistory excepted: agave writes them at freeze; on an Alpenglow bank also what its
+    /// block footer writes after the last transaction: the Clock, the nanosecond clock and
+    /// vote accounts). The run's Clock must equal the Clock the bank's transactions read
+    /// (an Alpenglow footer rewrites it: see `Bank::fast_lane_execution_clock_account`) and
+    /// its SlotHashes (for a chained run: resolved when the parent froze) the bank's.
     fn maybe_slot_check(&mut self, run_id: RunId) {
         let Some(info) = self.runs.get(&run_id) else {
             return;
@@ -949,16 +952,22 @@ impl Comparator {
             return;
         };
         let fee_deposits = bank.fast_lane_fee_deposit_accounts().unwrap_or_default();
-        let clock_id = solana_sdk_ids::sysvar::clock::id();
+        let alpenglow = bank.is_alpenglow();
+        let footer_accounts = Bank::fast_lane_alpenglow_footer_accounts();
         let slot_hashes_id = solana_sdk_ids::sysvar::slot_hashes::id();
         let run_slot_hashes = match &info.run.chain {
             Some(_) => info.run.overlay.latest(&slot_hashes_id).value,
             None => Some(info.run.ctx.slot_hashes_account.clone()),
         };
-        let sysvars_ok = same_value(
-            &Some(info.run.ctx.clock_account.clone()),
-            &bank.get_account(&clock_id),
-        ) && same_value(&run_slot_hashes, &bank.get_account(&slot_hashes_id));
+        // `None`: an Alpenglow bank already squashed into a root (its parent's Clock is
+        // gone); its execution Clock cannot be rebuilt, so it is not checked.
+        let clock_ok = bank
+            .fast_lane_execution_clock_account()
+            .is_none_or(|clock| {
+                same_value(&Some(info.run.ctx.clock_account.clone()), &Some(clock))
+            });
+        let sysvars_ok =
+            clock_ok && same_value(&run_slot_hashes, &bank.get_account(&slot_hashes_id));
         if sysvars_ok {
             self.interval.sysvar_checks_ok += 1;
         } else {
@@ -974,11 +983,23 @@ impl Comparator {
             if fee_deposits.contains(&key)
                 || key == incinerator::id()
                 || key == solana_sdk_ids::sysvar::slot_history::id()
+                || (alpenglow && footer_accounts.contains(&key))
             {
                 continue;
             }
             let fl = info.run.overlay.latest(&key).value;
             let agave = bank.get_account(&key);
+            // An Alpenglow footer rewrites the vote accounts of its reward and finalization
+            // certificates' validators (and the leader's) after the slot's transactions.
+            if alpenglow
+                && [&fl, &agave].into_iter().any(|account| {
+                    account
+                        .as_ref()
+                        .is_some_and(|account| solana_sdk_ids::vote::check_id(account.owner()))
+                })
+            {
+                continue;
+            }
             if !same_value(&fl, &agave) {
                 bad += 1;
                 if bad <= 3 {
